@@ -1,6 +1,6 @@
 ﻿import asyncio, json, sys
 from fastmcp import Client
-from server import mcp
+from windows_rca_mcp.server import mcp
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -18,6 +18,6 @@ async def main():
         args[k] = parse(v)
     async with Client(mcp) as c:
         r = await c.call_tool(tool, args)
-        print(r.content[0].text)
+        print(r.content[0].text if r.content else json.dumps(r.structured_content if r.structured_content is not None else [], ensure_ascii=False))
 
 asyncio.run(main())

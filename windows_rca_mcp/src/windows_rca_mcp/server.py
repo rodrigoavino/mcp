@@ -1,0 +1,1790 @@
+"""MCP (FastMCP) de OPS para Windows Server via WinRM (HTTPS/5986 por padrão).
+
+Somente leitura: nenhuma tool executa comando arbitrário nem altera o servidor.
+
+Variáveis de ambiente (podem vir de um arquivo .env no diretório de trabalho):
+  WINRM_USER, WINRM_PASSWORD     credenciais (use conta de serviço com menor privilégio)
+  WINRM_TRANSPORT                ntlm (padrão) | kerberos | credssp | basic
+  WINRM_SSL                      true (padrão) -> HTTPS | false -> HTTP
+  WINRM_PORT                     porta (padrão 5986 com SSL, 5985 sem SSL)
+  WINRM_VALIDATE_CERT            validate (padrão) | ignore
+  WINRM_ALLOWED_HOSTS            lista separada por vírgula (allowlist de servidores)
+"""
+import base64
+import json
+import os
+import re
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+import winrm
+from dotenv import load_dotenv
+from fastmcp import FastMCP
+
+load_dotenv()
+
+mcp = FastMCP("windows-server-ops")
+
+ALLOWED = {h.strip().lower() for h in os.getenv("WINRM_ALLOWED_HOSTS", "").split(",") if h.strip()}
+HOST_RE = re.compile(r"^[A-Za-z0-9._-]{1,253}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9 ._/-]{1,100}$")
+
+# Funções PowerShell injetadas em todo script.
+# Msg: normaliza espaços e trunca a mensagem do evento com segurança (eventos podem vir sem Message).
+PS_HELPERS = r"""
+$ProgressPreference = 'SilentlyContinue'
+try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch {}
+function Msg($m, $n) { if (-not $m) { return $null }; $t = ($m -replace '\s+', ' ').Trim(); $t.Substring(0, [math]::Min($n, $t.Length)) }
+function RunDism($a, $sec) {
+  if (Get-Process dism -ErrorAction SilentlyContinue) {
+    return [pscustomobject]@{ ExitCode=$null; Output='Outra instância do DISM já está em execução neste servidor; não foi iniciada uma nova.'; Busy=$true; TimedOut=$false } }
+  $psi = New-Object Diagnostics.ProcessStartInfo "$env:SystemRoot\System32\dism.exe", $a
+  $psi.RedirectStandardOutput = $true; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+  $p = [Diagnostics.Process]::Start($psi); $t = $p.StandardOutput.ReadToEndAsync()
+  if (-not $p.WaitForExit($sec * 1000)) { try { $p.Kill() } catch {}
+    return [pscustomobject]@{ ExitCode=$null; Output="DISM excedeu $sec s e foi encerrado."; Busy=$false; TimedOut=$true } }
+  [pscustomobject]@{ ExitCode=$p.ExitCode; Output=$t.Result.Trim(); Busy=$false; TimedOut=$false }
+}
+"""
+
+
+# ---------- infraestrutura WinRM ----------
+def _session(host: str, timeout: int = 60) -> winrm.Session:
+    if not HOST_RE.match(host):
+        raise ValueError("Hostname inválido")
+    if ALLOWED and host.lower() not in ALLOWED:
+        raise ValueError(f"Host '{host}' fora da allowlist WINRM_ALLOWED_HOSTS")
+    user, pwd = os.getenv("WINRM_USER"), os.getenv("WINRM_PASSWORD")
+    if not user or not pwd:
+        raise ValueError("WINRM_USER/WINRM_PASSWORD não configurados (defina no .env ou no ambiente)")
+    use_ssl = os.getenv("WINRM_SSL", "true").lower() == "true"
+    scheme = "https" if use_ssl else "http"
+    port = int(os.getenv("WINRM_PORT") or (5986 if use_ssl else 5985))
+    return winrm.Session(
+        f"{scheme}://{host}:{port}/wsman",
+        auth=(user, pwd),
+        transport=os.getenv("WINRM_TRANSPORT", "ntlm"),
+        server_cert_validation=os.getenv("WINRM_VALIDATE_CERT", "validate"),
+        # Cada Receive espera no máximo 20 s; o prazo TOTAL da tool é controlado em _run_ps.
+        operation_timeout_sec=min(int(timeout), 20),
+        read_timeout_sec=min(int(timeout), 20) + 15,
+    )
+
+
+class RemoteTimeout(Exception):
+    pass
+
+
+def _run_ps(host: str, script: str, timeout: int) -> tuple[int, bytes, bytes]:
+    """Executa PowerShell com PRAZO TOTAL real. O run_ps do pywinrm fica consultando a saída indefinidamente;
+    aqui, se o prazo estourar, o shell remoto é fechado, o que encerra o powershell.exe e seus processos filhos
+    no servidor (nada fica órfão)."""
+    import time
+    from winrm.exceptions import WinRMOperationTimeoutError
+
+    proto = _session(host, timeout).protocol
+    enc = base64.b64encode(script.encode("utf_16_le")).decode("ascii")
+    shell = proto.open_shell()
+    cmd = None
+    try:
+        cmd = proto.run_command(shell, "powershell", ["-NoProfile", "-NonInteractive", "-EncodedCommand", enc])
+        deadline = time.monotonic() + int(timeout)
+        out, err, code, done = [], [], 0, False
+        while not done:
+            if time.monotonic() > deadline:
+                raise RemoteTimeout(f"Prazo de {timeout}s excedido; comando remoto encerrado.")
+            try:
+                o, e, code, done = proto.get_command_output_raw(shell, cmd)
+                out.append(o)
+                err.append(e)
+            except WinRMOperationTimeoutError:
+                continue
+        return code, b"".join(out), b"".join(err)
+    finally:
+        try:
+            if cmd:
+                proto.cleanup_command(shell, cmd)
+        except Exception:
+            pass
+        try:
+            proto.close_shell(shell)
+        except Exception:
+            pass
+
+
+DATE_RE = re.compile(r"\\/Date\((-?\d+)(?:[+-]\d+)?\)\\/")
+
+
+def _conn_error(host: str, e: Exception) -> dict:
+    return {"error": f"{type(e).__name__}: {str(e)[:1000]}", "host": host}
+
+
+CLIXML_ERR_RE = re.compile(r'<S S="Error">(.*?)</S>', re.S)
+
+
+def _clean_err(raw: bytes) -> str:
+    """Extrai só as mensagens de erro do stderr em CLIXML (descarta registros de progresso)."""
+    txt = raw.decode(errors="replace")
+    if txt.startswith("#< CLIXML"):
+        parts = CLIXML_ERR_RE.findall(txt)
+        txt = "".join(parts).replace("_x000D_", "").replace("_x000A_", "\n")
+        for a, b in (("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'), ("&apos;", "'"), ("&amp;", "&")):
+            txt = txt.replace(a, b)
+    return txt.strip()[:2000]
+
+
+def _flatten_dates(o):
+    """PowerShell 5.1 serializa alguns DateTime como {"value": ..., "DateTime": "..."}; reduz para o valor."""
+    if isinstance(o, list):
+        return [_flatten_dates(x) for x in o]
+    if isinstance(o, dict):
+        if set(o) == {"value", "DateTime"}:
+            return o["value"]
+        return {k: _flatten_dates(v) for k, v in o.items()}
+    return o
+
+
+def _ps(host: str, script: str, timeout: int = 60):
+    """Executa PowerShell e devolve JSON já parseado (datas convertidas para ISO 8601 UTC).
+    O 'exit 0' final evita falso erro: o powershell.exe sai com 1 quando o último comando teve um erro
+    suprimido (-ErrorAction SilentlyContinue). Erros reais (terminating) interrompem antes e saem com 1."""
+    full = "$ErrorActionPreference='Stop'\n" + PS_HELPERS + script + "\nexit 0"
+    # Linha de comando do cmd.exe aceita ~8 KB; base64 de UTF-16 infla ~2,7x. Acima do limite, envia em blocos.
+    if len(full) * 8 // 3 > 7500 and not script.lstrip().startswith("$f = \"$env:TEMP\\mcp_"):
+        return _ps_long(host, script, timeout)
+    try:
+        code, so, se = _run_ps(host, full, timeout)
+    except ValueError:
+        raise
+    except Exception as e:  # prazo excedido, timeout, autenticação, SSL, rede
+        return _conn_error(host, e)
+    if code != 0:
+        return {"error": _clean_err(se) or f"exit code {code}", "host": host}
+    out = so.decode(errors="replace").strip()
+    out = DATE_RE.sub(
+        lambda m: datetime.fromtimestamp(int(m.group(1)) / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), out)
+    if not out:
+        return []
+    try:
+        return _flatten_dates(json.loads(out))
+    except json.JSONDecodeError:
+        return {"raw": out[:20000]}
+
+
+def _ps_long(host: str, script: str, timeout: int = 300):
+    """Para scripts grandes: a linha de comando do WinRM aceita ~8 KB, então o script é enviado em pedaços
+    para um arquivo temporário em %TEMP%, executado e apagado em seguida (nada mais é alterado no servidor)."""
+    s = _session(host, 60)
+    f = rf"$env:TEMP\mcp_{uuid.uuid4().hex[:12]}.b64"
+    b64 = base64.b64encode(script.encode("utf-8")).decode()
+    try:
+        for i in range(0, len(b64), 2400):
+            try:
+                r = s.run_ps(f"Add-Content -LiteralPath \"{f}\" -Value '{b64[i:i + 2400]}' -NoNewline -Encoding ASCII")
+            except Exception as e:
+                return _conn_error(host, e)
+            if r.status_code != 0:
+                return {"error": r.std_err.decode(errors="replace")[:2000], "host": host}
+        return _ps(host, rf"""
+$f = "{f}"
+try {{ $code = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([IO.File]::ReadAllText($f))) }}
+finally {{ Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }}
+Invoke-Expression $code
+""", timeout)
+    finally:
+        try:
+            s.run_ps(f'Remove-Item -LiteralPath "{f}" -Force -ErrorAction SilentlyContinue')
+        except Exception:
+            pass
+
+
+def _ints(values) -> str:
+    return ",".join(str(int(v)) for v in values)
+
+
+MAX_LOG_DAYS = 90
+
+
+def _days(d) -> int:
+    """Período de coleta de logs: padrão 1 dia (análise rápida), ampliável até MAX_LOG_DAYS se pedido."""
+    return max(1, min(int(d), MAX_LOG_DAYS))
+
+
+# ---------- tools ----------
+@mcp.tool
+def get_system_overview(host: str):
+    """Versão do SO, uptime, último boot, CPU/RAM total e domínio."""
+    return _ps(host, r"""
+$os = Get-CimInstance Win32_OperatingSystem
+$cs = Get-CimInstance Win32_ComputerSystem
+[pscustomobject]@{
+  Host=$env:COMPUTERNAME; OS=$os.Caption; Build=$os.BuildNumber
+  LastBoot=$os.LastBootUpTime; UptimeHours=[math]::Round(((Get-Date)-$os.LastBootUpTime).TotalHours,1)
+  Domain=$cs.Domain; Sockets=$cs.NumberOfProcessors; LogicalCPUs=$cs.NumberOfLogicalProcessors
+  RAM_GB=[math]::Round($cs.TotalPhysicalMemory/1GB,1)
+  FreeRAM_GB=[math]::Round($os.FreePhysicalMemory/1MB,1)
+} | ConvertTo-Json -Compress
+""")
+
+
+@mcp.tool
+def get_performance_snapshot(host: str):
+    """Snapshot de CPU, memória, paginação, fila de CPU e latência/fila de disco.
+    Usa classes CIM (independe do idioma do Windows, ao contrário do Get-Counter)."""
+    return _ps(host, r"""
+$cpu = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor | ? Name -eq '_Total'
+$mem = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory
+$sys = Get-CimInstance Win32_PerfFormattedData_PerfOS_System
+$dsk = Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk | ? Name -eq '_Total'
+[pscustomobject]@{
+  CpuPct=$cpu.PercentProcessorTime; CpuPrivilegedPct=$cpu.PercentPrivilegedTime
+  CpuInterruptPct=$cpu.PercentInterruptTime; ProcessorQueue=$sys.ProcessorQueueLength
+  ContextSwitchesSec=$sys.ContextSwitchesPersec
+  MemAvailableMB=$mem.AvailableMBytes; MemCommittedPct=$mem.PercentCommittedBytesInUse
+  PagesPerSec=$mem.PagesPersec; PoolNonpagedMB=[math]::Round($mem.PoolNonpagedBytes/1MB,1)
+  DiskReadMs=[math]::Round($dsk.AvgDisksecPerRead*1000,2)
+  DiskWriteMs=[math]::Round($dsk.AvgDisksecPerWrite*1000,2)
+  DiskQueue=$dsk.CurrentDiskQueueLength; DiskIOPS=$dsk.DiskTransfersPersec
+} | ConvertTo-Json -Compress
+""")
+
+
+@mcp.tool
+def get_top_processes(host: str, sort_by: str = "cpu", top: int = 15):
+    """Top processos por 'cpu' ou 'memory' (valores instantâneos)."""
+    key = "PercentProcessorTime" if sort_by == "cpu" else "WorkingSetPrivate"
+    return _ps(host, rf"""
+Get-CimInstance Win32_PerfFormattedData_PerfProc_Process |
+  ? {{ $_.Name -notin '_Total','Idle' }} | sort {key} -desc | select -first {int(top)} |
+  select Name,IDProcess,PercentProcessorTime,
+    @{{n='PrivateMB';e={{[math]::Round($_.WorkingSetPrivate/1MB,1)}}}},ThreadCount,HandleCount |
+  ConvertTo-Json -Compress
+""")
+
+
+@mcp.tool
+def get_events(
+    host: str,
+    log_name: str = "System",
+    days: int = 1,
+    levels: list[int] = [1, 2, 3],
+    event_ids: list[int] | None = None,
+    provider: str | None = None,
+    max_events: int = 50,
+):
+    """Eventos de PROBLEMA do Event Viewer: por padrão só Crítico(1), Erro(2) e Aviso(3) do último dia.
+    days: período (padrão 1; aumente só se o usuário pedir análise de mais dias, máx. 90).
+    levels: 1=Crítico, 2=Erro, 3=Aviso (4=Info só se pedido explicitamente)."""
+    if not NAME_RE.match(log_name) or (provider and not NAME_RE.match(provider)):
+        raise ValueError("log_name/provider inválido")
+    if not levels or any(int(lv) not in (1, 2, 3, 4, 5) for lv in levels):
+        raise ValueError("levels deve conter valores entre 1 e 5")
+    flt = f"LogName='{log_name}'; StartTime=(Get-Date).AddDays(-{_days(days)}); Level={_ints(levels)}"
+    if event_ids:
+        flt += f"; Id={_ints(event_ids)}"
+    if provider:
+        flt += f"; ProviderName='{provider}'"
+    return _ps(host, rf"""
+Get-WinEvent -FilterHashtable @{{{flt}}} -MaxEvents {min(int(max_events), 200)} -ErrorAction SilentlyContinue |
+  select TimeCreated,Id,LevelDisplayName,ProviderName,
+    @{{n='Message';e={{Msg $_.Message 500}}}} |
+  ConvertTo-Json -Compress
+""")
+
+
+EVENT_LOGS_DEFAULT = ["System", "Application", "Setup"]
+EVENT_LOGS_OPERATIONAL = [
+    "Microsoft-Windows-GroupPolicy/Operational",
+    "Microsoft-Windows-WindowsUpdateClient/Operational",
+    "Microsoft-Windows-TaskScheduler/Operational",
+    "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
+    "Microsoft-Windows-SMBClient/Connectivity",
+    "Microsoft-Windows-Time-Service/Operational",
+    "Microsoft-Windows-FailoverClustering/Operational",
+    "Microsoft-Windows-DNS-Client/Operational",
+]
+
+
+@mcp.tool
+def get_event_summary(
+    host: str,
+    days: int = 1,
+    levels: list[int] = [1, 2, 3],
+    include_operational: bool = False,
+    extra_logs: list[str] | None = None,
+    top: int = 20,
+):
+    """PONTO DE PARTIDA da RCA: agrupa eventos de problema (Crítico/Erro/Aviso) por log + nível + provedor + ID,
+    com contagem, primeira/última ocorrência e uma mensagem de exemplo. Padrão: último dia, logs System,
+    Application e Setup. include_operational=True adiciona logs operacionais úteis (GroupPolicy, WindowsUpdate,
+    TaskScheduler, RDS, SMB, Time, FailoverClustering, DNS-Client). days: aumente só se pedido (máx. 90)."""
+    logs = list(EVENT_LOGS_DEFAULT) + (EVENT_LOGS_OPERATIONAL if include_operational else []) + list(extra_logs or [])
+    for lg in logs:
+        if not NAME_RE.match(lg):
+            raise ValueError(f"log inválido: {lg}")
+    if not levels or any(int(lv) not in (1, 2, 3, 4, 5) for lv in levels):
+        raise ValueError("levels deve conter valores entre 1 e 5")
+    res = _ps(host, r"""
+$since = (Get-Date).AddDays(-__D__)
+$logs = @(__LOGS__)
+$totals = @(); $groups = @()
+foreach ($l in $logs) {
+  if (-not (Get-WinEvent -ListLog $l -ErrorAction SilentlyContinue)) { continue }
+  $ev = @(Get-WinEvent -FilterHashtable @{LogName=$l;StartTime=$since;Level=__LV__} -MaxEvents 20000 -ErrorAction SilentlyContinue)
+  if (-not $ev.Count) { continue }
+  $totals += @($ev | group LevelDisplayName | % { [pscustomobject]@{ Log=$l; Level=$_.Name; Count=$_.Count } })
+  $groups += @($ev | group ProviderName,Id,LevelDisplayName | sort Count -desc | select -first __T__ | % {
+      $g = $_.Group | sort TimeCreated
+      [pscustomobject]@{ Log=$l; Level=$g[0].LevelDisplayName; Provider=$g[0].ProviderName; Id=$g[0].Id; Count=$_.Count
+        First=$g[0].TimeCreated; Last=$g[-1].TimeCreated; Sample=(Msg $g[-1].Message 300) } })
+}
+[pscustomobject]@{ Totals=$totals; Groups=$groups } | ConvertTo-Json -Depth 3 -Compress
+""".replace("__D__", str(_days(days))).replace("__LV__", _ints(levels))
+       .replace("__T__", str(max(1, min(int(top), 100))))
+       .replace("__LOGS__", ",".join(f"'{lg}'" for lg in logs)), timeout=180)
+    if not isinstance(res, dict) or "error" in res:
+        return res
+    totals = sorted(_lst(res.get("Totals")), key=lambda t: -t["Count"])
+    groups = sorted(_lst(res.get("Groups")), key=lambda g: -g["Count"])
+    return {"period_days": _days(days), "logs": logs, "levels": levels,
+            "total_events": sum(t["Count"] for t in totals),
+            "totals_by_log_level": totals,
+            "groups": groups or "Nenhum evento de problema no período."}
+
+
+@mcp.tool
+def get_reboot_and_crash_history(host: str, days: int = 1):
+    """Reboots, desligamentos inesperados e BSOD (IDs 41, 1001, 1074, 1076, 6005, 6006, 6008).
+    days: padrão 1 (aumente se pedido, máx. 90)."""
+    return _ps(host, rf"""
+Get-WinEvent -FilterHashtable @{{LogName='System';StartTime=(Get-Date).AddDays(-{_days(days)});Id=41,1001,1074,1076,6005,6006,6008}} -ErrorAction SilentlyContinue |
+  select TimeCreated,Id,ProviderName,
+    @{{n='Message';e={{Msg $_.Message 400}}}} |
+  ConvertTo-Json -Compress
+""")
+
+
+@mcp.tool
+def get_stopped_auto_services(host: str):
+    """Serviços com início automático que não estão em execução."""
+    return _ps(host, r"""
+Get-CimInstance Win32_Service | ? { $_.StartMode -eq 'Auto' -and $_.State -ne 'Running' } |
+  select Name,DisplayName,State,ExitCode,StartName | ConvertTo-Json -Compress
+""")
+
+
+@mcp.tool
+def get_disks(host: str):
+    """Volumes: tamanho, livre e % livre."""
+    return _ps(host, r"""
+Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" |
+  select DeviceID,VolumeName,
+    @{n='SizeGB';e={[math]::Round($_.Size/1GB,1)}},
+    @{n='FreeGB';e={[math]::Round($_.FreeSpace/1GB,1)}},
+    @{n='FreePct';e={[math]::Round(100*$_.FreeSpace/$_.Size,1)}} | ConvertTo-Json -Compress
+""")
+
+
+@mcp.tool
+def get_recent_hotfixes(host: str, top: int = 15):
+    """Últimos patches instalados (útil para correlacionar com início do problema)."""
+    return _ps(host, rf"""
+Get-HotFix | sort InstalledOn -desc | select -first {int(top)} HotFixID,Description,InstalledOn,InstalledBy |
+  ConvertTo-Json -Compress
+""")
+
+
+# ---------- patches ----------
+@mcp.tool
+def get_patch_status(host: str):
+    """Situação de patches: último hotfix, dias sem patch, última detecção/instalação do WU,
+    WSUS configurado, reboot pendente (CBS, WU, file rename) e estado do serviço wuauserv."""
+    return _ps(host, r"""
+function V($p,$n){ try{ (Get-ItemProperty $p -ErrorAction Stop).$n }catch{ $null } }
+$os   = Get-CimInstance Win32_OperatingSystem
+$last = Get-HotFix | sort InstalledOn -desc | select -first 1
+$days = $null; if($last.InstalledOn){ $days = [int]((Get-Date)-$last.InstalledOn).TotalDays }
+$au = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\Results'
+$wu = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+[pscustomobject]@{
+  OS=$os.Caption; Build=$os.BuildNumber
+  UBR=(V 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' 'UBR')
+  LastHotfixId=$last.HotFixID; LastHotfixDate=$last.InstalledOn; DaysSinceLastPatch=$days
+  WU_LastDetect=(V "$au\Detect" 'LastSuccessTime')
+  WU_LastInstall=(V "$au\Install" 'LastSuccessTime')
+  WsusServer=(V $wu 'WUServer'); UseWsus=(V "$wu\AU" 'UseWUServer')
+  RebootPending_CBS=(Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending')
+  RebootPending_WU=(Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')
+  RebootPending_FileRename=[bool](V 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' 'PendingFileRenameOperations')
+  WuauservState=(Get-Service wuauserv).Status.ToString()
+} | ConvertTo-Json -Compress
+""")
+
+
+@mcp.tool
+def get_pending_updates(host: str):
+    """Updates pendentes (não instalados) segundo o agente do Windows Update / WSUS.
+    Obs.: a API COM do WUA pode retornar 'Access denied' em sessões remotas WinRM;
+    nesse caso use get_patch_status + get_windows_update_history."""
+    return _ps(host, r"""
+try {
+  $s = New-Object -ComObject Microsoft.Update.Session
+  $r = $s.CreateUpdateSearcher().Search("IsInstalled=0 and IsHidden=0")
+  @($r.Updates | select Title,
+    @{n='KB';e={$_.KBArticleIDs -join ','}}, @{n='Severity';e={$_.MsrcSeverity}},
+    @{n='RebootRequired';e={$_.RebootRequired}}, @{n='Downloaded';e={$_.IsDownloaded}}) |
+    ConvertTo-Json -Compress
+} catch { [pscustomobject]@{Error=$_.Exception.Message} | ConvertTo-Json -Compress }
+""")
+
+
+@mcp.tool
+def get_windows_update_history(host: str, days: int = 1):
+    """Histórico de instalação/falha de updates (WindowsUpdateClient: 19=sucesso, 20=falha, 21=reboot necessário).
+    days: padrão 1 (aumente se pedido, máx. 90)."""
+    return _ps(host, r"""
+Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-WindowsUpdateClient/Operational';
+  StartTime=(Get-Date).AddDays(-__D__);Id=19,20,21} -ErrorAction SilentlyContinue |
+  select TimeCreated,Id,
+    @{n='Message';e={Msg $_.Message 400}} |
+  ConvertTo-Json -Compress
+""".replace("__D__", str(_days(days))))
+
+
+# ---------- serviços ----------
+SVC_RE = re.compile(r"^[A-Za-z0-9*._-]{1,100}$")
+
+
+@mcp.tool
+def get_services(
+    host: str,
+    name_filter: str = "*",
+    state: str | None = None,
+    start_mode: str | None = None,
+):
+    """Lista serviços (wildcard em nome/display name). state: Running|Stopped; start_mode: Auto|Manual|Disabled."""
+    if not SVC_RE.match(name_filter):
+        raise ValueError("name_filter inválido")
+    if state not in (None, "Running", "Stopped") or start_mode not in (None, "Auto", "Manual", "Disabled"):
+        raise ValueError("state/start_mode inválido")
+    extra = (f" -and $_.State -eq '{state}'" if state else "") + (
+        f" -and $_.StartMode -eq '{start_mode}'" if start_mode else ""
+    )
+    return _ps(host, rf"""
+Get-CimInstance Win32_Service |
+  ? {{ ($_.Name -like '{name_filter}' -or $_.DisplayName -like '{name_filter}'){extra} }} |
+  select Name,DisplayName,State,StartMode,StartName,ProcessId,ExitCode,PathName |
+  ConvertTo-Json -Compress
+""")
+
+
+@mcp.tool
+def get_service_failures(host: str, days: int = 1):
+    """Falhas de serviços no SCM (7000, 7001, 7009, 7011, 7022, 7023, 7024, 7026, 7031, 7032, 7034).
+    days: padrão 1 (aumente se pedido, máx. 90)."""
+    return _ps(host, rf"""
+Get-WinEvent -FilterHashtable @{{LogName='System';ProviderName='Service Control Manager';
+  StartTime=(Get-Date).AddDays(-{_days(days)});Id=7000,7001,7009,7011,7022,7023,7024,7026,7031,7032,7034}} -ErrorAction SilentlyContinue |
+  select TimeCreated,Id,
+    @{{n='Message';e={{Msg $_.Message 400}}}} |
+  ConvertTo-Json -Compress
+""")
+
+
+# ---------- roles, features e software ----------
+@mcp.tool
+def get_roles_and_features(host: str, only_installed: bool = True):
+    """Roles, role services e features do Windows Server (Get-WindowsFeature).
+    Requer privilégio administrativo local."""
+    flt = "| ? Installed" if only_installed else ""
+    return _ps(host, rf"""
+Get-WindowsFeature {flt} | select Name,DisplayName,FeatureType,InstallState,Installed |
+  ConvertTo-Json -Compress
+""")
+
+
+@mcp.tool
+def get_installed_software(host: str, name_filter: str = "*"):
+    """Software instalado (registro de Uninstall, 64 e 32 bits)."""
+    if not SVC_RE.match(name_filter):
+        raise ValueError("name_filter inválido")
+    return _ps(host, rf"""
+$p='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+   'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+Get-ItemProperty $p -ErrorAction SilentlyContinue | ? {{ $_.DisplayName -like '{name_filter}' }} |
+  sort DisplayName | select DisplayName,DisplayVersion,Publisher,InstallDate | ConvertTo-Json -Compress
+""")
+
+
+# ---------- postura operacional / segurança ----------
+@mcp.tool
+def get_security_posture(host: str):
+    """Defender (status e idade das assinaturas), perfis do firewall e RDP habilitado."""
+    return _ps(host, r"""
+$mp = try { Get-MpComputerStatus | select AMServiceEnabled,AntivirusEnabled,RealTimeProtectionEnabled,
+        AntivirusSignatureLastUpdated,AntivirusSignatureAge,QuickScanEndTime,FullScanEndTime } catch { $null }
+$fw = Get-NetFirewallProfile | select Name,Enabled,DefaultInboundAction,DefaultOutboundAction
+$rdp = ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server').fDenyTSConnections -eq 0)
+[pscustomobject]@{Defender=$mp;Firewall=$fw;RdpEnabled=$rdp} | ConvertTo-Json -Depth 4 -Compress
+""")
+
+
+@mcp.tool
+def get_time_sync_status(host: str):
+    """Status do w32time (fonte, último sync, offset). Desvio de hora quebra Kerberos/AD."""
+    return _ps(host, r"""
+[pscustomobject]@{
+  Source=(w32tm /query /source | Out-String).Trim()
+  Status=(w32tm /query /status | Out-String).Trim()
+} | ConvertTo-Json -Compress
+""")
+
+
+@mcp.tool
+def get_expiring_certificates(host: str, days_threshold: int = 60):
+    """Certificados do repositório LocalMachine\\My vencidos ou que vencem em até N dias."""
+    return _ps(host, r"""
+Get-ChildItem Cert:\LocalMachine\My |
+  select Subject,Thumbprint,NotAfter,HasPrivateKey,
+    @{n='DaysLeft';e={[int]($_.NotAfter-(Get-Date)).TotalDays}} |
+  ? { $_.DaysLeft -le __D__ } | sort DaysLeft | ConvertTo-Json -Compress
+""".replace("__D__", str(int(days_threshold))))
+
+
+# ---------- saúde do CBS e do Windows Update (erros escondidos na aplicação de patches) ----------
+HEX_RE = re.compile(r"0x[0-9A-Fa-f]{8}")
+WU_HINTS = {
+    "0x80073712": "Component store corrompido/arquivo ausente (CBS). Rodar DISM /RestoreHealth.",
+    "0x80073701": "Assembly ausente no component store (CBS). Rodar DISM /RestoreHealth.",
+    "0x800f081f": "Arquivos-fonte não encontrados (CBS). DISM /RestoreHealth com fonte válida.",
+    "0x800f0831": "Store corrompido ou pré-requisito (KB anterior) ausente.",
+    "0x800f0922": "Falha genérica de instalação; comum: pouco espaço na System Reserved/EFI, corrupção CBS, rollback.",
+    "0x80070070": "Disco cheio.",
+    "0x80070005": "Acesso negado (permissões, antivírus, TrustedInstaller).",
+    "0x80070002": "Arquivo não encontrado (cache do WU/CBS).",
+    "0x8007000d": "Dados inválidos (cache do WU ou store corrompido).",
+    "0x80070bc9": "Reboot pendente impedindo a instalação.",
+    "0x800705b4": "Timeout na operação.",
+    "0x80240034": "Falha no download do update.",
+    "0x80246007": "Update não foi baixado.",
+    "0x8024402c": "Falha de resolução de nome/proxy/WSUS.",
+    "0x80244022": "Serviço WSUS/Microsoft indisponível (HTTP 503).",
+}
+PATH_RE = re.compile(r"^[A-Za-z]:\\[^'\"`$;|&<>*?\r\n]{0,240}$")
+
+
+def _lst(x):
+    return x if isinstance(x, list) else ([] if not x else [x])
+
+
+def _path(p: str) -> str:
+    if not PATH_RE.match(p):
+        raise ValueError(r"Caminho inválido (use o formato C:\pasta)")
+    return p
+
+
+@mcp.tool
+def get_cbs_health(host: str):
+    """Saúde do CBS (Component Based Servicing): DISM /CheckHealth (rápido, só leitura), pending.xml,
+    flags de reboot/pacotes/sessões pendentes, TrustedInstaller e tamanho dos logs do CBS."""
+    res = _ps(host, r"""
+$ErrorActionPreference='Continue'
+$k='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing'
+$d = RunDism '/Online /Cleanup-Image /CheckHealth' 90
+$cbs = Get-ChildItem "$env:SystemRoot\Logs\CBS" -Force -ErrorAction SilentlyContinue
+[pscustomobject]@{
+  DismCheckHealth=$d.Output; DismExitCode=$d.ExitCode; DismBusy=$d.Busy; DismTimedOut=$d.TimedOut
+  PendingXmlExists=(Test-Path "$env:SystemRoot\WinSxS\pending.xml")
+  RebootPending=(Test-Path "$k\RebootPending"); RebootInProgress=(Test-Path "$k\RebootInProgress")
+  PackagesPending=(Test-Path "$k\PackagesPending"); SessionsPending=(Test-Path "$k\SessionsPending")
+  TrustedInstaller=(Get-Service TrustedInstaller | select @{n='Status';e={"$($_.Status)"}},@{n='StartType';e={"$($_.StartType)"}})
+  CbsLogDir_MB=[math]::Round((($cbs | measure Length -Sum).Sum)/1MB,1)
+  CbsLog_LastWrite=($cbs | ? Name -eq 'CBS.log' | select -first 1).LastWriteTime
+} | ConvertTo-Json -Depth 3 -Compress
+""", timeout=120)
+    if isinstance(res, dict) and "DismCheckHealth" in res:
+        txt = res["DismCheckHealth"] or ""
+        res["Heuristic_StoreRepairable"] = bool(re.search(r"repairable|repar[aá]vel", txt, re.I))
+        res["Heuristic_Healthy"] = res["DismExitCode"] == 0 and not res["Heuristic_StoreRepairable"]
+    return res
+
+
+@mcp.tool
+def get_component_store_analysis(host: str, max_seconds: int = 300):
+    """DISM /AnalyzeComponentStore: tamanho real do WinSxS, espaço recuperável e se limpeza é recomendada.
+    Somente leitura, mas pode levar de 1 a 5 minutos. Não inicia se já houver um DISM rodando; se exceder
+    'max_seconds' o DISM é encerrado (nada fica pendurado no servidor)."""
+    return _ps(host, r"""
+$ErrorActionPreference='Continue'
+RunDism '/Online /Cleanup-Image /AnalyzeComponentStore' __S__ | ConvertTo-Json -Compress
+""".replace("__S__", str(max(60, min(int(max_seconds), 900)))), timeout=max(60, min(int(max_seconds), 900)) + 60)
+
+
+SERVICING_HINTS = {
+    "0x800f0805": "CBS_E_INVALID_PACKAGE: pacote inválido/não aplicável; costuma ser benigno ao enumerar pacotes.",
+    "0x800f080c": "CBS_E_UNKNOWN_UPDATE: feature/pacote desconhecido; normalmente benigno.",
+    "0x80070490": "Elemento não encontrado (manifesto/registro do CBS); pode indicar corrupção.",
+    "0x800f0982": "PSFX: falta de manifesto/arquivo do pacote; rodar DISM /RestoreHealth.",
+    "0x800f0988": "Falha na limpeza do component store; reboot e repetir.",
+    "0x80070020": "Arquivo em uso por outro processo (antivírus/backup).",
+}
+
+
+@mcp.tool
+def get_cbs_log_errors(host: str, days: int = 1, include_dism: bool = True, top: int = 25):
+    """Problemas nos logs de servicing (CBS.log + CbsPersist_*.log e, se include_dism, dism.log) do ÚLTIMO DIA
+    (days ampliável até 90 se pedido). Considera só linhas Error/Warning e Info com HRESULT de falha (0x8...),
+    'Cannot repair' e 'corrupt'. Para otimizar a análise, AGRUPA mensagens repetidas (números normalizados),
+    conta por fonte/nível, lista os HRESULTs mais frequentes com dica e devolve só os 'top' grupos.
+    Revela corrupção e falhas de patch que não aparecem no Event Viewer. Arquivos .cab compactados são ignorados."""
+    res = _ps(host, r"""
+$cutDate = (Get-Date).AddDays(-__D__); $cut = $cutDate.ToString('yyyy-MM-dd HH:mm:ss')
+$cbsDir = "$env:SystemRoot\Logs\CBS"
+$files = @(Get-ChildItem $cbsDir -Filter 'CBS.log' -File -ErrorAction SilentlyContinue)
+$files += @(Get-ChildItem $cbsDir -Filter 'CbsPersist_*.log' -File -ErrorAction SilentlyContinue | ? { $_.LastWriteTime -ge $cutDate })
+if (__DISM__) { $files += @(Get-ChildItem "$env:SystemRoot\Logs\DISM" -Filter 'dism*.log' -File -ErrorAction SilentlyContinue | ? { $_.LastWriteTime -ge $cutDate }) }
+$cabs = @(Get-ChildItem $cbsDir -Filter 'CbsPersist_*.cab' -File -ErrorAction SilentlyContinue | ? { $_.LastWriteTime -ge $cutDate }).Count
+$hit = '^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d, (Error|Warning) |HRESULT = 0x8|Cannot repair|[Cc]orrupt'
+$pat = '^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d), (\w+)\s+(\S+)\s+(.*)$'
+$groups = @{}; $byLevel = @{}; $hr = @{}; $stats = @(); $cr = 0; $co = 0; $total = 0
+$sw = [Diagnostics.Stopwatch]::StartNew()
+foreach ($f in $files) {
+  $src = if ($f.Name -like 'dism*') { 'DISM' } else { 'CBS' }; $n = 0
+  foreach ($m in (Select-String -LiteralPath $f.FullName -Pattern $hit -ErrorAction SilentlyContinue)) {
+    $l = $m.Line
+    if ($l.Length -lt 19 -or $l.Substring(0,19) -lt $cut) { continue }
+    if ($l -notmatch $pat) { continue }
+    $ts = $matches[1]; $lv = $matches[2]; $comp = $matches[3]; $msg = $matches[4].Trim()
+    if ($lv -eq 'Info' -and $msg -notmatch 'HRESULT = 0x8|Cannot repair|[Cc]orrupt') { continue }
+    if ($lv -eq 'Info') { $lv = 'Info(falha)' }
+    $n++
+    if ($msg -match 'Cannot repair') { $cr++ }
+    if ($msg -match '[Cc]orrupt' -and $msg -notmatch '[Nn]o (component store )?corruption') { $co++ }
+    if ($msg -match 'HRESULT = (0x[0-9A-Fa-f]{8})(?: - (\w+))?') { $c = $matches[1].ToLower(); if (-not $hr[$c]) { $hr[$c] = @(0, $matches[2]) }; $hr[$c][0]++ }
+    $bk = "$src|$lv"; $byLevel[$bk] = 1 + [int]$byLevel[$bk]
+    $norm = ($msg -replace '\{[0-9A-Fa-f-]{36}\}', '{GUID}' -replace '(?<!0x[0-9A-Fa-f]{0,7})\d+', '#')
+    $key = "$src|$lv|" + $norm.Substring(0, [math]::Min(250, $norm.Length))
+    $g = $groups[$key]
+    if (-not $g) { $g = [pscustomobject]@{ Source=$src; Level=$lv; Component=$comp; Count=0; First=$ts; Last=$ts
+        Sample=$msg.Substring(0,[math]::Min(300,$msg.Length)) }; $groups[$key] = $g }
+    $g.Count++; if ($ts -lt $g.First) { $g.First = $ts }
+    if ($ts -gt $g.Last) { $g.Last = $ts; $g.Sample = $msg.Substring(0,[math]::Min(300,$msg.Length)) }
+  }
+  $stats += [pscustomobject]@{ File=$f.Name; SizeMB=[math]::Round($f.Length/1MB,1); ProblemLines=$n }
+  $total += $n
+}
+[pscustomobject]@{
+  PeriodDays=__D__; Since=$cut; ScanSeconds=[math]::Round($sw.Elapsed.TotalSeconds,1)
+  FilesScanned=$stats; CompressedCabsSkipped=$cabs
+  TotalProblemLines=$total; DistinctProblems=$groups.Count; CannotRepairCount=$cr; CorruptCount=$co
+  ByLevel=@($byLevel.GetEnumerator() | sort Value -desc | % { [pscustomobject]@{ Source=$_.Key.Split('|')[0]; Level=$_.Key.Split('|')[1]; Count=$_.Value } })
+  TopHResults=@($hr.GetEnumerator() | sort { $_.Value[0] } -desc | select -first 15 | % { [pscustomobject]@{ Code=$_.Key; Name=$_.Value[1]; Count=$_.Value[0] } })
+  TopProblems=@($groups.Values | sort Count -desc | select -first __T__)
+} | ConvertTo-Json -Depth 4 -Compress
+""".replace("__D__", str(_days(days))).replace("__DISM__", "$true" if include_dism else "$false")
+       .replace("__T__", str(max(1, min(int(top), 100)))), timeout=300)
+    if isinstance(res, dict):
+        for h in _lst(res.get("TopHResults")):
+            h["Hint"] = SERVICING_HINTS.get(h["Code"]) or WU_HINTS.get(h["Code"]) or ""
+    return res
+
+
+@mcp.tool
+def get_windows_update_health(host: str):
+    """Saúde do Windows Update: serviços (wuauserv, bits, cryptsvc, TrustedInstaller, msiserver),
+    tamanho do SoftwareDistribution/DataStore/catroot2, proxy WinHTTP e espaço livre no disco do sistema."""
+    return _ps(host, r"""
+function SZ($p,$u){ if(Test-Path -LiteralPath $p){ [math]::Round(((Get-ChildItem -LiteralPath $p -Recurse -Force -File -ErrorAction SilentlyContinue | measure Length -Sum).Sum)/$u,2) } }
+$sd = "$env:SystemRoot\SoftwareDistribution"
+$ld = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'"
+[pscustomobject]@{
+  Services=@(Get-Service wuauserv,bits,cryptsvc,TrustedInstaller,msiserver -ErrorAction SilentlyContinue | select Name,Status,StartType)
+  SoftwareDistributionDownload_GB=(SZ "$sd\Download" 1GB)
+  SoftwareDistributionTotal_GB=(SZ $sd 1GB)
+  DataStoreEdb_GB=[math]::Round(((Get-Item "$sd\DataStore\DataStore.edb" -ErrorAction SilentlyContinue).Length)/1GB,2)
+  Catroot2_MB=(SZ "$env:SystemRoot\System32\catroot2" 1MB)
+  WinHttpProxy=((netsh winhttp show proxy | Out-String).Trim())
+  SystemDrive_FreeGB=[math]::Round($ld.FreeSpace/1GB,1)
+} | ConvertTo-Json -Depth 4 -Compress
+""", timeout=180)
+
+
+@mcp.tool
+def get_update_error_analysis(host: str, days: int = 1):
+    """Falhas de instalação/download de updates agrupadas por código de erro (HRESULT), com causa provável.
+    days: padrão 1 (aumente se pedido, máx. 90)."""
+    ev = _ps(host, r"""
+Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-WindowsUpdateClient/Operational';
+  StartTime=(Get-Date).AddDays(-__D__);Id=20,31} -ErrorAction SilentlyContinue |
+  select TimeCreated,Id,
+    @{n='Message';e={Msg $_.Message 500}} |
+  ConvertTo-Json -Compress
+""".replace("__D__", str(_days(days))), timeout=120)
+    if isinstance(ev, dict) and "Id" not in ev:
+        return ev  # erro ou saída crua
+    events = _lst(ev)
+    agg = {}
+    for e in events:
+        for code in {c.lower() for c in HEX_RE.findall(e.get("Message") or "")}:
+            a = agg.setdefault(code, {"error_code": code, "count": 0, "last_seen": None,
+                                      "hint": WU_HINTS.get(code, "Código sem dica local; pesquisar o HRESULT.")})
+            a["count"] += 1
+            a["last_seen"] = max(filter(None, [a["last_seen"], e.get("TimeCreated")]), default=None)
+    return {"failure_events": len(events),
+            "by_error_code": sorted(agg.values(), key=lambda a: -a["count"]),
+            "recent_events": events[:20]}
+
+
+# ---------- disco: espaço, ofensores e alocação sem uso ----------
+@mcp.tool
+def get_disk_usage_tree(
+    host: str,
+    path: str = "C:\\",
+    depth: int = 3,
+    top_children: int = 10,
+    top_files: int = 25,
+    min_file_size_mb: int = 100,
+    threads: int = 8,
+    scan_timeout_s: int = 300,
+    old_days: int = 365,
+):
+    """Análise de espaço estilo TreeSize, em uma única passada rápida (API nativa FindFirstFileEx + paralelismo).
+    Retorna: árvore de pastas até 'depth' níveis (maiores filhos, % do total), maiores arquivos, uso por extensão,
+    volume de dados sem modificação há 'old_days' dias e contagem de acessos negados. Tamanhos são lógicos.
+    Se estourar scan_timeout_s devolve resultado parcial (partial=true). Exige Add-Type (C#) liberado no servidor."""
+    p = _path(path)
+    depth = max(1, min(int(depth), 6))
+    args = (f"'{p}', {depth}, {max(3, min(int(top_children), 30))}, {max(5, min(int(top_files), 100))}, "
+            f"{max(1, int(min_file_size_mb)) * 1048576}, {max(1, min(int(threads), 16))}, "
+            f"{max(30, min(int(scan_timeout_s), 1500))}, {max(1, int(old_days))}")
+    src = (Path(__file__).parent / "diskscan.cs").read_text(encoding="utf-8")
+    script = f"$src = @'\n{src}\n'@\nAdd-Type -TypeDefinition $src\n[DiskScan]::Run({args})\n"
+    res = _ps_long(host, script, timeout=max(30, min(int(scan_timeout_s), 1500)) + 60)
+    if isinstance(res, dict) and "error" in res:
+        res["hint"] = ("Falha ao compilar/executar o scanner (Add-Type bloqueado por AppLocker/WDAC/Constrained "
+                       "Language?). Use get_largest_folders/get_largest_files como alternativa mais lenta.")
+    return res
+
+
+@mcp.tool
+def get_largest_folders(host: str, path: str = "C:\\", top: int = 15):
+    """Alternativa lenta (PowerShell puro) a get_disk_usage_tree: maiores itens de 'path', 1 nível."""
+    p = _path(path)
+    return _ps(host, r"""
+Get-ChildItem -LiteralPath '__P__' -Force -ErrorAction SilentlyContinue | % {
+  if($_.Attributes -band [IO.FileAttributes]::ReparsePoint){ $t='Link (ignorado)'; $s=0 }
+  elseif($_.PSIsContainer){ $t='Pasta'; $s=(Get-ChildItem -LiteralPath $_.FullName -Recurse -Force -File -ErrorAction SilentlyContinue | measure Length -Sum).Sum }
+  else { $t='Arquivo'; $s=$_.Length }
+  [pscustomobject]@{Path=$_.FullName; Type=$t; SizeGB=[math]::Round($s/1GB,2)}
+} | sort SizeGB -desc | select -first __N__ | ConvertTo-Json -Compress
+""".replace("__P__", p).replace("__N__", str(min(int(top), 50))), timeout=600)
+
+
+@mcp.tool
+def get_largest_files(host: str, path: str = "C:\\", top: int = 20, min_size_mb: int = 500):
+    """Alternativa lenta (PowerShell puro) a get_disk_usage_tree: maiores arquivos acima de min_size_mb."""
+    p = _path(path)
+    return _ps(host, r"""
+Get-ChildItem -LiteralPath '__P__' -Recurse -Force -File -ErrorAction SilentlyContinue |
+  ? { $_.Length -ge __MIN__ } | sort Length -desc | select -first __N__ |
+  select FullName,@{n='SizeGB';e={[math]::Round($_.Length/1GB,2)}},LastWriteTime,Extension |
+  ConvertTo-Json -Compress
+""".replace("__P__", p).replace("__N__", str(min(int(top), 100))).replace("__MIN__", str(int(min_size_mb) * 1048576)),
+        timeout=900)
+
+
+@mcp.tool
+def get_common_space_offenders(host: str):
+    """Verifica rapidamente os ofensores clássicos de espaço: Temp, cache do WU, CBS logs, Installer, dumps
+    (MEMORY.DMP/Minidump/LiveKernelReports), WER, logs do IIS, lixeira, pagefile/hiberfil, temp de usuários
+    e armazenamento de Shadow Copies (VSS)."""
+    return _ps(host, r"""
+function SZ($p){ if(Test-Path -Path $p){ [math]::Round(((Get-ChildItem -Path $p -Recurse -Force -File -ErrorAction SilentlyContinue | measure Length -Sum).Sum)/1GB,2) } }
+$sr=$env:SystemRoot; $sd=$env:SystemDrive
+$dirs = [ordered]@{
+ 'Windows\Temp'="$sr\Temp"; 'WU download cache'="$sr\SoftwareDistribution\Download"
+ 'CBS logs'="$sr\Logs\CBS"; 'Windows\Installer'="$sr\Installer"; 'Minidump'="$sr\Minidump"
+ 'LiveKernelReports'="$sr\LiveKernelReports"; 'WER'="$env:ProgramData\Microsoft\Windows\WER"
+ 'IIS logs'="$sd\inetpub\logs"; 'Lixeira'=($sd+'\$Recycle.Bin'); 'Temp de usuários'="$sd\Users\*\AppData\Local\Temp"
+ 'SCCM cache'="$sr\ccmcache"
+}
+$items = foreach($k in $dirs.Keys){ [pscustomobject]@{Item=$k; Path=$dirs[$k]; SizeGB=(SZ $dirs[$k])} }
+$files = foreach($f in "$sr\MEMORY.DMP","$sd\pagefile.sys","$sd\hiberfil.sys","$sd\swapfile.sys"){
+  $i = Get-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
+  if($i){ [pscustomobject]@{File=$f; SizeGB=[math]::Round($i.Length/1GB,2); LastWrite=$i.LastWriteTime} } }
+$vss = try { Get-CimInstance Win32_ShadowStorage | select @{n='Volume';e={$_.Volume.DeviceID}},
+  @{n='UsedGB';e={[math]::Round($_.UsedSpace/1GB,2)}},@{n='AllocatedGB';e={[math]::Round($_.AllocatedSpace/1GB,2)}},
+  @{n='MaxGB';e={[math]::Round($_.MaxSpace/1GB,2)}} } catch { $null }
+[pscustomobject]@{Folders=@($items | ? SizeGB | sort SizeGB -desc); Files=@($files); ShadowStorage=@($vss)} |
+  ConvertTo-Json -Depth 4 -Compress
+""", timeout=600)
+
+
+@mcp.tool
+def get_disk_allocation_analysis(host: str):
+    """Discos físicos/virtuais alocados à VM/servidor mas sem uso: discos OFFLINE, RAW (não inicializados),
+    espaço não alocado, partições sem letra/ponto de montagem e volumes muito subutilizados (possível desperdício)."""
+    data = _ps(host, r"""
+$disks = @(Get-Disk | % { [pscustomobject]@{
+  Number=$_.Number; Name=$_.FriendlyName; BusType=$_.BusType.ToString(); Partitioning=$_.PartitionStyle.ToString()
+  SizeGB=[math]::Round($_.Size/1GB,1); AllocatedGB=[math]::Round($_.AllocatedSize/1GB,1)
+  UnallocatedGB=[math]::Round(($_.Size-$_.AllocatedSize)/1GB,1)
+  Operational=($_.OperationalStatus | Out-String).Trim(); Health=$_.HealthStatus.ToString()
+  Offline=$_.IsOffline; ReadOnly=$_.IsReadOnly; Partitions=$_.NumberOfPartitions } })
+$parts = @(Get-Partition -ErrorAction SilentlyContinue | select DiskNumber,PartitionNumber,
+  @{n='Type';e={$_.Type.ToString()}},
+  @{n='DriveLetter';e={ if($_.DriveLetter){ [string]$_.DriveLetter } else { $null } }},
+  @{n='SizeGB';e={[math]::Round($_.Size/1GB,1)}},
+  @{n='MountPaths';e={ @($_.AccessPaths | ? { $_ -and $_ -notlike '\\?\*' }) }})
+$vols = @(Get-Volume | ? { $_.DriveType -eq 'Fixed' } | select DriveLetter,FileSystemLabel,FileSystem,
+  @{n='Health';e={$_.HealthStatus.ToString()}},
+  @{n='SizeGB';e={[math]::Round($_.Size/1GB,1)}},@{n='FreeGB';e={[math]::Round($_.SizeRemaining/1GB,1)}},
+  @{n='FreePct';e={ if($_.Size){ [math]::Round(100*$_.SizeRemaining/$_.Size,1) } }})
+[pscustomobject]@{Disks=$disks;Partitions=$parts;Volumes=$vols} | ConvertTo-Json -Depth 4 -Compress
+""", timeout=120)
+    if not isinstance(data, dict) or "Disks" not in data:
+        return data
+    findings = []
+    for d in _lst(data["Disks"]):
+        tag = f"Disco {d['Number']} ({d['Name']}, {d['SizeGB']} GB, {d['BusType']})"
+        if d["Offline"]:
+            findings.append(f"{tag}: OFFLINE – capacidade alocada sem uso (candidato a reclamação).")
+        elif d["Partitioning"] == "RAW":
+            findings.append(f"{tag}: não inicializado (RAW) – alocado e nunca utilizado.")
+        elif d["UnallocatedGB"] >= 1:
+            findings.append(f"{tag}: {d['UnallocatedGB']} GB não alocados.")
+        if d["Health"] != "Healthy":
+            findings.append(f"{tag}: HealthStatus = {d['Health']}.")
+    for p in _lst(data["Partitions"]):
+        if p["Type"] == "Basic" and not p["DriveLetter"] and not _lst(p["MountPaths"]):
+            findings.append(f"Disco {p['DiskNumber']} partição {p['PartitionNumber']} ({p['SizeGB']} GB): "
+                            "sem letra nem ponto de montagem – dados inacessíveis/possível desperdício.")
+    for v in _lst(data["Volumes"]):
+        if v["SizeGB"] and v["SizeGB"] >= 100 and (v["FreePct"] or 0) >= 90:
+            findings.append(f"Volume {v['DriveLetter'] or v['FileSystemLabel']}: {v['SizeGB']} GB com "
+                            f"{v['FreePct']}% livre – subutilizado (candidato a right-sizing).")
+    data["Findings"] = findings or ["Nenhuma anomalia de alocação encontrada."]
+    return data
+
+
+# ---------- uptime, últimos patches e validação do CBS ----------
+@mcp.tool
+def get_uptime(host: str):
+    """Uptime: último boot, dias/horas ligado, quem/por que reiniciou por último (evento 1074) e se o
+    último boot veio de desligamento inesperado (eventos 41/6008), além da contagem em 30 dias."""
+    return _ps(host, r"""
+$os = Get-CimInstance Win32_OperatingSystem
+$boot = $os.LastBootUpTime; $up = (Get-Date) - $boot
+$sd = Get-WinEvent -FilterHashtable @{LogName='System';Id=1074} -MaxEvents 1 -ErrorAction SilentlyContinue
+$last = $null
+if ($sd) { $p = $sd.Properties; $last = [pscustomobject]@{
+  Time=$sd.TimeCreated; Process=$p[0].Value; Reason=$p[2].Value; Type=$p[4].Value; Comment=$p[5].Value; User=$p[6].Value } }
+$unexpBoot = @(Get-WinEvent -FilterHashtable @{LogName='System';Id=41,6008;StartTime=$boot.AddMinutes(-5)} -ErrorAction SilentlyContinue | ? { $_.Id -eq 6008 -or $_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' })
+$unexp30 = @(Get-WinEvent -FilterHashtable @{LogName='System';Id=41,6008;StartTime=(Get-Date).AddDays(-30)} -ErrorAction SilentlyContinue | ? { $_.Id -eq 6008 -or $_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' })
+[pscustomobject]@{
+  Host=$env:COMPUTERNAME; LastBoot=$boot
+  UptimeDays=[math]::Round($up.TotalDays,2); UptimeText=('{0}d {1}h {2}m' -f $up.Days,$up.Hours,$up.Minutes)
+  LastPlannedShutdown=$last
+  LastBootWasUnexpected=($unexpBoot.Count -gt 0)
+  UnexpectedShutdowns30d=$unexp30.Count
+} | ConvertTo-Json -Depth 3 -Compress
+""")
+
+
+@mcp.tool
+def get_last_patches(host: str, top: int = 10):
+    """Últimos patches aplicados: Get-HotFix (KB, data, dias atrás) + instalações com sucesso do Windows
+    Update (evento 19), build/UBR atual e dias desde o último patch."""
+    return _ps(host, r"""
+$now = Get-Date
+$nt = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+$hf = @(Get-HotFix | ? InstalledOn | sort InstalledOn -desc | select -first __N__ HotFixID,Description,InstalledOn,InstalledBy,
+  @{n='DaysAgo';e={[int]($now-$_.InstalledOn).TotalDays}})
+$wu = @(Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-WindowsUpdateClient/Operational';Id=19} -MaxEvents __N__ -ErrorAction SilentlyContinue |
+  select TimeCreated,@{n='Update';e={$_.Properties[0].Value}},@{n='DaysAgo';e={[int]($now-$_.TimeCreated).TotalDays}})
+$lastDays = $null; if ($hf.Count) { $lastDays = $hf[0].DaysAgo }
+[pscustomobject]@{
+  OS=$nt.ProductName; DisplayVersion=$nt.DisplayVersion; Build="$($nt.CurrentBuild).$($nt.UBR)"
+  DaysSinceLastPatch=$lastDays; HotFixes=$hf; WindowsUpdateInstalls=$wu
+} | ConvertTo-Json -Depth 4 -Compress
+""".replace("__N__", str(max(1, min(int(top), 50)))), timeout=120)
+
+
+CBS_CODES = {"0x80073712", "0x80073701", "0x800f081f", "0x800f0831", "0x800f0922", "0x800f0982", "0x800f0988"}
+_RANK = {"OK": 0, "Atenção": 1, "Crítico": 2}
+
+
+def _worst(*st: str) -> str:
+    return max(st, key=lambda s: _RANK[s]) if st else "OK"
+
+
+@mcp.tool
+def validate_cbs(host: str, days: int = 1):
+    """Veredito 'o CBS está quebrado?': combina DISM /CheckHealth, flags de pending/reboot, contagens de
+    'Cannot repair'/'corrupt' nos logs CBS/DISM e falhas de update com códigos típicos de corrupção.
+    Período dos logs: último dia por padrão (days ampliável até 90 se pedido).
+    Retorna status OK/Atenção/Crítico, evidências e ações recomendadas."""
+    health = get_cbs_health(host)
+    if not isinstance(health, dict) or "error" in health:
+        return {"status": "Desconhecido", "error": health}
+    log = get_cbs_log_errors(host, days=days, top=10)
+    upd = get_update_error_analysis(host, days=days)
+
+    status, evid, actions = "OK", [], []
+    dism = health.get("DismCheckHealth") or ""
+    if re.search(r"cannot be repaired|não pode ser reparad", dism, re.I):
+        status = _worst(status, "Crítico")
+        evid.append("DISM: component store NÃO reparável.")
+        actions.append("Store irreparável: reparo in-place (upgrade) ou reconstrução do servidor.")
+    elif health.get("Heuristic_StoreRepairable"):
+        status = _worst(status, "Crítico")
+        evid.append("DISM /CheckHealth: component store corrompido (reparável).")
+        actions.append("DISM /Online /Cleanup-Image /RestoreHealth (com /Source se não houver acesso ao WU) e depois sfc /scannow.")
+    elif health.get("DismBusy") or health.get("DismTimedOut"):
+        status = _worst(status, "Atenção")
+        evid.append("DISM /CheckHealth não concluiu: " + (health.get("DismCheckHealth") or "")
+                    + " (um DISM travado pode indicar servicing preso; verifique TiWorker/TrustedInstaller).")
+    elif health.get("DismExitCode") not in (0, None):
+        status = _worst(status, "Atenção")
+        evid.append(f"DISM retornou código {health.get('DismExitCode')} (pode ser falta de privilégio administrativo).")
+
+    if health.get("PendingXmlExists") or health.get("RebootPending") or health.get("RebootInProgress"):
+        status = _worst(status, "Atenção")
+        evid.append("Operações de servicing pendentes (pending.xml/RebootPending): reboot necessário.")
+        actions.append("Agendar reboot antes de novas instalações de patch.")
+    if health.get("SessionsPending") or health.get("PackagesPending"):
+        status = _worst(status, "Atenção")
+        evid.append("Sessões/pacotes CBS pendentes.")
+
+    ti = health.get("TrustedInstaller") or {}
+    if str(ti.get("StartType")) in ("4", "Disabled"):
+        status = _worst(status, "Atenção")
+        evid.append("Serviço TrustedInstaller desabilitado (impede instalação de updates).")
+        actions.append("Voltar o TrustedInstaller para início Manual.")
+
+    if isinstance(log, dict) and "TotalProblemLines" in log:
+        if (log.get("CannotRepairCount") or 0) > 0:
+            status = _worst(status, "Crítico")
+            evid.append(f"CBS.log: {log['CannotRepairCount']} ocorrência(s) de 'Cannot repair'.")
+        if (log.get("CorruptCount") or 0) > 0:
+            status = _worst(status, "Atenção")
+            evid.append(f"CBS.log: {log['CorruptCount']} menção(ões) a 'corrupt'.")
+
+    if isinstance(upd, dict) and "by_error_code" in upd:
+        bad = [c for c in upd["by_error_code"] if c["error_code"] in CBS_CODES]
+        if bad:
+            status = _worst(status, "Crítico")
+            for c in bad:
+                evid.append(f"Windows Update: {c['error_code']} x{c['count']} (último {c['last_seen']}) - {c['hint']}")
+            actions.append("Rodar DISM /RestoreHealth e repetir a instalação do update.")
+
+    if (health.get("CbsLogDir_MB") or 0) > 2048:
+        evid.append(f"Pasta de logs do CBS com {health['CbsLogDir_MB']} MB.")
+    return {
+        "host": host, "status": status,
+        "verdict": {"OK": "CBS saudável.", "Atenção": "CBS com pendências; não necessariamente corrompido.",
+                    "Crítico": "CBS quebrado/corrompido: patches tendem a falhar."}[status],
+        "evidence": evid or ["Nenhuma evidência de problema no CBS."],
+        "recommended_actions": list(dict.fromkeys(actions)),
+        "details": {"cbs_health": health, "cbs_log": log,
+                    "update_errors": upd.get("by_error_code") if isinstance(upd, dict) else upd},
+    }
+
+
+# ---------- rede ----------
+@mcp.tool
+def get_network_config(host: str):
+    """Configuração de rede dos adaptadores ativos: IPv4/IPv6, gateway, DNS, sufixo DNS, DHCP, MAC e velocidade."""
+    return _ps(host, r"""
+$out = foreach ($c in @(Get-NetIPConfiguration | ? { $_.NetAdapter.Status -eq 'Up' })) {
+  $ipif = Get-NetIPInterface -InterfaceIndex $c.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+  $dc = Get-DnsClient -InterfaceIndex $c.InterfaceIndex -ErrorAction SilentlyContinue
+  [pscustomobject]@{
+    Interface=$c.InterfaceAlias; Description=$c.InterfaceDescription
+    MAC=$c.NetAdapter.MacAddress; LinkSpeed=$c.NetAdapter.LinkSpeed
+    Dhcp=if ($ipif) { $ipif.Dhcp.ToString() } else { $null }
+    IPv4=@($c.IPv4Address | % { "$($_.IPAddress)/$($_.PrefixLength)" })
+    IPv6=@($c.IPv6Address | % { $_.IPAddress })
+    Gateway=@($c.IPv4DefaultGateway | % { $_.NextHop })
+    DnsServers=@($c.DNSServer | ? AddressFamily -eq 2 | % { $_.ServerAddresses })
+    DnsSuffix=$dc.ConnectionSpecificSuffix
+    RegisterInDns=$dc.RegisterThisConnectionsAddress
+  }
+}
+[pscustomobject]@{
+  Host=$env:COMPUTERNAME; Adapters=@($out)
+  DnsSearchList=@((Get-DnsClientGlobalSetting).SuffixSearchList)
+} | ConvertTo-Json -Depth 4 -Compress
+""")
+
+
+@mcp.tool
+def get_listening_ports(host: str, include_udp: bool = False):
+    """Portas TCP em escuta (e opcionalmente UDP) com o processo e os serviços donos de cada porta."""
+    udp = "$true" if include_udp else "$false"
+    return _ps(host, r"""
+$proc = @{}; Get-Process | % { $proc[[int]$_.Id] = $_.ProcessName }
+$svc = @{}; Get-CimInstance Win32_Service | ? { $_.ProcessId } | % { $k=[int]$_.ProcessId; $svc[$k] = @($svc[$k]) + $_.Name }
+function Row($proto, $e) { $k=[int]$e.OwningProcess
+  [pscustomobject]@{ Protocol=$proto; LocalAddress=$e.LocalAddress; LocalPort=$e.LocalPort; PID=$k
+    Process=$proc[$k]; Services=(@($svc[$k] | ? { $_ }) -join ',') } }
+$rows = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | % { Row 'TCP' $_ })
+if (__UDP__) { $rows += @(Get-NetUDPEndpoint -ErrorAction SilentlyContinue | ? { $_.LocalPort -lt 49152 } | % { Row 'UDP' $_ }) }
+$rows | sort Protocol,LocalPort,LocalAddress | ConvertTo-Json -Compress
+""".replace("__UDP__", udp))
+
+
+@mcp.tool
+def test_connectivity(host: str, target: str, port: int | None = None):
+    """Testa, A PARTIR do servidor 'host', resolução de nome, ping e (se 'port' for informado) conexão TCP
+    até 'target'. Útil para diagnosticar dependências (AD, SQL, file server, proxy)."""
+    if not HOST_RE.match(target):
+        raise ValueError("target inválido")
+    if port is not None and not 1 <= int(port) <= 65535:
+        raise ValueError("port deve estar entre 1 e 65535")
+    port_arg = f"-Port {int(port)}" if port is not None else ""
+    return _ps(host, rf"""
+$ProgressPreference='SilentlyContinue'
+try {{
+  $r = Test-NetConnection -ComputerName '{target}' {port_arg} -WarningAction SilentlyContinue
+  [pscustomobject]@{{
+    Source=$env:COMPUTERNAME; Target='{target}'; Port={int(port) if port is not None else '$null'}
+    NameResolved=[bool]$r.RemoteAddress; RemoteAddress="$($r.RemoteAddress)"
+    PingSucceeded=$r.PingSucceeded; PingRttMs=$r.PingReplyDetails.RoundtripTime
+    TcpTestSucceeded=$r.TcpTestSucceeded
+    SourceAddress="$($r.SourceAddress.IPAddress)"; InterfaceAlias=$r.InterfaceAlias
+  }} | ConvertTo-Json -Compress
+}} catch {{ [pscustomobject]@{{Target='{target}'; Error=$_.Exception.Message}} | ConvertTo-Json -Compress }}
+""", timeout=90)
+
+
+@mcp.tool
+def get_network_adapters(host: str):
+    """Configuração detalhada das placas de rede: status, velocidade, duplex, MTU, VLAN, driver (versão/data),
+    RSS, IPv6 habilitado, contadores de erros/descartes, propriedades avançadas (offloads, jumbo, buffers)
+    e NIC Teaming (LBFO) / SET quando existir."""
+    return _ps(host, r"""
+$ad = foreach ($a in @(Get-NetAdapter -ErrorAction SilentlyContinue)) {
+  $st = Get-NetAdapterStatistics -Name $a.Name -ErrorAction SilentlyContinue
+  $rss = Get-NetAdapterRss -Name $a.Name -ErrorAction SilentlyContinue
+  $v6 = Get-NetAdapterBinding -Name $a.Name -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
+  [pscustomobject]@{
+    Name=$a.Name; Description=$a.InterfaceDescription; Status="$($a.Status)"; LinkSpeed=$a.LinkSpeed
+    FullDuplex=$a.FullDuplex; MAC=$a.MacAddress; MtuBytes=$a.MtuSize; VlanID=$a.VlanID; Virtual=$a.Virtual
+    DriverProvider=$a.DriverProvider; DriverVersion=$a.DriverVersionString; DriverDate=$a.DriverDate
+    RssEnabled=$rss.Enabled; IPv6Enabled=$v6.Enabled
+    RxGB=$(if ($st) { [math]::Round($st.ReceivedBytes/1GB,2) }); TxGB=$(if ($st) { [math]::Round($st.SentBytes/1GB,2) })
+    RxErrors=$st.ReceivedPacketErrors; RxDiscarded=$st.ReceivedDiscardedPackets
+    TxErrors=$st.OutboundPacketErrors; TxDiscarded=$st.OutboundDiscardedPackets
+    Advanced=@(Get-NetAdapterAdvancedProperty -Name $a.Name -ErrorAction SilentlyContinue | ? DisplayValue |
+      select -first 40 DisplayName,DisplayValue)
+  }
+}
+$teams = @(try { @(Get-NetLbfoTeam -ErrorAction Stop | select Name,@{n='Mode';e={"$($_.TeamingMode)"}},
+  @{n='LB';e={"$($_.LoadBalancingAlgorithm)"}},@{n='Members';e={$_.Members -join ','}},@{n='Status';e={"$($_.Status)"}}) } catch { @() })
+$set = @(try { @(Get-VMSwitch -ErrorAction Stop | ? EmbeddedTeamingEnabled | select Name,@{n='Members';e={$_.NetAdapterInterfaceDescriptions -join ','}}) } catch { @() })
+[pscustomobject]@{ Host=$env:COMPUTERNAME; Adapters=@($ad); LbfoTeams=$teams; SetSwitches=$set } | ConvertTo-Json -Depth 5 -Compress
+""", timeout=120)
+
+
+@mcp.tool
+def get_routes(host: str, include_ipv6: bool = False):
+    """Tabela de rotas (ativa) e rotas persistentes: destino, next hop, interface, métricas e origem.
+    Ignora rotas de multicast/broadcast. Útil para rotas estáticas erradas, gateway duplicado, assimetria."""
+    fam = "" if include_ipv6 else "-AddressFamily IPv4"
+    return _ps(host, rf"""
+$skip = '^(224\.0\.0\.0/4|255\.255\.255\.255/32|ff00::/8)$'
+$act = @(Get-NetRoute {fam} -ErrorAction SilentlyContinue | ? {{ $_.DestinationPrefix -notmatch $skip }} |
+  sort DestinationPrefix | select DestinationPrefix,NextHop,InterfaceAlias,RouteMetric,
+  @{{n='InterfaceMetric';e={{$_.InterfaceMetric}}}},@{{n='Protocol';e={{"$($_.Protocol)"}}}})
+$per = @(Get-NetRoute {fam} -PolicyStore PersistentStore -ErrorAction SilentlyContinue |
+  select DestinationPrefix,NextHop,InterfaceAlias,RouteMetric)
+[pscustomobject]@{{
+  DefaultGateways=@($act | ? {{ $_.DestinationPrefix -in '0.0.0.0/0','::/0' }})
+  PersistentRoutes=$per; ActiveRoutes=$act
+}} | ConvertTo-Json -Depth 4 -Compress
+""")
+
+
+@mcp.tool
+def get_network_connections(host: str, state: str | None = None, top: int = 30):
+    """Equivalente ao 'netstat -ano' com análise: contagem por estado TCP, maiores destinos remotos, processos com
+    mais conexões, uso de portas efêmeras e alerta de TIME_WAIT/CLOSE_WAIT excessivos.
+    state (opcional): Established|Listen|TimeWait|CloseWait|SynSent|... para listar as conexões nesse estado."""
+    if state is not None and not re.match(r"^[A-Za-z]{3,15}$", state):
+        raise ValueError("state inválido")
+    n = max(1, min(int(top), 200))
+    res = _ps(host, r"""
+$proc = @{}; Get-Process | % { $proc[[int]$_.Id] = $_.ProcessName }
+$c = @(Get-NetTCPConnection -ErrorAction SilentlyContinue)
+$dyn = (netsh int ipv4 show dynamicport tcp | Out-String) -split "`n" | % { if ($_ -match ':\s*(\d+)') { [int]$matches[1] } }
+$start = $dyn[0]; $count = $dyn[1]
+$eph = @($c | ? { $_.LocalPort -ge $start -and $_.LocalPort -lt ($start + $count) -and "$($_.State)" -ne 'Listen' }).Count
+$est = @($c | ? { "$($_.State)" -eq 'Established' })
+[pscustomobject]@{
+  Total=$c.Count
+  ByState=@($c | group { "$($_.State)" } | sort Count -desc | select @{n='State';e={$_.Name}},Count)
+  DynamicPortRange="$start-$($start+$count-1)"; EphemeralInUse=$eph; EphemeralCapacity=$count
+  TopRemoteAddresses=@($est | ? { $_.RemoteAddress -notin '127.0.0.1','::1' } | group RemoteAddress | sort Count -desc | select -first __N__ @{n='RemoteAddress';e={$_.Name}},Count,
+    @{n='Ports';e={(@($_.Group.RemotePort | select -unique | select -first 10) -join ',')}})
+  TopProcesses=@($c | group OwningProcess | sort Count -desc | select -first __N__ @{n='PID';e={[int]$_.Name}},
+    @{n='Process';e={$proc[[int]$_.Name]}},Count,@{n='States';e={(@($_.Group | group { "$($_.State)" } | % { "$($_.Name)=$($_.Count)" }) -join ' ')}})
+  Connections=@(if ('__S__') { $c | ? { "$($_.State)" -eq '__S__' } | select -first __N__ LocalAddress,LocalPort,RemoteAddress,RemotePort,
+    @{n='State';e={"$($_.State)"}},@{n='PID';e={$_.OwningProcess}},@{n='Process';e={$proc[[int]$_.OwningProcess]}} })
+} | ConvertTo-Json -Depth 4 -Compress
+""".replace("__N__", str(n)).replace("__S__", state or ""), timeout=120)
+    if isinstance(res, dict) and "ByState" in res:
+        st = {s["State"]: s["Count"] for s in _lst(res["ByState"])}
+        alerts = []
+        if st.get("TimeWait", 0) > 5000:
+            alerts.append(f"{st['TimeWait']} conexões em TIME_WAIT (churn alto de conexões curtas).")
+        if st.get("CloseWait", 0) > 100:
+            alerts.append(f"{st['CloseWait']} em CLOSE_WAIT (aplicação não fecha sockets; ver TopProcesses).")
+        cap = res.get("EphemeralCapacity") or 0
+        if cap and res.get("EphemeralInUse", 0) > 0.7 * cap:
+            alerts.append(f"Portas efêmeras {res['EphemeralInUse']}/{cap} em uso: risco de esgotamento.")
+        res["Alerts"] = alerts or ["Nenhuma anomalia de conexões."]
+    return res
+
+
+@mcp.tool
+def get_applied_gpos(host: str, days: int = 1):
+    """GPOs aplicadas ao computador e aos usuários com perfil carregado (lidas do estado do Group Policy no
+    registro, sem gerar arquivos): nome, GUID, link (OU/site/domínio), versão, OU do computador, site, DC usado,
+    último processamento e erros/avisos do Group Policy no último dia (days ampliável até 90 se pedido)."""
+    return _ps(host, r"""
+$root = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State'
+function GpoList($k) { @(Get-ChildItem "$k\GPO-List" -ErrorAction SilentlyContinue | % { $p = Get-ItemProperty $_.PSPath
+  [pscustomobject]@{ Name=$p.DisplayName; Guid=$p.GPOID; Link=$p.SOM; Version=$p.Version; AccessDenied=[bool]$p.AccessDenied; Disabled=[bool]$p.'GPO-Disabled'; WmiFilterPass=[bool]$p.WQLFilterPass } }) }
+function GpTime($p) { try { if ($p.EndTimeHi -ne $null) { [DateTime]::FromFileTimeUtc(([int64][uint32]$p.EndTimeHi -shl 32) -bor [uint32]$p.EndTimeLo) } } catch { $null } }
+$m = Get-ItemProperty "$root\Machine" -ErrorAction SilentlyContinue
+$ext = Get-ItemProperty "$root\Machine\Extension-List\{00000000-0000-0000-0000-000000000000}" -ErrorAction SilentlyContinue
+$users = @(Get-ChildItem $root -ErrorAction SilentlyContinue | ? { $_.PSChildName -like 'S-1-5-21-*' } | % {
+  $sid = $_.PSChildName; $n = try { (New-Object Security.Principal.SecurityIdentifier($sid)).Translate([Security.Principal.NTAccount]).Value } catch { $sid }
+  $u = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+  [pscustomobject]@{ User=$n; DistinguishedName=$u.'Distinguished-Name'; GPOs=@(GpoList $_.PSPath) } })
+$since = (Get-Date).AddDays(-__H__)
+$log = 'Microsoft-Windows-GroupPolicy/Operational'
+$last = Get-WinEvent -FilterHashtable @{LogName=$log;Id=8000,8001,8002,8003,8004,8005,8006,8007} -MaxEvents 1 -ErrorAction SilentlyContinue
+[pscustomobject]@{
+  Computer=[pscustomobject]@{ DistinguishedName=$m.'Distinguished-Name'; Site=$m.'Site-Name'; DomainController=$m.DC
+    LastPolicyProcessing=(GpTime $ext); GPOs=@(GpoList "$root\Machine") }
+  Users=$users
+  LastProcessingEvent=$(if ($last) { [pscustomobject]@{ Time=$last.TimeCreated; Id=$last.Id; Message=(Msg $last.Message 300) } })
+  ErrorsAndWarnings=@(Get-WinEvent -FilterHashtable @{LogName=$log;Level=1,2,3;StartTime=$since} -MaxEvents 30 -ErrorAction SilentlyContinue |
+    select TimeCreated,Id,LevelDisplayName,@{n='Message';e={Msg $_.Message 400}})
+  SystemGpErrors=@(Get-WinEvent -FilterHashtable @{LogName='System';ProviderName='Microsoft-Windows-GroupPolicy';Level=1,2,3;StartTime=$since} -MaxEvents 20 -ErrorAction SilentlyContinue |
+    select TimeCreated,Id,@{n='Message';e={Msg $_.Message 400}})
+} | ConvertTo-Json -Depth 5 -Compress
+""".replace("__H__", str(_days(days))), timeout=120)
+
+
+@mcp.tool
+def get_top_resource_consumers(host: str, sample_seconds: int = 5, top: int = 10):
+    """Processos que mais consomem CPU e memória, MEDIDOS por amostragem (delta de tempo de CPU em
+    'sample_seconds', normalizado pelo nº de CPUs lógicas: mais preciso que leitura instantânea).
+    Para cada processo: CPU%, memória privada, working set, handles, threads, dono, início, serviços hospedados
+    e linha de comando. Inclui o total de CPU e memória do servidor."""
+    secs = max(1, min(int(sample_seconds), 30))
+    return _ps(host, r"""
+$n = __N__; $secs = __S__
+$cores = [Environment]::ProcessorCount
+$t1 = @{}; Get-Process | % { try { $t1[$_.Id] = $_.TotalProcessorTime.TotalMilliseconds } catch {} }
+$sw = [Diagnostics.Stopwatch]::StartNew(); Start-Sleep -Seconds $secs; $el = $sw.Elapsed.TotalMilliseconds
+$wp = @{}; Get-CimInstance Win32_Process | % { $wp[[int]$_.ProcessId] = $_ }
+$svc = @{}; Get-CimInstance Win32_Service | ? { $_.ProcessId } | % { $k=[int]$_.ProcessId; $svc[$k] = @($svc[$k]) + $_.Name }
+$rows = @(Get-Process | ? { $_.Id -ne 0 } | % {
+  $cpu = 0; try { if ($t1.ContainsKey($_.Id)) { $cpu = [math]::Round(100*($_.TotalProcessorTime.TotalMilliseconds - $t1[$_.Id])/($el*$cores),1) } } catch {}
+  [pscustomobject]@{ Name=$_.ProcessName; PID=$_.Id; CpuPct=$cpu
+    PrivateMB=[math]::Round($_.PrivateMemorySize64/1MB,1); WorkingSetMB=[math]::Round($_.WorkingSet64/1MB,1)
+    Handles=$_.HandleCount; Threads=$_.Threads.Count } })
+function Enrich($r) { $w = $wp[[int]$r.PID]
+  $o = try { $x = Invoke-CimMethod -InputObject $w -MethodName GetOwner -ErrorAction Stop; if ($x.User) { "$($x.Domain)\$($x.User)" } } catch { $null }
+  $r | Add-Member -NotePropertyMembers @{ Owner=$o; Started=$w.CreationDate; Services=(@($svc[[int]$r.PID] | ? { $_ }) -join ',')
+    CommandLine=$(if ($w.CommandLine) { $w.CommandLine.Substring(0,[math]::Min(300,$w.CommandLine.Length)) } else { $null }) } -Force -PassThru }
+$os = Get-CimInstance Win32_OperatingSystem
+[pscustomobject]@{
+  Host=$env:COMPUTERNAME; SampleSeconds=$secs; LogicalCPUs=$cores
+  TotalCpuPct=[math]::Min(100,[math]::Round(($rows | measure CpuPct -Sum).Sum,1))
+  MemTotalGB=[math]::Round($os.TotalVisibleMemorySize/1MB,1)
+  MemUsedPct=[math]::Round(100-100*$os.FreePhysicalMemory/$os.TotalVisibleMemorySize,1)
+  ProcessCount=$rows.Count
+  TopCpu=@($rows | sort CpuPct -desc | select -first $n | % { Enrich $_ })
+  TopMemory=@($rows | sort PrivateMB -desc | select -first $n | % { Enrich $_ })
+} | ConvertTo-Json -Depth 4 -Compress
+""".replace("__N__", str(max(1, min(int(top), 30)))).replace("__S__", str(secs)), timeout=secs + 120)
+
+
+@mcp.tool
+def get_nic_teaming(host: str):
+    """Configuração DETALHADA de NIC Teaming: LBFO (modo, algoritmo de balanceamento, membros ativos/standby,
+    status e motivo de falha por membro, velocidade, team NICs/VLANs) e SET - Switch Embedded Teaming do
+    Hyper-V (membros, algoritmo, vNICs de host e VLANs). Gera alertas de membro caído, velocidades
+    diferentes e team degradado."""
+    d = _ps(host, r"""
+$lbfo = @(try { foreach ($t in @(Get-NetLbfoTeam -ErrorAction Stop)) {
+  [pscustomobject]@{
+    Name=$t.Name; Status="$($t.Status)"; TeamingMode="$($t.TeamingMode)"; LoadBalancing="$($t.LoadBalancingAlgorithm)"
+    LacpTimer="$($t.LacpTimer)"
+    Members=@(Get-NetLbfoTeamMember -Team $t.Name -ErrorAction SilentlyContinue | % { [pscustomobject]@{
+      Name=$_.Name; Description=$_.InterfaceDescription; AdministrativeMode="$($_.AdministrativeMode)"
+      OperationalStatus="$($_.OperationalStatus)"; FailureReason="$($_.FailureReason)"
+      LinkSpeedGbps=[math]::Round($_.TransmitLinkSpeed/1e9,2) } })
+    TeamNics=@(Get-NetLbfoTeamNic -Team $t.Name -ErrorAction SilentlyContinue | % { [pscustomobject]@{
+      Name=$_.Name; VlanID=$_.VlanID; Primary=$_.Primary; Default=$_.Default } })
+  } } } catch { })
+$set = @(try { foreach ($s in @(Get-VMSwitch -ErrorAction Stop | ? EmbeddedTeamingEnabled)) {
+  $tm = Get-VMSwitchTeam -Name $s.Name -ErrorAction SilentlyContinue
+  [pscustomobject]@{
+    Name=$s.Name; SwitchType="$($s.SwitchType)"; AllowManagementOS=$s.AllowManagementOS
+    TeamingMode="$($tm.TeamingMode)"; LoadBalancing="$($tm.LoadBalancingAlgorithm)"
+    Members=@($tm.NetAdapterInterfaceDescription | % { $d = $_; $a = Get-NetAdapter -InterfaceDescription $d -ErrorAction SilentlyContinue
+      [pscustomobject]@{ Description=$d; Name=$a.Name; Status="$($a.Status)"; LinkSpeed=$a.LinkSpeed } })
+    HostVNics=@(Get-VMNetworkAdapter -ManagementOS -SwitchName $s.Name -ErrorAction SilentlyContinue | % {
+      $v = Get-VMNetworkAdapterVlan -ManagementOS -VMNetworkAdapterName $_.Name -ErrorAction SilentlyContinue
+      [pscustomobject]@{ Name=$_.Name; Mac=$_.MacAddress; VlanMode="$($v.OperationMode)"; VlanID=$v.AccessVlanId } })
+  } } } catch { })
+[pscustomobject]@{ Host=$env:COMPUTERNAME; Lbfo=$lbfo; Set=$set } | ConvertTo-Json -Depth 6 -Compress
+""", timeout=120)
+    if not isinstance(d, dict) or "Host" not in d:
+        return d
+    alerts = []
+    for t in _lst(d.get("Lbfo")):
+        if t.get("Status") != "Up":
+            alerts.append(f"Team LBFO '{t['Name']}' com status {t.get('Status')}.")
+        mem = _lst(t.get("Members"))
+        for m in mem:
+            if m.get("OperationalStatus") != "Active" and m.get("AdministrativeMode") != "Standby":
+                alerts.append(f"Team '{t['Name']}': membro {m['Name']} {m.get('OperationalStatus')} "
+                              f"(motivo: {m.get('FailureReason')}).")
+            if m.get("AdministrativeMode") == "Standby":
+                alerts.append(f"Team '{t['Name']}': membro {m['Name']} em Standby (sem redundância ativa-ativa).")
+        speeds = {m.get("LinkSpeedGbps") for m in mem}
+        if len(speeds) > 1:
+            alerts.append(f"Team '{t['Name']}': membros com velocidades diferentes {sorted(speeds)} Gbps.")
+        if len(mem) < 2:
+            alerts.append(f"Team '{t['Name']}' com {len(mem)} membro(s): sem redundância.")
+    for s in _lst(d.get("Set")):
+        mem = _lst(s.get("Members"))
+        for m in mem:
+            if m.get("Status") != "Up":
+                alerts.append(f"SET '{s['Name']}': membro {m.get('Name') or m['Description']} {m.get('Status')}.")
+        if len({m.get("LinkSpeed") for m in mem}) > 1:
+            alerts.append(f"SET '{s['Name']}': membros com velocidades diferentes.")
+        if len(mem) < 2:
+            alerts.append(f"SET '{s['Name']}' com {len(mem)} membro(s): sem redundância.")
+    d["Configured"] = bool(_lst(d.get("Lbfo")) or _lst(d.get("Set")))
+    d["Alerts"] = alerts or (["Teaming saudável."] if d["Configured"] else
+                             ["Nenhum NIC Teaming (LBFO/SET) configurado neste servidor."])
+    return d
+
+
+@mcp.tool
+def get_time_config(host: str):
+    """Configuração completa de NTP/tempo (w32time): tipo de sincronização (NT5DS=hierarquia do domínio, NTP=
+    servidores manuais), servidores NTP configurados, intervalos, fonte atual, stratum, último sync, peers,
+    se é o PDC/servidor de tempo confiável, provedor de tempo do Hyper-V (VMICTimeProvider) e o OFFSET medido
+    contra a fonte. Desvio > 5 min quebra Kerberos/AD."""
+    d = _ps(host, r"""
+$ErrorActionPreference='Continue'
+$base = 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time'
+$p = Get-ItemProperty "$base\Parameters" -ErrorAction SilentlyContinue
+$c = Get-ItemProperty "$base\Config" -ErrorAction SilentlyContinue
+$ntpc = Get-ItemProperty "$base\TimeProviders\NtpClient" -ErrorAction SilentlyContinue
+$ntps = Get-ItemProperty "$base\TimeProviders\NtpServer" -ErrorAction SilentlyContinue
+$vmic = Get-ItemProperty "$base\TimeProviders\VMICTimeProvider" -ErrorAction SilentlyContinue
+$pol = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\W32Time\Parameters' -ErrorAction SilentlyContinue
+$src = ((& w32tm /query /source 2>$null) | Out-String).Trim()
+$status = ((& w32tm /query /status 2>$null) | Out-String).Trim()
+$peers = ((& w32tm /query /peers 2>$null) | Out-String).Trim()
+$target = ($src -replace ',0x\w+$','').Trim()
+$off = $null
+if ($target -and $target -notmatch 'CMOS|Free-running|VM IC') {
+  $sc = (& w32tm /stripchart /computer:$target /samples:3 /dataonly 2>$null) | ? { $_ -match '[+-]\d+\.\d+s' }
+  $vals = @($sc | % { if ($_ -match '([+-]\d+\.\d+)s') { [double]$matches[1] } })
+  if ($vals.Count) { $off = [math]::Round(($vals | measure -Average).Average, 4) }
+}
+$svc = Get-Service W32Time -ErrorAction SilentlyContinue
+$cs = Get-CimInstance Win32_ComputerSystem
+[pscustomobject]@{
+  Host=$env:COMPUTERNAME; DomainRole=$cs.DomainRole; PartOfDomain=$cs.PartOfDomain
+  ServiceStatus="$($svc.Status)"; ServiceStartType="$($svc.StartType)"
+  Type=$p.Type; NtpServer=$p.NtpServer; PolicyType=$pol.Type; PolicyNtpServer=$pol.NtpServer
+  SpecialPollIntervalSec=$ntpc.SpecialPollInterval; NtpClientEnabled=$ntpc.Enabled
+  NtpServerEnabled=$ntps.Enabled; AnnounceFlags=$c.AnnounceFlags
+  MaxPosPhaseCorrection=$c.MaxPosPhaseCorrection; MaxNegPhaseCorrection=$c.MaxNegPhaseCorrection
+  VMICTimeProviderEnabled=$vmic.Enabled
+  CurrentSource=$src; OffsetSeconds=$off; Status=$status; Peers=$peers
+} | ConvertTo-Json -Compress
+""", timeout=120)
+    if not isinstance(d, dict) or "Host" not in d:
+        return d
+    st = d.get("Status") or ""
+    m = re.search(r"Stratum:\s*(\d+)", st)
+    d["Stratum"] = int(m.group(1)) if m else None
+    m = re.search(r"Last Successful Sync Time:\s*(.+)", st) or re.search(r"Hora da .ltima sincroniza.+?:\s*(.+)", st)
+    d["LastSuccessfulSync"] = m.group(1).strip() if m else None
+    role = d.get("DomainRole")
+    d["DomainRoleText"] = {0: "Estação standalone", 1: "Estação membro", 2: "Servidor standalone",
+                           3: "Servidor membro", 4: "DC (backup)", 5: "DC (PDC emulator)"}.get(role, role)
+    src, typ, off = (d.get("CurrentSource") or ""), (d.get("PolicyType") or d.get("Type") or ""), d.get("OffsetSeconds")
+    status, findings = "OK", []
+    if re.search(r"Local CMOS|Free-running", src, re.I):
+        status = "Crítico" if d.get("PartOfDomain") and role != 5 else "Atenção"
+        findings.append("Fonte de tempo = relógio local (CMOS): o servidor NÃO está sincronizando com ninguém.")
+    if d.get("PartOfDomain") and role != 5 and typ.upper() == "NTP":
+        status = _worst(status, "Atenção")
+        findings.append("Membro de domínio com Type=NTP (manual); o recomendado é NT5DS (hierarquia do domínio).")
+    if role == 5 and typ.upper() != "NTP":
+        status = _worst(status, "Atenção")
+        findings.append("PDC emulator deveria sincronizar com fonte externa confiável (Type=NTP + NtpServer).")
+    if d.get("VMICTimeProviderEnabled") == 1 and d.get("PartOfDomain"):
+        findings.append("VMICTimeProvider habilitado: em VM de domínio pode disputar com o NT5DS (avaliar desabilitar).")
+    if off is None and not re.search(r"Local CMOS|Free-running|VM IC", src, re.I):
+        status = _worst(status, "Atenção")
+        findings.append(f"Não foi possível medir o offset contra '{src}' (fonte inacessível ou não resolvível agora).")
+    if off is not None:
+        if abs(off) >= 300:
+            status = _worst(status, "Crítico")
+            findings.append(f"Offset de {off}s (>5 min): Kerberos falha.")
+        elif abs(off) >= 1:
+            status = _worst(status, "Atenção")
+            findings.append(f"Offset de {off}s em relação à fonte.")
+    if d.get("ServiceStatus") != "Running":
+        status = _worst(status, "Crítico")
+        findings.append(f"Serviço W32Time {d.get('ServiceStatus')}.")
+    d["status"], d["findings"] = status, findings or ["Sincronização de tempo saudável."]
+    return d
+
+
+KEY_ROLES = {
+    "AD-Domain-Services": ["NTDS", "Netlogon", "KDC", "DFSR"],
+    "DNS": ["DNS"], "DHCP": ["DHCPServer"], "Web-Server": ["W3SVC", "WAS"],
+    "Hyper-V": ["vmms", "vmcompute"], "Failover-Clustering": ["ClusSvc"],
+    "FS-DFS-Namespace": ["Dfs"], "FS-DFS-Replication": ["DFSR"],
+    "RDS-RD-Server": ["TermService"], "RDS-Licensing": ["TermServLicensing"],
+    "Print-Services": ["Spooler"], "UpdateServices": ["WsusService"], "ADCS-Cert-Authority": ["CertSvc"],
+    "NPAS": ["IAS"], "Windows-Server-Backup": ["wbengine"],
+}
+
+
+@mcp.tool
+def get_server_roles(host: str):
+    """Roles instaladas no Windows Server em hierarquia (Role → Role Services), lista de Features instaladas e
+    estado dos serviços das roles principais (AD DS, DNS, DHCP, IIS, Hyper-V, Cluster, DFS, RDS, WSUS, AD CS...).
+    Requer admin local."""
+    d = _ps(host, r"""
+$f = @(Get-WindowsFeature -ErrorAction Stop | ? Installed)
+$names = @(__SVCS__)
+[pscustomobject]@{
+  Host=$env:COMPUTERNAME; OS=(Get-CimInstance Win32_OperatingSystem).Caption
+  Installed=@($f | select Name,DisplayName,@{n='Type';e={"$($_.FeatureType)"}},Parent,Depth)
+  Services=@(Get-Service -Name $names -ErrorAction SilentlyContinue | select Name,DisplayName,@{n='Status';e={"$($_.Status)"}},@{n='StartType';e={"$($_.StartType)"}})
+} | ConvertTo-Json -Depth 4 -Compress
+""".replace("__SVCS__", ",".join(f"'{s}'" for s in sorted({x for v in KEY_ROLES.values() for x in v}))), timeout=120)
+    if not isinstance(d, dict) or "Installed" not in d:
+        return d
+    items = _lst(d["Installed"])
+    by_name = {i["Name"]: i for i in items}
+    svc = {s["Name"].lower(): s for s in _lst(d.get("Services"))}
+
+    def top_role(i):
+        while i.get("Parent") and i["Parent"] in by_name:
+            i = by_name[i["Parent"]]
+        return i
+
+    roles = {}
+    for i in items:
+        if i["Type"] == "Role" and not i.get("Parent"):
+            roles.setdefault(i["Name"], {"name": i["Name"], "display": i["DisplayName"], "role_services": []})
+    for i in items:
+        if i["Type"] == "Role Service":
+            r = top_role(i)
+            roles.setdefault(r["Name"], {"name": r["Name"], "display": r["DisplayName"], "role_services": []})
+            roles[r["Name"]]["role_services"].append(i["DisplayName"])
+    alerts = []
+    for name, svcs in KEY_ROLES.items():
+        if name in by_name:
+            st = [svc.get(s.lower()) for s in svcs]
+            for r in roles.values():
+                if r["name"] == name or name in (by_name[name].get("Parent") or ""):
+                    r["services"] = [s for s in st if s]
+            for s in st:
+                if s and s["Status"] != "Running" and s["StartType"] != "Disabled":
+                    alerts.append(f"Role {name}: serviço {s['Name']} está {s['Status']}.")
+    for name, svcs in KEY_ROLES.items():
+        if name in by_name and name not in roles:
+            roles[name] = {"name": name, "display": by_name[name]["DisplayName"], "role_services": [],
+                           "services": [svc[s.lower()] for s in svcs if s.lower() in svc]}
+    features = [i["DisplayName"] for i in items if i["Type"] == "Feature" and not i.get("Parent")]
+    return {"host": d["Host"], "os": d.get("OS"), "roles_count": len(roles),
+            "roles": sorted(roles.values(), key=lambda r: r["display"]),
+            "features": sorted(features), "alerts": alerts or ["Serviços das roles principais em execução."]}
+
+
+# ---------- failover cluster ----------
+@mcp.tool
+def get_cluster_health(host: str, days: int = 1):
+    """Failover Cluster (se existir): configuração detalhada e saúde. Cluster (nome, domínio, versão funcional),
+    quorum/witness, nós (estado, voto, peso dinâmico), roles/grupos (dono, estado, nós preferidos), recursos com
+    falha, redes do cluster e interfaces, Cluster Shared Volumes (estado, dono, espaço livre, modo redirecionado),
+    pool S2D quando houver e eventos de erro/crítico do FailoverClustering no último dia (days ampliável até 90)."""
+    d = _ps_long(host, r"""
+if (-not (Get-Service ClusSvc -ErrorAction SilentlyContinue)) { [pscustomobject]@{ Clustered=$false; Reason='Serviço ClusSvc não existe (feature Failover-Clustering não instalada).' } | ConvertTo-Json -Compress; exit 0 }
+try { Import-Module FailoverClusters -ErrorAction Stop; $cl = Get-Cluster -ErrorAction Stop }
+catch { [pscustomobject]@{ Clustered=$false; Reason="Não é membro de cluster ou módulo indisponível: $($_.Exception.Message)" } | ConvertTo-Json -Compress; exit 0 }
+$q = Get-ClusterQuorum -ErrorAction SilentlyContinue
+$since = (Get-Date).AddDays(-__H__)
+[pscustomobject]@{
+  Clustered=$true
+  Cluster=[pscustomobject]@{ Name=$cl.Name; Domain=$cl.Domain; FunctionalLevel=$cl.ClusterFunctionalLevel
+    S2DEnabled=$cl.S2DEnabled; DynamicQuorum=$cl.DynamicQuorum; SameSubnetThreshold=$cl.SameSubnetThreshold
+    CrossSubnetThreshold=$cl.CrossSubnetThreshold }
+  Quorum=[pscustomobject]@{ Type="$($q.QuorumType)"; Resource="$($q.QuorumResource)"
+    WitnessState="$(if ($q.QuorumResource) { (Get-ClusterResource -Name $q.QuorumResource.Name -ErrorAction SilentlyContinue).State })" }
+  Nodes=@(Get-ClusterNode | % { [pscustomobject]@{ Name=$_.Name; State="$($_.State)"; StatusInfo="$($_.StatusInformation)"
+    NodeWeight=$_.NodeWeight; DynamicWeight=$_.DynamicWeight; Site=$_.FaultDomain } })
+  Groups=@(Get-ClusterGroup | % { [pscustomobject]@{ Name=$_.Name; State="$($_.State)"; OwnerNode="$($_.OwnerNode)"
+    GroupType="$($_.GroupType)"; Priority=$_.Priority
+    PreferredOwners=(@(Get-ClusterOwnerNode -Group $_.Name -ErrorAction SilentlyContinue | % { $_.OwnerNodes.Name }) -join ',') } })
+  ResourceCount=@(Get-ClusterResource).Count
+  ResourcesNotOnline=@(Get-ClusterResource | ? { "$($_.State)" -ne 'Online' } | % { [pscustomobject]@{
+    Name=$_.Name; Type=$_.ResourceType.Name; Group="$($_.OwnerGroup)"; State="$($_.State)"; Owner="$($_.OwnerNode)" } })
+  Networks=@(Get-ClusterNetwork | % { [pscustomobject]@{ Name=$_.Name; Role="$($_.Role)"; State="$($_.State)"
+    Address="$($_.Address)/$($_.AddressMask)"; Metric=$_.Metric } })
+  NetInterfacesNotUp=@(Get-ClusterNetworkInterface | ? { "$($_.State)" -ne 'Up' } | % { [pscustomobject]@{
+    Name=$_.Name; Node="$($_.Node)"; Network="$($_.Network)"; State="$($_.State)" } })
+  CSVs=@(Get-ClusterSharedVolume -ErrorAction SilentlyContinue | % { $i = $_.SharedVolumeInfo | select -first 1
+    $st = Get-ClusterSharedVolumeState -Name $_.Name -ErrorAction SilentlyContinue | select -first 1
+    [pscustomobject]@{ Name=$_.Name; State="$($_.State)"; Owner="$($_.OwnerNode)"; Path=$i.FriendlyVolumeName
+      SizeGB=[math]::Round($i.Partition.Size/1GB,1); FreeGB=[math]::Round($i.Partition.FreeSpace/1GB,1)
+      FreePct=[math]::Round($i.Partition.PercentFree,1); Redirected="$($st.StateInfo)"; RedirectReason="$($st.FileSystemRedirectedIOReason)" } })
+  StoragePools=@(try { Get-StoragePool -IsPrimordial $false -ErrorAction Stop | % { [pscustomobject]@{ Name=$_.FriendlyName
+    Health="$($_.HealthStatus)"; Operational="$($_.OperationalStatus)"; SizeTB=[math]::Round($_.Size/1TB,2)
+    AllocatedTB=[math]::Round($_.AllocatedSize/1TB,2) } } } catch { })
+  RecentProblems=@(Get-WinEvent -FilterHashtable @{LogName='System';ProviderName='Microsoft-Windows-FailoverClustering';Level=1,2,3;StartTime=$since} -MaxEvents 30 -ErrorAction SilentlyContinue |
+    select TimeCreated,Id,@{n='Message';e={Msg $_.Message 400}})
+} | ConvertTo-Json -Depth 5 -Compress
+""".replace("__H__", str(_days(days))), timeout=180)
+    if not isinstance(d, dict) or not d.get("Clustered"):
+        return d
+    status, findings = "OK", []
+    for n in _lst(d.get("Nodes")):
+        if n.get("State") != "Up":
+            status = _worst(status, "Crítico" if n.get("State") == "Down" else "Atenção")
+            findings.append(f"Nó {n['Name']} está {n['State']} {n.get('StatusInfo') or ''}".strip())
+    q = d.get("Quorum") or {}
+    if q.get("Resource") and q.get("WitnessState") not in ("Online", ""):
+        status = _worst(status, "Crítico")
+        findings.append(f"Witness '{q['Resource']}' está {q.get('WitnessState')}.")
+    if q.get("Type") == "NodeMajority" and len(_lst(d.get("Nodes"))) % 2 == 0:
+        status = _worst(status, "Atenção")
+        findings.append("Número par de nós sem witness: configure Cloud/File Share/Disk witness.")
+    for g in _lst(d.get("Groups")):
+        if g.get("State") not in ("Online",) and g.get("GroupType") != "AvailableStorage":
+            status = _worst(status, "Crítico" if g.get("State") == "Failed" else "Atenção")
+            findings.append(f"Role '{g['Name']}' {g['State']} (dono {g.get('OwnerNode')}).")
+    for r in _lst(d.get("ResourcesNotOnline")):
+        if r.get("State") == "Failed":
+            status = _worst(status, "Crítico")
+            findings.append(f"Recurso '{r['Name']}' ({r['Type']}) FAILED no grupo {r['Group']}.")
+    for n in _lst(d.get("Networks")):
+        if n.get("State") != "Up":
+            status = _worst(status, "Atenção")
+            findings.append(f"Rede do cluster '{n['Name']}' {n['State']}.")
+    for i in _lst(d.get("NetInterfacesNotUp")):
+        status = _worst(status, "Atenção")
+        findings.append(f"Interface {i['Name']} ({i['Node']}) {i['State']}.")
+    for c in _lst(d.get("CSVs")):
+        if c.get("State") != "Online":
+            status = _worst(status, "Crítico")
+            findings.append(f"CSV {c['Name']} {c['State']}.")
+        if c.get("FreePct") is not None and c["FreePct"] < 10:
+            status = _worst(status, "Atenção")
+            findings.append(f"CSV {c['Name']} com {c['FreePct']}% livre.")
+        if "Redirected" in (c.get("Redirected") or ""):
+            status = _worst(status, "Atenção")
+            findings.append(f"CSV {c['Name']} em I/O redirecionado ({c.get('RedirectReason')}).")
+    for p in _lst(d.get("StoragePools")):
+        if p.get("Health") != "Healthy":
+            status = _worst(status, "Crítico")
+            findings.append(f"Pool {p['Name']} HealthStatus={p['Health']} ({p['Operational']}).")
+    if _lst(d.get("RecentProblems")):
+        status = _worst(status, "Atenção")
+        findings.append(f"{len(_lst(d['RecentProblems']))} evento(s) de problema do FailoverClustering em {_days(days)} dia(s).")
+    d["status"], d["findings"] = status, findings or ["Cluster saudável."]
+    return d
+
+
+# ---------- tarefas agendadas ----------
+TASK_OK = {0, 0x41300, 0x41301, 0x41303, 0x41325}  # sucesso, pronta, executando, nunca executou, enfileirada
+
+
+@mcp.tool
+def get_scheduled_tasks(host: str, only_failed: bool = True, include_microsoft: bool = False):
+    """Tarefas agendadas com estado, última/próxima execução, resultado (hex) e conta de execução.
+    only_failed=True devolve só as que falharam na última execução. Por padrão ignora \\Microsoft\\*."""
+    rows = _ps(host, r"""
+$t = Get-ScheduledTask -ErrorAction SilentlyContinue
+if (-not __MS__) { $t = $t | ? { $_.TaskPath -notlike '\Microsoft\*' } }
+@(foreach ($x in $t) {
+  $i = $x | Get-ScheduledTaskInfo -ErrorAction SilentlyContinue
+  [pscustomobject]@{
+    Path=$x.TaskPath; Name=$x.TaskName; State=$x.State.ToString(); RunAs=$x.Principal.UserId
+    LastRun=$i.LastRunTime; LastResult=$i.LastTaskResult; NextRun=$i.NextRunTime; MissedRuns=$i.NumberOfMissedRuns
+    Action=(@($x.Actions | % { ("$($_.Execute) $($_.Arguments)").Trim() }) -join ' | ')
+  }
+}) | ConvertTo-Json -Compress
+""".replace("__MS__", "$true" if include_microsoft else "$false"), timeout=180)
+    if isinstance(rows, dict) and "error" in rows:
+        return rows
+    out = []
+    for r in _lst(rows):
+        res = r.get("LastResult")
+        if isinstance(res, int):
+            res &= 0xFFFFFFFF
+            r["LastResultHex"] = f"0x{res:08X}"
+        never = not r.get("LastRun") or str(r["LastRun"]).startswith("1999")
+        r["Failed"] = isinstance(res, int) and res not in TASK_OK and not never
+        if not only_failed or r["Failed"]:
+            out.append(r)
+    return {"total_tasks": len(_lst(rows)), "returned": len(out), "tasks": out}
+
+
+# ---------- sessões e usuários ----------
+QUSER_RE = re.compile(r"^>?(?P<user>\S+)\s+(?:(?P<session>\S+)\s+)?(?P<id>\d+)\s+(?P<state>\S+)\s+(?P<idle>\S+)\s+(?P<logon>.+?)\s*$")
+
+
+@mcp.tool
+def get_user_sessions(host: str):
+    """Usuários logados e sessões RDP/console (quser): usuário, sessão, ID, estado, ociosidade e horário de logon.
+    Sessões desconectadas há muito tempo prendem memória e licenças RDS."""
+    raw = _ps(host, r"""
+$ErrorActionPreference='Continue'
+$o = (& quser.exe 2>$null | Out-String)
+[pscustomobject]@{ Raw=$o } | ConvertTo-Json -Compress
+""")
+    if not isinstance(raw, dict) or "Raw" not in raw:
+        return raw
+    lines = [ln for ln in (raw["Raw"] or "").splitlines() if ln.strip()]
+    sessions = []
+    for ln in lines[1:]:  # 1a linha = cabeçalho (localizado)
+        m = QUSER_RE.match(ln.strip())
+        if m:
+            d = m.groupdict()
+            d["current"] = ln.lstrip().startswith(">")
+            sessions.append(d)
+    return {"count": len(sessions), "sessions": sessions}
+
+
+@mcp.tool
+def get_local_admins(host: str):
+    """Membros do grupo local Administradores (via SID S-1-5-32-544, independe do idioma)."""
+    return _ps(host, r"""
+try {
+  @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop |
+    select Name,@{n='ObjectClass';e={"$($_.ObjectClass)"}},@{n='Source';e={"$($_.PrincipalSource)"}},@{n='SID';e={"$($_.SID)"}}) |
+    ConvertTo-Json -Compress
+} catch {
+  $n = (New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')).Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
+  $g = [ADSI]"WinNT://$env:COMPUTERNAME/$n,group"
+  @($g.Invoke('Members') | % {
+    [pscustomobject]@{
+      Name=((($_.GetType().InvokeMember('ADsPath','GetProperty',$null,$_,$null)) -replace '^WinNT://','').Split('/') | select -last 2) -join '\'
+      ObjectClass=$_.GetType().InvokeMember('Class','GetProperty',$null,$_,$null); Source='ADSI'; SID=$null }
+  }) | ConvertTo-Json -Compress
+}
+""")
+
+
+LOGON_SUBSTATUS = {
+    "0xc000006a": "Senha incorreta",
+    "0xc0000064": "Usuário não existe",
+    "0xc0000234": "Conta bloqueada",
+    "0xc0000072": "Conta desabilitada",
+    "0xc000006f": "Fora do horário permitido",
+    "0xc0000070": "Estação de trabalho não permitida",
+    "0xc0000071": "Senha expirada",
+    "0xc0000193": "Conta expirada",
+    "0xc0000224": "Troca de senha obrigatória",
+    "0xc000015b": "Tipo de logon não concedido",
+    "0xc000006d": "Usuário ou credencial inválidos",
+    "0xc000005e": "Nenhum servidor de logon disponível (DC inacessível)",
+    "0xc0000133": "Relógio fora de sincronia com o DC",
+    "0xc000018d": "Falha na relação de confiança",
+    "0xc0000192": "Serviço Netlogon não iniciado",
+    "0xc0000413": "Firewall de autenticação bloqueou o logon",
+}
+
+
+@mcp.tool
+def get_failed_logons(host: str, days: int = 1, top: int = 25):
+    """Logons com falha (evento 4625 do log Security) agrupados por conta + IP de origem, com tipo de logon e
+    motivo (SubStatus traduzido). Detecta força bruta, contas de serviço com senha antiga e bloqueios.
+    Requer permissão de leitura no log Security (admin local ou equivalente)."""
+    res = _ps(host, r"""
+$ev = @(Get-WinEvent -FilterHashtable @{LogName='Security';Id=4625;StartTime=(Get-Date).AddDays(-__H__)} -MaxEvents 5000 -ErrorAction SilentlyContinue)
+$rows = foreach ($e in $ev) {
+  $d = @{}; ([xml]$e.ToXml()).Event.EventData.Data | % { $d[$_.Name] = $_.'#text' }
+  [pscustomobject]@{ Time=$e.TimeCreated; Account="$($d.TargetDomainName)\$($d.TargetUserName)"; SourceIp=$d.IpAddress
+    Workstation=$d.WorkstationName; LogonType=$d.LogonType; SubStatus=$(if ("$($d.SubStatus)" -match "^0x0+$") { "$($d.Status)".ToLower() } else { "$($d.SubStatus)".ToLower() }); Process=$d.ProcessName }
+}
+[pscustomobject]@{
+  TotalEvents=$ev.Count
+  Groups=@($rows | group Account,SourceIp | sort Count -desc | select -first __T__ | % {
+    $g=$_.Group | sort Time
+    [pscustomobject]@{ Count=$_.Count; Account=$g[0].Account; SourceIp=$g[0].SourceIp; Workstation=$g[0].Workstation
+      LogonTypes=(@($g.LogonType | select -unique) -join ','); SubStatus=@($g.SubStatus | select -unique)
+      Process=$g[-1].Process; First=$g[0].Time; Last=$g[-1].Time } })
+} | ConvertTo-Json -Depth 4 -Compress
+""".replace("__H__", str(_days(days))).replace("__T__", str(max(1, min(int(top), 100)))), timeout=180)
+    if isinstance(res, dict):
+        for g in _lst(res.get("Groups")):
+            g["Reasons"] = [LOGON_SUBSTATUS.get(s, s) for s in _lst(g.get("SubStatus"))]
+    return res
+
+
+# ---------- painel de saúde rápido ----------
+@mcp.tool
+def get_health_summary(
+    host: str,
+    cpu_warn: int = 80,
+    mem_warn: int = 85,
+    disk_warn_pct: int = 15,
+    disk_crit_pct: int = 5,
+    patch_warn_days: int = 45,
+    uptime_warn_days: int = 120,
+):
+    """Painel de saúde em UMA chamada: CPU, memória, discos, serviços automáticos parados, reboot pendente,
+    uptime, dias sem patch, flags do CBS, eventos críticos (24h) e desligamentos inesperados (7d).
+    Devolve status OK/Atenção/Crítico por área, status geral e achados. Comece a triagem por aqui."""
+    d = _ps(host, r"""
+$os = Get-CimInstance Win32_OperatingSystem
+$cpu = @(1..3 | % { (Get-CimInstance Win32_Processor | measure LoadPercentage -Average).Average; Start-Sleep -Milliseconds 700 })
+$mem = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory
+$k = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion'
+$last = Get-HotFix | ? InstalledOn | sort InstalledOn -desc | select -first 1
+[pscustomobject]@{
+  Host=$env:COMPUTERNAME; OS=$os.Caption; LastBoot=$os.LastBootUpTime
+  UptimeDays=[math]::Round(((Get-Date)-$os.LastBootUpTime).TotalDays,1)
+  CpuPct=[math]::Round(($cpu | measure -Average).Average,0)
+  MemUsedPct=[math]::Round(100-100*$os.FreePhysicalMemory/$os.TotalVisibleMemorySize,1)
+  MemCommitPct=$mem.PercentCommittedBytesInUse
+  Disks=@(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ? Size | select DeviceID,
+    @{n='SizeGB';e={[math]::Round($_.Size/1GB,1)}},@{n='FreeGB';e={[math]::Round($_.FreeSpace/1GB,1)}},
+    @{n='FreePct';e={[math]::Round(100*$_.FreeSpace/$_.Size,1)}})
+  StoppedAuto=@(Get-CimInstance Win32_Service -Filter "StartMode='Auto' AND State<>'Running'" | select Name,DisplayName,ExitCode)
+  RebootCBS=(Test-Path "$k\Component Based Servicing\RebootPending")
+  RebootWU=(Test-Path "$k\WindowsUpdate\Auto Update\RebootRequired")
+  PendingXml=(Test-Path "$env:SystemRoot\WinSxS\pending.xml")
+  LastHotfix=$last.HotFixID; DaysSincePatch=if ($last) { [int]((Get-Date)-$last.InstalledOn).TotalDays } else { $null }
+  Critical24h=@(Get-WinEvent -FilterHashtable @{LogName='System','Application';Level=1;StartTime=(Get-Date).AddDays(-1)} -ErrorAction SilentlyContinue).Count
+  Error24h=@(Get-WinEvent -FilterHashtable @{LogName='System','Application';Level=2;StartTime=(Get-Date).AddDays(-1)} -MaxEvents 5000 -ErrorAction SilentlyContinue).Count
+  Unexpected7d=@(Get-WinEvent -FilterHashtable @{LogName='System';Id=41,6008;StartTime=(Get-Date).AddDays(-7)} -ErrorAction SilentlyContinue | ? { $_.Id -eq 6008 -or $_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' }).Count
+} | ConvertTo-Json -Depth 3 -Compress
+""", timeout=120)
+    if not isinstance(d, dict) or "Host" not in d:
+        return d
+
+    areas, findings = {}, []
+
+    def flag(area, st, msg=None):
+        areas[area] = _worst(areas.get(area, "OK"), st)
+        if msg:
+            findings.append(f"[{st}] {area}: {msg}")
+
+    cpu = d.get("CpuPct") or 0
+    flag("CPU", "Crítico" if cpu >= 95 else "Atenção" if cpu >= cpu_warn else "OK",
+         f"{cpu}% de uso" if cpu >= cpu_warn else None)
+    mu, mc = d.get("MemUsedPct") or 0, d.get("MemCommitPct") or 0
+    flag("Memória", "Crítico" if mu >= 95 else "Atenção" if mu >= mem_warn else "OK",
+         f"{mu}% da RAM em uso" if mu >= mem_warn else None)
+    if mc >= 90:
+        flag("Memória", "Atenção", f"commit em {mc}% (risco de falta de memória virtual)")
+    flag("Disco", "OK")
+    for dk in _lst(d.get("Disks")):
+        fp, fg = dk.get("FreePct") or 0, dk.get("FreeGB") or 0
+        if fp <= disk_crit_pct or fg < 2:
+            flag("Disco", "Crítico", f"{dk['DeviceID']} com {fg} GB livres ({fp}%)")
+        elif fp <= disk_warn_pct:
+            flag("Disco", "Atenção", f"{dk['DeviceID']} com {fg} GB livres ({fp}%)")
+    flag("Serviços", "OK")
+    failed = [s for s in _lst(d.get("StoppedAuto")) if s.get("ExitCode") not in (0, None)]
+    if failed:
+        flag("Serviços", "Atenção", "automáticos parados com erro: " +
+             ", ".join(f"{s['Name']} (exit {s['ExitCode']})" for s in failed[:10]))
+    flag("Patches", "OK")
+    dp = d.get("DaysSincePatch")
+    if dp is None:
+        flag("Patches", "Atenção", "não foi possível determinar o último patch")
+    elif dp >= 2 * patch_warn_days:
+        flag("Patches", "Crítico", f"{dp} dias sem patch (último {d.get('LastHotfix')})")
+    elif dp >= patch_warn_days:
+        flag("Patches", "Atenção", f"{dp} dias sem patch (último {d.get('LastHotfix')})")
+    if d.get("RebootCBS") or d.get("RebootWU") or d.get("PendingXml"):
+        flag("Patches", "Atenção", "reboot pendente (CBS/WU/pending.xml)")
+    up = d.get("UptimeDays") or 0
+    flag("Disponibilidade", "OK")
+    if up >= uptime_warn_days:
+        flag("Disponibilidade", "Atenção", f"{up} dias sem reboot (patches de kernel não aplicados)")
+    if d.get("Unexpected7d"):
+        flag("Disponibilidade", "Atenção", f"{d['Unexpected7d']} desligamento(s) inesperado(s) em 7 dias")
+    flag("Eventos", "OK")
+    if d.get("Critical24h"):
+        flag("Eventos", "Atenção", f"{d['Critical24h']} evento(s) crítico(s) nas últimas 24h")
+    if (d.get("Error24h") or 0) >= 50:
+        flag("Eventos", "Atenção", f"{d['Error24h']} eventos de erro nas últimas 24h (System+Application)")
+
+    return {
+        "host": d["Host"], "os": d.get("OS"), "overall": _worst(*areas.values()),
+        "areas": areas, "findings": findings or ["Nenhum problema encontrado."],
+        "metrics": {k: d.get(k) for k in ("CpuPct", "MemUsedPct", "MemCommitPct", "UptimeDays", "LastBoot",
+                                          "DaysSincePatch", "LastHotfix", "Critical24h", "Error24h", "Unexpected7d")},
+        "disks": _lst(d.get("Disks")),
+        "stopped_auto_services": _lst(d.get("StoppedAuto")),
+        "next_steps": "Aprofunde áreas não-OK: validate_cbs, get_event_summary, get_top_processes, "
+                      "get_disk_usage_tree, get_service_failures.",
+    }
+
+
+@mcp.prompt
+def root_cause_analysis(host: str, symptom: str, days: int = 1) -> str:
+    """Roteiro de RCA para um sintoma em um servidor (logs do último dia por padrão)."""
+    return (
+        f"Faça análise de causa raiz no servidor {host}. Sintoma: {symptom}.\n"
+        f"Regra de coleta: logs só de problema (Crítico/Erro/Aviso) e período days={_days(days)}; "
+        "só amplie o período se o usuário pedir ou se o início do problema for anterior.\n"
+        "1) get_health_summary, get_uptime e get_reboot_and_crash_history; 2) get_top_resource_consumers; "
+        "3) get_event_summary (include_operational=true se o sintoma envolver GPO/update/tarefas/RDS/tempo) "
+        "e depois get_events nos IDs/provedores suspeitos; 4) get_disks, get_service_failures, "
+        "get_last_patches e, se envolver patch/update, validate_cbs e get_cbs_log_errors. "
+        "Monte uma linha do tempo, separe fatos de hipóteses, aponte a causa mais provável "
+        "e a evidência que a sustenta."
+    )
+
+
+@mcp.prompt
+def ops_health_check(host: str) -> str:
+    """Health check operacional completo de um Windows Server."""
+    return (
+        f"Faça um health check operacional do servidor {host}. Comece por get_health_summary e get_uptime; "
+        "depois validate_cbs e get_last_patches; get_top_resource_consumers; get_network_config, "
+        "get_network_adapters, get_nic_teaming, get_routes, get_network_connections, get_listening_ports, "
+        "get_applied_gpos, get_time_config, get_server_roles, get_cluster_health, "
+        "get_scheduled_tasks, get_user_sessions, get_local_admins e get_failed_logons. Complete com "
+        "get_system_overview, "
+        "get_patch_status (+ get_pending_updates e get_windows_update_history), "
+        "get_performance_snapshot, get_disks, get_stopped_auto_services e get_service_failures, "
+        "get_roles_and_features, get_security_posture, get_time_sync_status e "
+        "get_expiring_certificates. Inclua a saúde do CBS/Windows Update (get_cbs_health, "
+        "get_cbs_log_errors, get_windows_update_health, get_update_error_analysis) e o disco "
+        "(get_common_space_offenders, get_disk_allocation_analysis e, nos volumes com pouco espaço, "
+        "get_disk_usage_tree). Todas as coletas de log usam o padrão de 1 dia e só Crítico/Erro/Aviso. "
+        "Entregue um resumo com status (OK/Atenção/Crítico) por área, "
+        "os achados priorizados e as ações recomendadas."
+    )
+
+
+if __name__ == "__main__":
+    mcp.run()  # stdio; para HTTP: mcp.run(transport="http", host="0.0.0.0", port=8000)

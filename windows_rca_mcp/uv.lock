@@ -1557,16 +1557,18 @@ wheels = [
 
 [[package]]
 name = "windows-rca-mcp"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastmcp" },
+    { name = "python-dotenv" },
     { name = "pywinrm" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "fastmcp", specifier = ">=4.2.2" },
+    { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "pywinrm", specifier = ">=0.5.0" },
 ]
 
