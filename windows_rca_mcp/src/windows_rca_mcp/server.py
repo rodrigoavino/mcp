@@ -1892,6 +1892,22 @@ DOMAIN_RIDS = {"500": "Administrator (domínio)", "502": "krbtgt", "512": "Domai
                "519": "Enterprise Admins", "520": "Group Policy Creator Owners", "525": "Protected Users"}
 
 
+def _member_source(sid: str, is_local: bool) -> str:
+    """Origem do membro pelo SID: conta local, grupo interno, principal do sistema (NT AUTHORITY, Everyone...),
+    domínio (S-1-5-21-...) ou Azure AD (S-1-12-1-...). Antes tudo que não era local virava 'Domínio/Externo'."""
+    if is_local:
+        return "Local"
+    if sid.startswith("S-1-12-1-"):
+        return "Azure AD"
+    if sid.startswith("S-1-5-21-"):
+        return "Domínio"
+    if sid.startswith("S-1-5-32-"):
+        return "Interno (BUILTIN)"
+    if re.fullmatch(r"S-1-(1-0|2-\d+|3-\d+|5-\d{1,2}|5-(80|82|83|90|96)-[\d-]+)", sid):
+        return "Sistema (NT AUTHORITY)"
+    return "Externo"
+
+
 @mcp.tool
 def get_local_groups(host: str, group: str | None = None, include_users: bool = True):
     """TODOS os grupos locais e seus membros (independe do idioma: usa SID). Para cada grupo: nome, SID, descrição,
@@ -1922,8 +1938,9 @@ $groups = foreach ($g in @(Get-LocalGroup -ErrorAction SilentlyContinue | ? { -n
     $local = [bool]$u -or ($sid -and $sid -match '^S-1-5-32-') -or ($path -like "$env:COMPUTERNAME/*")
     $unres = [bool]($sid -and -not (Rs $sid))
     [pscustomobject]@{ Name=$name; SID=$sid; Class=$cls; Local=$local; Unresolved=$unres
-      Enabled=$(if ($u) { $u.Enabled }); LastLogon=$(if ($u) { $u.LastLogon }); PasswordLastSet=$(if ($u) { $u.PasswordLastSet })
-      PasswordNeverExpires=$(if ($u) { [bool]($u.PasswordNeverExpires -or -not $u.PasswordExpires) }) }
+      Enabled=$(if ($u) { $u.Enabled } else { $null }); LastLogon=$(if ($u) { $u.LastLogon } else { $null })
+      PasswordLastSet=$(if ($u) { $u.PasswordLastSet } else { $null })
+      PasswordNeverExpires=$(if ($u) { [bool]($u.PasswordNeverExpires -or -not $u.PasswordExpires) } else { $null }) }
   }
   [pscustomobject]@{ Name=$g.Name; SID="$($g.SID)"; Description=$g.Description; BuiltIn=("$($g.SID)" -like 'S-1-5-32-*')
     Members=@($mem) }
@@ -1948,7 +1965,7 @@ $users = if (__U__) { @($lu.Values | sort Name | % { [pscustomobject]@{ Name=$_.
             rid = sid.rsplit("-", 1)[-1] if sid.startswith("S-1-5-21-") else None
             if rid in DOMAIN_RIDS and (m.get("Unresolved") or "\\" not in (m.get("Name") or "")):
                 m["WellKnown"] = DOMAIN_RIDS[rid]
-            m["Source"] = ("Local" if m.get("Local") else "Domínio/Externo")
+            m["Source"] = _member_source(sid, bool(m.get("Local")))
         if not members:
             empty.append(g["Name"])
         why = PRIV_GROUPS.get(g.get("SID"))
@@ -1958,7 +1975,7 @@ $users = if (__U__) { @($lu.Values | sort Name | % { [pscustomobject]@{ Name=$_.
                 findings.append({"severity": "Atenção", "group": g["Name"], "member": m.get("Name"),
                                  "issue": "SID não resolvido (conta removida ou DC inacessível)"
                                           + (f"; RID de {m['WellKnown']}" if m.get("WellKnown") else "")})
-            if why and g["SID"] == "S-1-5-32-544" and m.get("Local") is False:
+            if why and g["SID"] == "S-1-5-32-544" and m.get("Source") in ("Domínio", "Azure AD"):
                 findings.append({"severity": "Info", "group": g["Name"], "member": m.get("Name"),
                                  "issue": "Principal de domínio com administração local" + (f" ({m['WellKnown']})" if m.get("WellKnown") else "")})
             if why and m.get("Enabled") is True and m.get("PasswordNeverExpires") and g["SID"] in ("S-1-5-32-544", "S-1-5-32-551", "S-1-5-32-549"):

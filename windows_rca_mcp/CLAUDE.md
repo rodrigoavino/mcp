@@ -67,11 +67,13 @@ uv run python teste.py get_health_summary host=fastmcp.familia.local  # uma tool
   - C: com cerca de 17% livre.
 
 ## Git
-- Repositório em `C:\mcp` (remoto `rodrigoavino/mcp`), branch `main`. Branch `baseline` (commit `11d920e`) criado só para abrir um PR de revisão; pode ser apagado depois.
+- Repositório em `C:\mcp` (remoto `rodrigoavino/mcp`), branch `main`. PRs mesclados: 2 (busca otimizada, `get_local_groups`). PR 1 (revisão) fechado e os branches `baseline`, `fix/ultrareview-pr1` e `feat/cbs-busca-otimizada` apagados.
 - Novas mudanças: usar um branch de feature, para o `/code-review ultra` funcionar sem argumentos.
 
 ## Pendências (retomar)
-- [x] `get_stopped_auto_services` classifica suspeitos x esperados (branch `feat/servicos-suspeitos`, aguardando PR).
-- [ ] Reiniciar o Claude Code para carregar as 49 tools; commit, push e PR do branch `feat/cbs-busca-otimizada`.
-- [ ] Limpar os branches `baseline` e `fix/ultrareview-pr1`, fechar o PR 1.
-- [ ] Lab: remover o DNS 10.10.0.1 do servidor; conferir os SIDs de domínio não resolvidos em Administradores/Users (`get_local_groups`).
+- [x] `get_stopped_auto_services` classifica suspeitos x esperados (PR 3).
+- [x] `get_local_groups`: campos vazios como `null` e origem do membro por SID (PR 3).
+- [x] MCP recarregado com as 49 tools; PR 1 fechado e branches antigos apagados.
+- [ ] Mesclar o PR 3 (https://github.com/rodrigoavino/mcp/pull/3).
+- [ ] Lab: remover o DNS 10.10.0.1 do servidor. (Os SIDs `S-1-5-21-439607407-*` de Domain Admins/Users agora resolvem como `FAMILIA\...`: eram só o DC fora do ar.)
+- [ ] Rodar a bateria completa de regressão contra as 49 tools depois do merge do PR 3 (a última cobriu 48 e antes da classificação de serviços).

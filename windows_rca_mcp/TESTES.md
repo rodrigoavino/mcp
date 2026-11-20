@@ -226,6 +226,8 @@ Nova tool **`get_local_groups`** (49 tools): 27 grupos locais, membros com SID, 
 
 Resultado no lab (uptime 0,2 h): 6 parados, 2 suspeitos e 4 esperados. O `InventorySvc`, que ontem aparecia parado, subiu sozinho depois do boot e saiu da lista, o que confirma que era só atraso de inicialização. Os dois do Google Updater continuam, como "automático sem atraso e sem gatilho". Eles têm ExitCode 0, então o mais provável é terem concluído a tarefa e encerrado, mas isso é uma hipótese, não foi verificado.
 
+**Correções no `get_local_groups` (mesmo PR):** com o domínio resolvendo, apareceram dois defeitos. (1) `Enabled`, `LastLogon`, `PasswordLastSet` e `PasswordNeverExpires` saíam como `{}` para membros que não são conta local; agora são `null`. (2) `NT AUTHORITY\\IUSR`, `INTERACTIVE` e `Authenticated Users` apareciam como "Domínio/Externo"; a origem agora sai do SID: `Local`, `Interno (BUILTIN)`, `Sistema (NT AUTHORITY)`, `Domínio`, `Azure AD` ou `Externo`. O achado "principal de domínio com administração local" só vale para `Domínio` e `Azure AD`. Os SIDs de `Domain Admins`/`Domain Users` que não resolviam ontem agora resolvem como `FAMILIA\\...`: era só o DC fora do ar, não um domínio antigo.
+
 **Mudança de contrato:** a tool agora devolve um objeto (`suspicious`, `expected_names`, contagens) em vez de uma lista. `stopped_auto_services` do `get_health_summary` também mudou de formato.
 
 ## 10. Limitações dos testes
