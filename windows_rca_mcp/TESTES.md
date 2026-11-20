@@ -226,3 +226,43 @@ Nova tool **`get_local_groups`** (49 tools): 27 grupos locais, membros com SID, 
 - **Cluster e NIC Teaming** foram validados só no caminho "não existe", porque o servidor não tem essas configurações. Os caminhos positivos foram implementados pelos cmdlets oficiais, mas **não foram exercitados**.
 - Os testes foram feitos **contra o próprio servidor** (loopback). Um teste contra um segundo servidor validará firewall, certificado e NTLM entre máquinas.
 - GPOs de domínio e offset do NTP: validados no reteste depois da correção do domínio (seção 4.0).
+
+## Anexo A. Evidência de carga e plataforma (revisão 5)
+Duas tools novas do coletor, só com fatos e evidência (51 tools): `get_workload_evidence` e `get_platform_info`.
+
+| Teste | Resultado |
+|---|---|
+| Carga: nada instalado | nenhuma carga, `docs_context` vazio |
+| Carga: só SSMS e drivers ODBC/OLE DB (cliente) | **não** vira servidor SQL (`sql_client_tools_only=true`) |
+| Carga: serviço `MSSQLSERVER`, processo `sqlservr` e instância no registro | SQL Server com 4 evidências, `running=true` |
+| Carga: instância nomeada `MSSQL$PROD` parada | SQL Server presente, `running=false` |
+| Carga: recurso Web-Server instalado; DomainRole 5 | IIS e AD DS identificados; DNS `Available` não conta |
+| Servidor de teste (real) | nenhuma carga; vale só SO e versão (Windows Server 2025 Standard, build 26100, UBR 33822) |
+| Plataforma: VMware, Hyper-V, AWS Nitro, AWS Xen, GCP, KVM/QEMU, VirtualBox (sintéticos) | todos classificados com a evidência |
+| Plataforma: Hyper-V genérico | **não** vira Azure sem agente de guest ou metadados |
+| Plataforma: físico Dell sem hypervisor; físico HPE com Hyper-V (`vmms` rodando) | `physical`; chassi `Rack Mount Chassis`, 2 sockets |
+| Plataforma: hypervisor presente sem assinatura (ex.: físico com VBS) | `indeterminate` com nota; nada é chutado |
+| Plataforma: servidor de teste (real) | `virtual`, KVM/QEMU, `qemu-ga` em execução; `vmic*` parados **não** contam |
+| Privacidade: serial, UUID, id da instância e id da VM | ficam só em `identifiers`; nunca em `docs_context` |
+| Metadados da nuvem forçados no servidor de teste (`probe_cloud=all`) | AWS, Azure e GCP inalcançáveis (tempo esgotado em 2 s cada, 8,7 s no total); tratamento de erro validado |
+
+**Não validado:** os caminhos de **sucesso** do serviço de metadados (AWS, Azure e GCP) não foram exercitados contra uma nuvem real, porque o laboratório é KVM. A leitura e a classificação desses campos foram testadas só com respostas sintéticas. A etiqueta de ativo do chassi do Azure, que eu conhecia de memória, **não** foi incluída: a documentação oficial consultada não a confirmou, então a Azure só é declarada com agente de guest em execução ou resposta dos metadados. As assinaturas SMBIOS são do catálogo do projeto, não de documentação oficial, e podem ser alteradas na configuração da VM.
+
+## Anexo B. Armazenamento (revisão 5)
+Duas tools novas do coletor (53 tools), só com fatos e sinais objetivos: `get_storage_overview` e `get_volumes`.
+
+| Teste | Resultado |
+|---|---|
+| GUIDs de partição do disco dinâmico e tipo MBR 0x42 | confirmados em learn.microsoft.com (*set id*, atualizada em 2026-02-16); `verify_claim` sustentada nos dois |
+| Discos sintéticos: NVMe/SSD, SAS/HDD 512e offline, SCSI/mídia não informada MBR de 3 TiB com partição 0x42, GPT com LDM Metadata somente leitura 4Kn e saúde Warning | tipo, estilo, básico/dinâmico (com a base), online, leitura, formato de setor e sinais corretos; `mbrDiskAbove2TiB` aponta o disco 2 |
+| Mídia `Unspecified` com barramento SCSI | `type_text` diz que o tipo de mídia não foi informado: **não** presume SSD nem HDD |
+| Serial e GUID do disco | só em `identifiers`, fora das linhas dos discos |
+| BitLocker sem o recurso | `indeterminate` com o motivo (nunca "desligado") |
+| BitLocker com recurso (sintético) | proteção, estado, bloqueio, % e método; **só tipos** de protetor |
+| Volume sem letra | BitLocker `indeterminate` (não mapeável por letra) |
+| Volume sintético com ponto de montagem em pasta | `mount_folders` separa a pasta; GUID extraído; sinal `freeSpaceBelowBaseline` com 12% |
+| Servidor de teste (real), `get_storage_overview` | 1 disco VirtIO de 32 GB, SCSI, mídia não informada, MBR, básico, online, 512n, saudável; nenhum sinal |
+| Servidor de teste (real), `get_volumes` | 3 volumes NTFS com cluster de 4096; `C:` com 12,8% livre (sinal `freeSpaceBelowBaseline` com baseline de 15%); BitLocker `indeterminate` (cmdlet ausente) |
+| `low_free_pct=500` | limitado a 99 |
+
+**Não validado:** (1) a detecção de **disco dinâmico** foi testada só com dados sintéticos, porque o laboratório não tem disco dinâmico; os critérios (MBR 0x42, GUIDs LDM, Logical Disk Manager no WMI) estão confirmados na documentação, mas a leitura real desses campos num disco dinâmico não foi exercitada; (2) o caminho **com BitLocker instalado** foi testado só com dados sintéticos, porque o recurso não existe no servidor de teste; (3) o mapeamento de BitLocker é por letra de unidade.

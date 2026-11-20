@@ -15,9 +15,16 @@ MCP (FastMCP) de **OPS para Windows Server**. Serve para o Claude triar incident
   - limites (`-MaxEvents`, tamanho ou tempo de leitura) são sempre **sinalizados** na resposta (`truncated`/`Partial`).
 - Toda tool que pode ser lenta passa um `timeout` explícito ao `_ps`. O padrão de 60 s é um prazo total rígido.
 - Idioma: português (docstrings, mensagens, README).
+- **Fronteira coleta × interpretação (decidida pelo usuário):** este MCP só **coleta**. A interpretação fica no `microsoft-docs-mcp` (`C:\mcp\microsoft_docs_mcp`, outro servidor MCP, o único com acesso à internet).
+  - Pode afirmar: existe / não existe, online / offline, valor acima de X ou abaixo de Y, diverge da baseline configurada do projeto, falhou / passou, corrompido / não corrompido. Sinais objetivos derivados de fatos (`diskOffline`, `pendingReboot`, `freeSpaceLow`) são permitidos, com o limiar à vista.
+  - **Não** pode afirmar: melhor prática, recomendado pela Microsoft, configuração inadequada ou insegura, "deve ser alterado", fora do padrão Microsoft, nem classificar serviço como "suspeito" ou "esperado". Quem diz qual é o estado esperado é o RAG, com fonte.
+  - **Carga do servidor só com evidência:** nunca presumir que o servidor é SQL Server, IIS etc. Use `get_workload_evidence`; sem evidência identificadora vale só o SO e a versão. Cliente (SSMS, ODBC) não identifica servidor. O `context` enviado ao RAG vem só de `docs_context`.
+  - **Plataforma:** `get_platform_info` diz se é físico, virtual ou nuvem, só por assinatura com a evidência à vista; `indeterminate` quando nada casa. Serial, UUID, asset tag e id de instância são sensíveis: ficam em `identifiers` e nunca vão ao RAG (só `docs_context`).
+  - Nada que saia deste MCP para a internet: nenhuma chamada externa aqui. A única exceção é o serviço de metadados da própria instância (`169.254.169.254`, link-local, executado no servidor alvo e só em campos de lista fixa).
+  - Dívida conhecida: tools antigas ainda trazem julgamento (`get_health_summary` e `validate_cbs` com OK/Atenção/Crítico e ações, `get_stopped_auto_services` com suspeito/esperado no PR 3, `get_local_groups` com achados, dicas de HRESULT). Devem migrar para fatos + sinais. Tool nova já nasce sem julgamento.
 
 ## Arquitetura
-- `src/windows_rca_mcp/server.py`: todas as tools (49) e os prompts (`ops_health_check`, `root_cause_analysis`).
+- `src/windows_rca_mcp/server.py`: todas as tools (53) e os prompts (`ops_health_check`, `root_cause_analysis`).
 - `src/windows_rca_mcp/__init__.py`: `main()`. `MCP_TRANSPORT=stdio` (padrão) ou `http` (`MCP_HOST`/`MCP_PORT`).
 - `src/windows_rca_mcp/diskscan.cs`: scanner de disco em C#, compilado no alvo via `Add-Type` (`get_disk_usage_tree`).
 - Execução remota:

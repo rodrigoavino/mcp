@@ -594,6 +594,535 @@ Get-ItemProperty $p -ErrorAction SilentlyContinue | ? {{ $_.DisplayName -like '{
 """)
 
 
+# ---------- camada de armazenamento (discos, partições, volumes, BitLocker) ----------
+# Regra do projeto: só fatos observáveis e sinais objetivos com o limiar à vista. Sem "melhor prática" nem recomendação:
+# isso é do RAG (microsoft-docs). Tipo de mídia (SSD/HDD) e barramento (NVMe/SAS/SATA/...) são campos SEPARADOS: não se
+# presume SSD por causa do barramento nem o contrário. BitLocker indisponível é "indeterminado", nunca "desligado".
+LDM_GPT = {"5808c8aa-7e8f-42e0-85d2-e1e90434cfb3": "LDM Metadata", "af9b60a0-1431-4f62-bc68-3311714a69ad": "LDM Data"}
+MBR_LDM = 0x42   # tipo MBR 0x42 = partição LDM (disco dinâmico). GUIDs e 0x42 confirmados em learn.microsoft.com (set id).
+MBR_LIMIT_BYTES = 2 * 1024**4   # 2 TiB: limiar do projeto para o sinal mbrDiskAbove2TiB
+LOW_FREE_PCT = 15               # baseline do projeto para o sinal freeSpaceBelowBaseline
+
+
+def _gb(b):
+    return round(b / 1024**3, 2) if isinstance(b, (int, float)) else None
+
+
+def _sector_format(logical, physical):
+    if logical == 512 and physical == 512:
+        return "512n"
+    if logical == 512 and physical == 4096:
+        return "512e"
+    if logical == 4096 and physical == 4096:
+        return "4Kn"
+    return None
+
+
+def _disk_type_text(media, bus):
+    m = media if media and media != "Unspecified" else None
+    if m and bus:
+        return f"{m} via {bus}"
+    return f"tipo de mídia não informado pelo sistema (barramento {bus})" if bus else "indeterminado"
+
+
+def _is_dynamic(disk: dict) -> tuple[bool, list[str]]:
+    why = []
+    for pt in _lst(disk.get("PartTypes")):
+        g = str(pt.get("GptType") or "").strip("{}").lower()
+        if g in LDM_GPT:
+            why.append(f"partição GPT {LDM_GPT[g]}")
+        if pt.get("MbrType") == MBR_LDM:
+            why.append("partição MBR tipo 0x42 (LDM)")
+    for t in _lst(disk.get("Win32Types")):
+        if "logical disk manager" in str(t).lower():
+            why.append("Win32_DiskPartition: Logical Disk Manager")
+    return bool(why), list(dict.fromkeys(why))
+
+
+def _normalize_disks(raw: dict) -> dict:
+    disks = []
+    for d in _lst(raw.get("Disks")):
+        dyn, basis = _is_dynamic(d)
+        size = d.get("SizeBytes") or 0
+        disks.append({
+            "number": d.get("Number"), "model": d.get("Model"), "size_bytes": size, "size_gb": _gb(size),
+            "allocated_gb": _gb(d.get("AllocatedBytes")), "bus_type": d.get("BusType") or None,
+            "media_type": d.get("MediaType") or None, "spindle_speed_rpm": d.get("SpindleSpeed"),
+            "type_text": _disk_type_text(d.get("MediaType"), d.get("BusType")),
+            "partition_style": d.get("PartitionStyle"), "dynamic": dyn, "dynamic_basis": basis,
+            "volume_kind": "Dinâmico" if dyn else "Básico",
+            "online": not d.get("IsOffline"), "offline_reason": d.get("OfflineReason") if d.get("IsOffline") else None,
+            "read_only": bool(d.get("IsReadOnly")), "is_boot": bool(d.get("IsBoot")), "is_system": bool(d.get("IsSystem")),
+            "is_clustered": bool(d.get("IsClustered")), "health_status": d.get("HealthStatus"),
+            "operational_status": d.get("OperationalStatus"),
+            "logical_sector_bytes": d.get("LogicalSectorSize"), "physical_sector_bytes": d.get("PhysicalSectorSize"),
+            "sector_format": _sector_format(d.get("LogicalSectorSize"), d.get("PhysicalSectorSize")),
+            "partition_count": d.get("PartitionCount"), "location": d.get("Location"),
+            "firmware": d.get("FirmwareVersion") or None,
+            "_ids": {"serial": (d.get("SerialNumber") or "").strip() or None, "disk_guid": d.get("DiskGuid") or None}})
+    ids = [{"disk": x["number"], **{k: v for k, v in x.pop("_ids").items() if v}} for x in disks]
+    mbr_big = [x["number"] for x in disks if x["partition_style"] == "MBR" and x["size_bytes"] > MBR_LIMIT_BYTES]
+    sig = {"diskOffline": any(not x["online"] for x in disks), "diskReadOnly": any(x["read_only"] for x in disks),
+           "diskNotHealthy": any((x["health_status"] or "Healthy") != "Healthy" for x in disks),
+           "dynamicDiskPresent": any(x["dynamic"] for x in disks), "mbrDiskAbove2TiB": bool(mbr_big)}
+    by = lambda k: {v: sum(1 for x in disks if x[k] == v) for v in sorted({str(x[k]) for x in disks})}
+    return {"disk_count": len(disks), "total_gb": _gb(sum(x["size_bytes"] for x in disks)),
+            "by_bus_type": by("bus_type"), "by_media_type": by("media_type"), "by_partition_style": by("partition_style"),
+            "disks": disks, "signals": sig,
+            "signal_details": {"mbrDiskAbove2TiB": {"threshold_tib": 2, "disks": mbr_big, "source": "limiar do projeto"}},
+            "identifiers": ids}
+
+
+@mcp.tool
+def get_storage_overview(host: str):
+    """Discos do servidor, só fatos: quantidade, modelo, tamanho, barramento (NVMe/SAS/SATA/SCSI/iSCSI/Virtual...) e tipo de
+    mídia (SSD/HDD/SCM; 'Unspecified' quando o sistema não informa, ex.: discos virtuais) em campos SEPARADOS, estilo de
+    partição (GPT/MBR), básico ou dinâmico (com a base da detecção), online/offline (+ motivo), somente leitura, saúde,
+    bytes por setor lógico e físico (512n/512e/4Kn), partições, boot/sistema. Sinais objetivos: diskOffline,
+    diskReadOnly, diskNotHealthy, dynamicDiskPresent, mbrDiskAbove2TiB (limiar do projeto). Serial e GUID do disco ficam
+    em 'identifiers' (sensíveis: não vão ao RAG). Sem recomendação: interpretação é do RAG (microsoft-docs)."""
+    raw = _ps(host, r"""
+$wdp = @(Get-CimInstance Win32_DiskPartition | select DiskIndex,Type)
+$rows = foreach ($d in @(Get-Disk | sort Number)) {
+  $pd = $d | Get-PhysicalDisk -ErrorAction SilentlyContinue | select -first 1
+  $parts = @(try { Get-Partition -DiskNumber $d.Number -ErrorAction Stop } catch { })
+  [pscustomobject]@{ Number=$d.Number; Model=$d.FriendlyName; SizeBytes=[int64]$d.Size; AllocatedBytes=[int64]$d.AllocatedSize
+    BusType="$($d.BusType)"; MediaType="$($pd.MediaType)"; SpindleSpeed=$pd.SpindleSpeed; PartitionStyle="$($d.PartitionStyle)"
+    IsOffline=[bool]$d.IsOffline; OfflineReason="$($d.OfflineReason)"; IsReadOnly=[bool]$d.IsReadOnly
+    IsBoot=[bool]$d.IsBoot; IsSystem=[bool]$d.IsSystem; IsClustered=[bool]$d.IsClustered
+    HealthStatus="$($d.HealthStatus)"; OperationalStatus=(@($d.OperationalStatus) -join ',')
+    LogicalSectorSize=$d.LogicalSectorSize; PhysicalSectorSize=$d.PhysicalSectorSize; PartitionCount=$d.NumberOfPartitions
+    Location=$d.Location; FirmwareVersion=$d.FirmwareVersion; SerialNumber=$d.SerialNumber; DiskGuid="$($d.Guid)"
+    PartTypes=@($parts | % { [pscustomobject]@{ GptType="$($_.GptType)"; MbrType=$(if ($null -ne $_.MbrType) { [int]$_.MbrType } else { $null }) } })
+    Win32Types=@($wdp | ? { $_.DiskIndex -eq $d.Number } | % { "$($_.Type)" }) }
+}
+[pscustomobject]@{ Disks=@($rows) } | ConvertTo-Json -Depth 5 -Compress
+""", timeout=90)
+    if not isinstance(raw, dict) or "Disks" not in raw:
+        return raw
+    out = _normalize_disks(raw)
+    out["host"] = host
+    return out
+
+
+def _bitlocker_for(vol: dict, bl: dict) -> dict:
+    """BitLocker de um volume. Sem o recurso: 'indeterminado' (nunca 'desligado')."""
+    if not bl.get("Available"):
+        return {"status": "indeterminate", "reason": bl.get("Reason") or "BitLocker indisponível neste servidor"}
+    letter = (vol.get("DriveLetter") or "")
+    if not letter:
+        return {"status": "indeterminate", "reason": "volume sem letra: não mapeado ao BitLocker"}
+    m = next((x for x in _lst(bl.get("Volumes")) if str(x.get("MountPoint", "")).upper().rstrip("\\") == f"{letter.upper()}:"), None)
+    if not m:
+        return {"status": "indeterminate", "reason": "volume não listado pelo BitLocker"}
+    return {"status": "reported", "protection": m.get("ProtectionStatus"), "volume_status": m.get("VolumeStatus"),
+            "lock_status": m.get("LockStatus"), "encryption_percent": m.get("EncryptionPercentage"),
+            "encryption_method": m.get("EncryptionMethod"), "volume_type": m.get("VolumeType"),
+            "key_protector_types": _lst(m.get("KeyProtectorTypes"))}   # só os TIPOS: nunca senha/chave de recuperação
+
+
+def _normalize_volumes(raw: dict, low_free_pct: int) -> dict:
+    parts = {}
+    for pt in _lst(raw.get("Partitions")):
+        for path in _lst(pt.get("AccessPaths")):
+            parts[str(path).lower()] = pt
+    w32 = {str(x.get("DeviceID", "")).lower(): x for x in _lst(raw.get("Win32Volumes"))}
+    bl = raw.get("BitLocker") or {}
+    vols, low = [], []
+    for v in _lst(raw.get("Volumes")):
+        path = v.get("Path") or ""
+        pt = parts.get(path.lower()) or {}
+        w = w32.get(path.lower()) or {}
+        size, free = v.get("Size"), v.get("SizeRemaining")
+        pct = round(100 * free / size, 1) if size and free is not None else None
+        guid = re.search(r"Volume\{([0-9a-fA-F-]{36})\}", path)
+        cluster = v.get("AllocationUnitSize") or w.get("BlockSize") or None
+        letter = v.get("DriveLetter") or None
+        folders = [a for a in _lst(pt.get("AccessPaths")) if a and not str(a).lower().startswith("\\\\?\\volume") and len(str(a)) > 3]
+        row = {"drive_letter": f"{letter}:" if letter else None, "mount_folders": folders,
+               "volume_guid": guid.group(1) if guid else None, "volume_path": path or None, "label": v.get("FileSystemLabel") or None,
+               "filesystem": v.get("FileSystem") or None, "drive_type": v.get("DriveType"),
+               "cluster_size_bytes": cluster, "size_bytes": size, "size_gb": _gb(size), "free_bytes": free, "free_gb": _gb(free),
+               "free_percent": pct, "health_status": v.get("HealthStatus"), "operational_status": v.get("OperationalStatus"),
+               "disk_number": pt.get("DiskNumber"), "partition_number": pt.get("PartitionNumber"),
+               "partition_offset_bytes": pt.get("Offset"), "partition_size_bytes": pt.get("Size"), "partition_size_gb": _gb(pt.get("Size")),
+               "partition_type": pt.get("Type"), "partition_read_only": bool(pt.get("IsReadOnly")) if pt else None,
+               "partition_hidden": bool(pt.get("IsHidden")) if pt else None, "partition_active": bool(pt.get("IsActive")) if pt else None,
+               "bitlocker": _bitlocker_for(v, bl)}
+        row["signals"] = {"freeSpaceBelowBaseline": pct is not None and pct < low_free_pct,
+                          "notHealthy": (v.get("HealthStatus") or "Healthy") != "Healthy",
+                          "readOnly": bool(pt.get("IsReadOnly"))}
+        if row["signals"]["freeSpaceBelowBaseline"]:
+            low.append(row["drive_letter"] or row["volume_guid"])
+        vols.append(row)
+    return {"volume_count": len(vols), "volumes": vols,
+            "bitlocker": {"available": bool(bl.get("Available")), "source": bl.get("Source"), "reason": bl.get("Reason")},
+            "signals": {"freeSpaceBelowBaseline": low, "volumeNotHealthy": [x["drive_letter"] or x["volume_guid"] for x in vols if x["signals"]["notHealthy"]],
+                        "bitLockerIndeterminate": not bl.get("Available")},
+            "baseline": {"low_free_pct": low_free_pct, "source": "limiar do projeto"}}
+
+
+@mcp.tool
+def get_volumes(host: str, low_free_pct: int = LOW_FREE_PCT):
+    """Partições e volumes, só fatos, ligados ao disco: letra e pontos de montagem (pastas), GUID do volume, rótulo, sistema
+    de arquivos, tamanho do cluster (unidade de alocação) em bytes, tamanho do volume e da partição, espaço livre
+    (bytes e %), saúde, disco/partição/offset, tipo de partição, somente leitura/oculta/ativa e BitLocker (proteção,
+    estado, bloqueio, % criptografado, método, TIPOS de protetor; nunca senha nem chave de recuperação).
+    BitLocker indisponível => 'indeterminate' (nunca 'desligado'). Sinais: freeSpaceBelowBaseline (limiar do projeto
+    low_free_pct, padrão 15), notHealthy, readOnly, bitLockerIndeterminate. Sem recomendação (isso é do RAG)."""
+    low_free_pct = max(1, min(int(low_free_pct), 99))
+    raw = _ps(host, r"""
+$parts = @(Get-Partition -ErrorAction SilentlyContinue | % {
+  [pscustomobject]@{ DiskNumber=$_.DiskNumber; PartitionNumber=$_.PartitionNumber; Offset=[int64]$_.Offset; Size=[int64]$_.Size
+    Type="$($_.Type)"; IsReadOnly=[bool]$_.IsReadOnly; IsHidden=[bool]$_.IsHidden; IsActive=[bool]$_.IsActive; AccessPaths=@($_.AccessPaths) } })
+$vols = @(Get-Volume | % {
+  [pscustomobject]@{ DriveLetter="$($_.DriveLetter)"; Path=$_.Path; FileSystemLabel=$_.FileSystemLabel; FileSystem="$($_.FileSystem)"
+    DriveType="$($_.DriveType)"; AllocationUnitSize=$_.AllocationUnitSize; Size=[int64]$_.Size; SizeRemaining=[int64]$_.SizeRemaining
+    HealthStatus="$($_.HealthStatus)"; OperationalStatus=(@($_.OperationalStatus) -join ',') } })
+$w32 = @(Get-CimInstance Win32_Volume | select DeviceID,BlockSize)
+$bl = [pscustomobject]@{ Available=$false; Source=$null; Reason=$null; Volumes=@() }
+if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
+  try {
+    $bl.Volumes = @(Get-BitLockerVolume -ErrorAction Stop | % {
+      [pscustomobject]@{ MountPoint=$_.MountPoint; VolumeType="$($_.VolumeType)"; VolumeStatus="$($_.VolumeStatus)"
+        ProtectionStatus="$($_.ProtectionStatus)"; LockStatus="$($_.LockStatus)"; EncryptionPercentage=$_.EncryptionPercentage
+        EncryptionMethod="$($_.EncryptionMethod)"; KeyProtectorTypes=@($_.KeyProtector | % { "$($_.KeyProtectorType)" }) } })
+    $bl.Available = $true; $bl.Source = 'Get-BitLockerVolume'
+  } catch { $bl.Reason = "Get-BitLockerVolume falhou: " + (("$($_.Exception.Message)" -split "`n")[0]) }
+} else {
+  $f = try { (Get-WindowsFeature -Name BitLocker -ErrorAction Stop).InstallState } catch { $null }
+  $bl.Reason = "cmdlet Get-BitLockerVolume ausente" + $(if ($f) { " (recurso BitLocker: $f)" } else { "" })
+}
+[pscustomobject]@{ Partitions=$parts; Volumes=$vols; Win32Volumes=$w32; BitLocker=$bl } | ConvertTo-Json -Depth 5 -Compress
+""", timeout=120)
+    if not isinstance(raw, dict) or "Volumes" not in raw:
+        return raw
+    out = _normalize_volumes(raw, low_free_pct)
+    out["host"] = host
+    return out
+
+
+# ---------- plataforma: físico, virtual ou nuvem ----------
+# Regra do projeto: só fatos e evidência. A plataforma é deduzida por ASSINATURAS do catálogo do projeto (cadeias SMBIOS
+# e agentes de guest); strings SMBIOS podem ser alteradas na configuração da VM, então o resultado traz a evidência
+# usada e 'indeterminado' quando nada casa. Serviço de metadados da nuvem (IMDS) só é consultado quando o SMBIOS
+# indica uma nuvem possível, só em campos de uma lista fixa, NUNCA credenciais, user-data ou custom-data.
+CHASSIS = {1: "Other", 2: "Unknown", 3: "Desktop", 4: "Low Profile Desktop", 5: "Pizza Box", 6: "Mini Tower", 7: "Tower",
+           8: "Portable", 9: "Laptop", 10: "Notebook", 13: "All in One", 17: "Main System Chassis", 23: "Rack Mount Chassis",
+           28: "Blade", 29: "Blade Enclosure", 30: "Tablet", 31: "Convertible", 35: "Mini PC", 36: "Stick PC"}
+GUEST_SERVICES = ["VMTools", "VGAuthService", "QEMU-GA", "qemu-ga", "AmazonSSMAgent", "AWSLiteAgent", "EC2Launch",
+                  "WindowsAzureGuestAgent", "RdAgent", "GCEAgent", "vmicheartbeat", "vmicshutdown", "vmictimesync", "vmms"]
+
+
+def _s(x) -> str:
+    return str(x or "").strip()
+
+
+def _classify_platform(raw: dict, probes: dict | None = None) -> dict:
+    """Função pura: SMBIOS + serviços (+ metadados da nuvem, se houver) -> plataforma com a evidência usada."""
+    cs, bios, csp = raw.get("ComputerSystem") or {}, raw.get("Bios") or {}, raw.get("Product") or {}
+    man, model = _s(cs.get("Manufacturer")), _s(cs.get("Model"))
+    bver, bman = _s(bios.get("Version")) + " " + _s(bios.get("SMBIOSBIOSVersion")), _s(bios.get("Manufacturer"))
+    running = {_s(x.get("Name")).lower() for x in _lst(raw.get("Services")) if _s(x.get("Status")) == "Running"}
+    probes = probes or {}
+    hits: list[dict] = []
+
+    def hit(key, label, kind, why):
+        hits.append({"key": key, "label": label, "kind": kind, "evidence": why})
+
+    if re.match(r"VMware", man, re.I) or re.match(r"VMware", model, re.I) or re.search(r"VMW|VMware", bver):
+        hit("vmware", "VMware", "hypervisor", f"SMBIOS: fabricante '{man}', modelo '{model}', BIOS '{bver.strip()}'")
+    if man == "Microsoft Corporation" and model == "Virtual Machine":
+        hit("hyperv", "Microsoft Hyper-V", "hypervisor", "SMBIOS: fabricante 'Microsoft Corporation', modelo 'Virtual Machine'")
+    if re.match(r"Amazon EC2", man, re.I) or re.match(r"Amazon EC2", bman, re.I) or re.search(r"amazon", bver, re.I):
+        hit("aws", "Amazon Web Services (EC2)", "cloud", f"SMBIOS: fabricante '{man}', modelo '{model}', BIOS '{bver.strip()}'")
+    if re.match(r"Google", man, re.I) and re.search(r"Google Compute Engine", model, re.I):
+        hit("gcp", "Google Cloud (Compute Engine)", "cloud", f"SMBIOS: fabricante '{man}', modelo '{model}'")
+    if re.match(r"Xen", man, re.I) or model == "HVM domU":
+        hit("xen", "Xen", "hypervisor", f"SMBIOS: fabricante '{man}', modelo '{model}'")
+    if re.match(r"(QEMU|Red Hat)", man, re.I) or re.search(r"\b(KVM|QEMU)\b|Standard PC", model):
+        hit("kvm_qemu", "KVM/QEMU", "hypervisor", f"SMBIOS: fabricante '{man}', modelo '{model}', BIOS '{bman}'")
+    if re.search(r"innotek|VirtualBox", man + " " + model, re.I):
+        hit("virtualbox", "Oracle VirtualBox", "hypervisor", f"SMBIOS: fabricante '{man}', modelo '{model}'")
+    # Azure: só com evidência além do Hyper-V genérico (agente de guest em execução ou metadados da própria Azure).
+    az = probes.get("azure") or {}
+    if az.get("Reachable") or ({"windowsazureguestagent", "rdagent"} & running):
+        if any(h["key"] == "hyperv" for h in hits) or az.get("Reachable"):
+            why = "serviço de metadados da Azure respondeu" if az.get("Reachable") else "agente de guest da Azure em execução (WindowsAzureGuestAgent/RdAgent)"
+            hit("azure", "Microsoft Azure", "cloud", why)
+    for key, label, svcs in (("aws", "Amazon Web Services (EC2)", {"amazonssmagent", "awslitagent", "ec2launch"}),
+                             ("gcp", "Google Cloud (Compute Engine)", {"gceagent"})):
+        if (probes.get(key) or {}).get("Reachable") and not any(h["key"] == key for h in hits):
+            hit(key, label, "cloud", "serviço de metadados respondeu")
+    guest = [n for n in ("vmtools", "vgauthservice", "qemu-ga", "amazonssmagent", "awslitagent", "windowsazureguestagent",
+                         "rdagent", "gceagent") if n in running]
+    hyperv_host = "vmms" in running and not any(h["key"] == "hyperv" for h in hits)
+
+    hv = [h for h in hits if h["kind"] == "hypervisor"]
+    cloud = [h for h in hits if h["kind"] == "cloud"]
+    if hits:
+        ptype = "virtual"
+    elif not cs.get("HypervisorPresent"):
+        ptype = "physical"
+    elif hyperv_host:
+        ptype = "physical"   # tem hypervisor porque ele É o host Hyper-V (serviço vmms em execução)
+    else:
+        ptype = "indeterminate"
+    chassis = [CHASSIS.get(int(c), f"código {c}") for c in _lst((raw.get("Enclosure") or {}).get("ChassisTypes")) if str(c).isdigit()]
+    cpus = _lst(raw.get("Processors"))
+    mem_gb = round((cs.get("TotalPhysicalMemory") or 0) / 1024**3, 1)
+    hardware = {"manufacturer": man or None, "model": model or None, "system_type": cs.get("SystemType"),
+                "bios": {"vendor": bman or None, "version": _s(bios.get("SMBIOSBIOSVersion")) or None, "date": bios.get("ReleaseDate")},
+                "board": {"manufacturer": _s((raw.get("BaseBoard") or {}).get("Manufacturer")) or None,
+                          "product": _s((raw.get("BaseBoard") or {}).get("Product")) or None},
+                "chassis": chassis, "sockets": cs.get("NumberOfProcessors"), "logical_processors": cs.get("NumberOfLogicalProcessors"),
+                "cpu_model": _s(cpus[0].get("Name")) if cpus else None, "cores": sum(int(c.get("NumberOfCores") or 0) for c in cpus),
+                "memory_gb": mem_gb}
+    out = {"platform": ptype, "hypervisor_present": bool(cs.get("HypervisorPresent")),
+           "virtualization": [h["label"] for h in hv], "cloud_provider": [h["label"] for h in cloud],
+           "detected_by": hits, "guest_agents_running": guest, "hyper_v_host_role": hyperv_host,
+           "hardware": hardware, "signature_source": "catálogo do projeto (cadeias SMBIOS e agentes de guest)"}
+    if ptype == "indeterminate":
+        out["note"] = ("Hypervisor presente, mas nenhuma assinatura do catálogo casou: pode ser servidor físico com VBS/Hyper-V "
+                       "ou VM de plataforma fora do catálogo. Os fatos de hardware estão em 'hardware'.")
+    # Identificadores: servem a suporte/inventário, NÃO a consulta externa (nunca envie ao RAG).
+    out["identifiers"] = {k: v for k, v in {
+        "bios_serial": _s(bios.get("SerialNumber")) or None, "system_uuid": _s(csp.get("UUID")) or None,
+        "identifying_number": _s(csp.get("IdentifyingNumber")) or None,
+        "asset_tag": _s((raw.get("Enclosure") or {}).get("SMBIOSAssetTag")) or None,
+        "note": "sensíveis: não incluir em consultas externas"}.items() if v}
+    # Metadados da nuvem (campos de uma lista fixa)
+    meta = {}
+    for key in ("aws", "azure", "gcp"):
+        pr = probes.get(key)
+        if pr and pr.get("Reachable"):
+            meta[key] = {k: v for k, v in pr.items() if k not in ("Reachable", "InstanceId", "VmId")}
+            ids = out["identifiers"]
+            if pr.get("InstanceId") or pr.get("VmId"):
+                ids["cloud_instance_id"] = pr.get("InstanceId") or pr.get("VmId")
+        elif pr:
+            meta[key] = {"Reachable": False, "Error": pr.get("Error")}
+    if meta:
+        out["cloud_metadata"] = meta
+    # Contexto genérico para o RAG: sem serial, UUID, asset tag, id de instância, host, IP ou assinatura/conta.
+    ctx: list[str] = []
+    if ptype == "physical":
+        ctx += ["physical server"] + ([f"{man} {model}"] if man and model else [])
+    elif ptype == "virtual":
+        ctx += [f"virtual machine on {h['label']}" for h in hv] or [f"virtual machine on {cloud[0]['label']}"]
+        for h in cloud:
+            ctx.append(h["label"])
+        m = meta.get("aws") or {}
+        if m.get("InstanceType"):
+            ctx.append(f"EC2 instance type {m['InstanceType']}")
+        elif any(h["key"] == "aws" for h in hits) and re.fullmatch(r"[a-z0-9]+\.[a-z0-9]+", model or ""):
+            ctx.append(f"EC2 instance type {model}")
+        m = meta.get("azure") or {}
+        if m.get("VmSize"):
+            ctx.append(f"Azure VM size {m['VmSize']}")
+        m = meta.get("gcp") or {}
+        if m.get("MachineType"):
+            ctx.append(f"Compute Engine machine type {m['MachineType']}")
+    out["docs_context"] = list(dict.fromkeys(ctx))
+    return out
+
+
+PS_PROBES = {
+    "aws": r"""
+try { $t = Invoke-RestMethod -Method Put -Uri 'http://169.254.169.254/latest/api/token' -Headers @{'X-aws-ec2-metadata-token-ttl-seconds'='60'} -TimeoutSec 2
+  $h = @{'X-aws-ec2-metadata-token'=$t}
+  function G($p) { try { Invoke-RestMethod -Uri "http://169.254.169.254/latest/meta-data/$p" -Headers $h -TimeoutSec 2 } catch { $null } }
+  $pr['aws'] = [pscustomobject]@{ Reachable=$true; InstanceType=(G 'instance-type'); AvailabilityZone=(G 'placement/availability-zone')
+    Region=(G 'placement/region'); LifeCycle=(G 'instance-life-cycle'); InstanceId=(G 'instance-id') }
+} catch { $pr['aws'] = [pscustomobject]@{ Reachable=$false; Error=("$($_.Exception.Message)" -split "`n")[0] } }
+""",
+    "azure": r"""
+try { $m = Invoke-RestMethod -Uri 'http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01' -Headers @{Metadata='true'} -TimeoutSec 2
+  $pr['azure'] = [pscustomobject]@{ Reachable=$true; VmSize=$m.vmSize; Location=$m.location; Zone=$m.zone; OsType=$m.osType
+    Offer=$m.offer; Sku=$m.sku; Priority=$m.priority; AzEnvironment=$m.azEnvironment; VmId=$m.vmId
+    OsDiskGB=$m.storageProfile.osDisk.diskSizeGB; OsDiskType=$m.storageProfile.osDisk.managedDisk.storageAccountType
+    DataDisks=@($m.storageProfile.dataDisks | % { [pscustomobject]@{ Lun=$_.lun; SizeGB=$_.diskSizeGB; Type=$_.managedDisk.storageAccountType; Caching=$_.caching } }) }
+} catch { $pr['azure'] = [pscustomobject]@{ Reachable=$false; Error=("$($_.Exception.Message)" -split "`n")[0] } }
+""",
+    "gcp": r"""
+try { $h = @{'Metadata-Flavor'='Google'}
+  $mt = Invoke-RestMethod -Uri 'http://169.254.169.254/computeMetadata/v1/instance/machine-type' -Headers $h -TimeoutSec 2
+  $zn = Invoke-RestMethod -Uri 'http://169.254.169.254/computeMetadata/v1/instance/zone' -Headers $h -TimeoutSec 2
+  $pr['gcp'] = [pscustomobject]@{ Reachable=$true; MachineType=(("$mt") -split '/')[-1]; Zone=(("$zn") -split '/')[-1] }
+} catch { $pr['gcp'] = [pscustomobject]@{ Reachable=$false; Error=("$($_.Exception.Message)" -split "`n")[0] } }
+""",
+}
+
+
+@mcp.tool
+def get_platform_info(host: str, probe_cloud: str = "auto"):
+    """Plataforma do servidor: FÍSICO, VIRTUAL (VMware, Hyper-V, KVM/QEMU, Xen, VirtualBox) ou NUVEM (AWS, Azure, GCP),
+    com a evidência usada (cadeias SMBIOS, agentes de guest, metadados). Servidor físico: fabricante, modelo, BIOS,
+    placa, chassi, CPU, sockets, núcleos e memória. 'indeterminate' quando nenhuma assinatura casa (nunca chuta).
+    probe_cloud: 'auto' (padrão) consulta o serviço de metadados da instância só se o SMBIOS indicar nuvem possível
+    (AWS/GCP, ou Hyper-V para Azure); 'no' nunca consulta; 'aws', 'azure', 'gcp' ou 'all' força. Só campos de lista
+    fixa (tipo/tamanho da instância, região, zona, discos): nunca credenciais nem user-data. 'docs_context' traz rótulos
+    genéricos para consultar o RAG (microsoft-docs); 'identifiers' (serial, UUID, asset tag, id da instância) são
+    sensíveis e NÃO devem ir ao RAG."""
+    if probe_cloud not in ("auto", "no", "aws", "azure", "gcp", "all"):
+        raise ValueError("probe_cloud deve ser auto, no, aws, azure, gcp ou all")
+    raw = _ps(host, r"""
+$cs = Get-CimInstance Win32_ComputerSystem | select Manufacturer,Model,SystemType,HypervisorPresent,TotalPhysicalMemory,NumberOfProcessors,NumberOfLogicalProcessors
+$bios = Get-CimInstance Win32_BIOS | select Manufacturer,Version,SMBIOSBIOSVersion,ReleaseDate,SerialNumber
+$prod = Get-CimInstance Win32_ComputerSystemProduct | select UUID,IdentifyingNumber
+$bb = Get-CimInstance Win32_BaseBoard | select Manufacturer,Product
+$enc = Get-CimInstance Win32_SystemEnclosure | select ChassisTypes,SMBIOSAssetTag
+$cpu = @(Get-CimInstance Win32_Processor | select Name,NumberOfCores)
+$svc = @(Get-Service -Name __SVC__ -ErrorAction SilentlyContinue | select Name,@{n='Status';e={"$($_.Status)"}})
+[pscustomobject]@{ ComputerSystem=$cs; Bios=$bios; Product=$prod; BaseBoard=$bb; Enclosure=$enc; Processors=$cpu; Services=$svc } | ConvertTo-Json -Depth 4 -Compress
+""".replace("__SVC__", ",".join(GUEST_SERVICES)), timeout=60)
+    if not isinstance(raw, dict) or "ComputerSystem" not in raw:
+        return raw
+    first = _classify_platform(raw)
+    keys = {h["key"] for h in first["detected_by"]}
+    if probe_cloud == "all":
+        want = ["aws", "azure", "gcp"]
+    elif probe_cloud in ("aws", "azure", "gcp"):
+        want = [probe_cloud]
+    elif probe_cloud == "auto":
+        want = [k for k in ("aws", "gcp") if k in keys] + (["azure"] if "hyperv" in keys else [])
+    else:
+        want = []
+    probes = {}
+    if want:
+        pr = _ps(host, "$pr = @{}\n[System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy\n"
+                 + "\n".join(PS_PROBES[k] for k in want) + "\n$pr | ConvertTo-Json -Depth 4 -Compress", timeout=40)
+        if isinstance(pr, dict) and "error" not in pr:
+            probes = pr
+    out = _classify_platform(raw, probes)
+    out["host"] = host
+    out["cloud_probed"] = want
+    return out
+
+
+# ---------- evidência de carga (o que o servidor realmente executa) ----------
+# Regra do projeto: o coletor NÃO presume a função do servidor. Uma carga só é declarada quando há evidência
+# identificadora (serviço, instância no registro, software de servidor, recurso do Windows ou processo).
+# Sem evidência, vale só o sistema operacional e a versão. Ferramentas CLIENTES (SSMS, drivers ODBC) não contam.
+WORKLOADS = {
+    "sql_server_engine": {
+        "label": "SQL Server",
+        "services": ["MSSQLSERVER", "MSSQL$*", "SQLSERVERAGENT", "SQLAgent$*"],
+        "processes": ["sqlservr"],
+        "software": [r"^(Microsoft )?SQL Server \d{4}( R2)?( \(\d+-bit\)| Database Engine Services)"],
+    },
+    "iis": {"label": "IIS", "services": ["W3SVC"], "processes": ["w3wp"], "features": ["Web-Server"]},
+    "hyper_v": {"label": "Hyper-V", "services": ["vmms"], "features": ["Hyper-V"]},
+    "active_directory_domain_services": {"label": "Active Directory Domain Services", "services": ["NTDS"],
+                                         "features": ["AD-Domain-Services"]},
+    "dns_server": {"label": "DNS Server", "services": ["DNS"], "features": ["DNS"]},
+    "dhcp_server": {"label": "DHCP Server", "services": ["DHCPServer"], "features": ["DHCP"]},
+    "failover_cluster": {"label": "Failover Cluster", "services": ["ClusSvc"], "features": ["Failover-Clustering"]},
+}
+# Ferramentas de cliente do SQL Server: informativas, NUNCA identificam um servidor SQL.
+SQL_CLIENT_TOOLS = [r"SQL Server Management Studio", r"^Microsoft ODBC Driver .* for SQL Server",
+                    r"^Microsoft OLE DB Driver .* for SQL Server", r"SQL Server Native Client",
+                    r"Microsoft .* Command Line Utilities .* for SQL Server", r"SQL Server Data Tools"]
+
+
+def _classify_workloads(raw: dict) -> dict:
+    """Função pura: transforma a coleta bruta em evidências por carga. Nada é inferido além do catálogo."""
+    svc = {x["Name"].lower(): x for x in _lst(raw.get("Services")) if x.get("Name")}
+    procs = {str(x).lower() for x in _lst(raw.get("Processes"))}
+    feats = {x["Name"]: x for x in _lst(raw.get("Features")) if isinstance(x, dict) and x.get("Name")}
+    sw = [x for x in _lst(raw.get("Software")) if x.get("DisplayName")]
+    found, absent = {}, []
+    for key, w in WORKLOADS.items():
+        ev = []
+        for pat in w.get("services", []):
+            for name, x in svc.items():
+                if fnmatch.fnmatchcase(name, pat.lower()):
+                    ev.append({"type": "service", "name": x["Name"], "state": x.get("State"), "start_mode": x.get("StartMode")})
+        for name in w.get("processes", []):
+            if name.lower() in procs:
+                ev.append({"type": "process", "name": name, "state": "Running"})
+        for name in w.get("features", []):
+            f = feats.get(name)
+            if f and str(f.get("InstallState")) in ("Installed", "1"):
+                ev.append({"type": "windows_feature", "name": name, "state": "Installed"})
+        for rx in w.get("software", []):
+            for x in sw:
+                if re.search(rx, x["DisplayName"]) and not any(re.search(c, x["DisplayName"]) for c in SQL_CLIENT_TOOLS):
+                    ev.append({"type": "software", "name": x["DisplayName"], "version": x.get("DisplayVersion")})
+        if key == "sql_server_engine":
+            for inst in _lst(raw.get("SqlInstances")):
+                ev.append({"type": "registry_instance", "name": inst.get("Instance"), "instance_id": inst.get("InstanceId"),
+                           "edition": inst.get("Edition"), "version": inst.get("Version"), "patch_level": inst.get("PatchLevel")})
+        if key == "active_directory_domain_services" and (raw.get("DomainRole") or 0) >= 4:
+            ev.append({"type": "domain_role", "name": "controlador de domínio (DomainRole >= 4)", "state": "Active"})
+        if ev:
+            running = any(e.get("state") in ("Running", "Active") for e in ev)
+            found[key] = {"label": w["label"], "present": True, "running": running, "evidence": ev}
+        else:
+            absent.append(key)
+    clients = [{"name": x["DisplayName"], "version": x.get("DisplayVersion")} for x in sw
+               if any(re.search(c, x["DisplayName"]) for c in SQL_CLIENT_TOOLS)]
+    return {"workloads": found, "not_identified": absent, "sql_client_tools_only": bool(clients) and "sql_server_engine" not in found,
+            "client_tools": clients}
+
+
+@mcp.tool
+def get_workload_evidence(host: str, include_all_software: bool = False):
+    """EVIDÊNCIA do que o servidor executa, sem presumir função. Devolve sistema operacional e versão, e para cada
+    carga do catálogo (SQL Server, IIS, Hyper-V, AD DS, DNS, DHCP, Failover Cluster) a evidência que a identifica:
+    serviço, processo, recurso do Windows, instância do SQL Server no registro (edição, versão, patch) ou software
+    de servidor. Ferramentas CLIENTES (SSMS, drivers ODBC/OLE DB) NÃO identificam um servidor SQL (vão em
+    client_tools). 'docs_context' lista só rótulos com evidência e é o único valor aceitável como 'context' ao
+    consultar o RAG (microsoft-docs). Sem evidência, 'docs_context' fica vazio: considere apenas SO e versão.
+    include_all_software=True devolve também todo o software instalado (até 400 itens)."""
+    raw = _ps(host, r"""
+$os = Get-CimInstance Win32_OperatingSystem; $cs = Get-CimInstance Win32_ComputerSystem
+$cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+$reg = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+$sw = @(Get-ItemProperty $reg -ErrorAction SilentlyContinue | ? DisplayName | sort DisplayName | select DisplayName,DisplayVersion,Publisher)
+$svc = @(Get-CimInstance Win32_Service | select Name,DisplayName,State,StartMode)
+$procs = @(Get-Process | select -ExpandProperty ProcessName -Unique)
+$names = '__FEATURES__'.Split(',')
+$feat = $null; $featErr = $null
+try { $feat = @(Get-WindowsFeature -Name $names -ErrorAction Stop | select Name,@{n='InstallState';e={"$($_.InstallState)"}}) } catch { $featErr = $_.Exception.Message }
+$sql = @(); $k = 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL'
+if (Test-Path $k) {
+  $ip = Get-ItemProperty $k
+  foreach ($pr in @($ip.PSObject.Properties | ? { $_.Name -notlike 'PS*' })) {
+    $st = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$($pr.Value)\Setup" -ErrorAction SilentlyContinue
+    $sql += [pscustomobject]@{ Instance=$pr.Name; InstanceId="$($pr.Value)"; Edition=$st.Edition; Version=$st.Version; PatchLevel=$st.PatchLevel }
+  }
+}
+[pscustomobject]@{
+  Host=$env:COMPUTERNAME; Caption=$os.Caption; Version=$os.Version; Build=$os.BuildNumber; UBR=$cv.UBR
+  InstallationType=$cv.InstallationType; DomainRole=[int]$cs.DomainRole; Software=$sw; SoftwareCount=$sw.Count
+  Services=$svc; Processes=$procs; Features=$feat; FeaturesError=$featErr; SqlInstances=$sql
+} | ConvertTo-Json -Depth 4 -Compress
+""".replace("__FEATURES__", ",".join(sorted({f for w in WORKLOADS.values() for f in w.get("features", [])}))), timeout=90)
+    if not isinstance(raw, dict) or "Caption" not in raw:
+        return raw
+    c = _classify_workloads(raw)
+    ctx = [w["label"] for w in c["workloads"].values()]
+    out = {
+        "host": raw.get("Host") or host,
+        "os": {"caption": raw.get("Caption"), "version": raw.get("Version"), "build": raw.get("Build"), "ubr": raw.get("UBR"),
+               "installation_type": raw.get("InstallationType"), "domain_role": raw.get("DomainRole")},
+        "workloads": c["workloads"], "not_identified": c["not_identified"],
+        "client_tools": c["client_tools"], "sql_client_tools_only": c["sql_client_tools_only"],
+        "docs_context": ctx,
+        "windows_features_checked": raw.get("FeaturesError") is None,
+        "software_total": raw.get("SoftwareCount"),
+        "rule": ("Carga só é declarada com evidência identificadora. "
+                 + ("Evidência encontrada para: " + ", ".join(ctx) + "." if ctx else
+                    "Nenhuma carga identificada: considerar apenas o sistema operacional e a versão.")),
+    }
+    if raw.get("FeaturesError"):
+        out["windows_features_note"] = "Recursos do Windows indisponíveis nesta edição/permissão: evidência por recurso é indeterminada."
+    if include_all_software:
+        out["software"] = _lst(raw.get("Software"))[:400]
+    return out
+
+
 # ---------- postura operacional / segurança ----------
 @mcp.tool
 def get_security_posture(host: str):
