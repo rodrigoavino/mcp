@@ -89,5 +89,5 @@ uv run python teste.py get_health_summary host=fastmcp.familia.local  # uma tool
 ## Pendências (retomar)
 - [x] `get_stopped_auto_services` e `get_local_groups` só com fatos e sinais (sem classificar nem recomendar).
 - [ ] Migrar para fatos + sinais o que ainda julga (lista na seção de fronteira acima).
-- [ ] RAG (`microsoft_docs_mcp`): **tabelas** viram células soltas (cada `td`/`th` é um bloco), então o trecho perde a associação linha/coluna e a busca dá falso negativo (ex.: código 1077, RIDs de domínio). Juntar as células de cada linha num bloco.
+- [x] RAG (`microsoft_docs_mcp`): **tabelas** agora viram um bloco por linha com o cabeçalho de cada coluna, e a decodificação é UTF-8 primeiro (acentos de páginas pt-br). Resta tratar `rowspan`/`colspan` e tabelas aninhadas.
 - [ ] Lab: **avaliar** o DNS secundário 10.10.0.1 (servidor válido, decisão do usuário; não resolve `familia.local`: com o DC fora do ar o cliente cai nele e recebe "não existe"). Opções: manter, trocar por um 2º DC, ou DC com encaminhador e só o DC no cliente.

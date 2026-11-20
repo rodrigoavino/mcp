@@ -51,6 +51,7 @@ PAGE_TTL_S = int(os.getenv("MS_DOCS_PAGE_TTL_DAYS", "7")) * 86400
 SEARCH_TTL_S = int(os.getenv("MS_DOCS_SEARCH_TTL_DAYS", "1")) * 86400
 OFFLINE = os.getenv("MS_DOCS_OFFLINE", "").strip().lower() == "true"
 CACHE_MAX_FILES = 400
+PARSER_VERSION = "p2"   # muda quando o parser/decodificador muda: invalida as páginas em cache
 MAX_PAGES_TOTAL = 12  # teto de páginas NOVAS baixadas por consulta, somando todas as passadas
 FIRST_PASS_DOCS = 6   # páginas lidas na 1a passada (1 consulta); só amplia se não houver evidência
 
@@ -331,8 +332,17 @@ def _fetch(url: str, timeout: float = 15.0) -> tuple[str, str]:
                 if size > MAX_BYTES:
                     break
                 buf.append(chunk)
-            return cur, b"".join(buf).decode(r.encoding or "utf-8", errors="replace")
+            return cur, _decode(b"".join(buf), r.encoding)
     raise ValueError("redirecionamentos demais")
+
+
+def _decode(raw: bytes, declared: str | None) -> str:
+    """UTF-8 estrito primeiro: o 'requests' assume ISO-8859-1 quando o Content-Type não traz charset, e páginas em
+    português saíam com 'vocÃª'. Só se o UTF-8 falhar usa o charset declarado (ou cp1252)."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode(declared or "cp1252", errors="replace")
 
 
 # ---------- HTML -> blocos de texto ----------
@@ -354,10 +364,40 @@ class _Doc(HTMLParser):
         self._head = ""
         self._in_head_tag = False
         self._pre = 0
+        self._row: list[str] | None = None      # células da linha em curso (None = fora de tabela)
+        self._cellbuf: list[str] = []
+        self._in_cell = False
+        self._row_all_th = True
+        self._headers: list[str] = []
+        self._tables = 0
+
+    def _end_cell(self):
+        if self._in_cell and self._row is not None:
+            self._row.append(" ".join(self._cellbuf).strip())
+        self._cellbuf, self._in_cell = [], False
+
+    def _end_row(self):
+        self._end_cell()
+        row, self._row = self._row, None
+        if not row or not any(row):
+            return
+        if self._row_all_th:
+            self._headers = row
+            text = " | ".join(c for c in row if c)
+        elif self._headers and len(self._headers) == len(row):
+            text = " | ".join(f"{h}: {c}" if h and c else (c or "") for h, c in zip(self._headers, row) if c)
+        else:
+            text = " | ".join(c for c in row if c)
+        if len(text) >= 3:
+            (self.main if self._main else self.body).append((self._head, text))
 
     def _flush(self):
         t = ("".join(self._buf) if self._pre else " ".join("".join(self._buf).split())).strip()
         self._buf = []
+        if self._row is not None and self._in_cell:   # dentro de célula: junta no texto da célula (qualquer tamanho)
+            if t:
+                self._cellbuf.append(t)
+            return
         if len(t) < 3:
             return
         if self._in_head_tag:
@@ -381,6 +421,17 @@ class _Doc(HTMLParser):
             self._main += 1
         if tag in _BLOCK:
             self._flush()
+        if tag == "table":
+            self._tables += 1
+            self._headers = []
+        elif tag == "tr":
+            self._end_row()
+            self._row, self._row_all_th = [], True
+        elif tag in ("td", "th") and self._row is not None:
+            self._end_cell()
+            self._in_cell = True
+            if tag == "td":
+                self._row_all_th = False
         if tag in ("h1", "h2", "h3", "h4"):
             self._in_head_tag = True
         if tag == "pre":
@@ -396,6 +447,15 @@ class _Doc(HTMLParser):
             return
         if tag in _BLOCK:
             self._flush()
+        if tag in ("td", "th"):
+            self._end_cell()
+        elif tag == "tr":
+            self._end_row()
+        elif tag == "table":
+            self._end_row()
+            self._tables = max(0, self._tables - 1)
+            if not self._tables:
+                self._headers = []
         if tag in ("h1", "h2", "h3", "h4"):
             self._in_head_tag = False
         if tag == "pre":
@@ -414,6 +474,7 @@ def parse_html(html: str) -> dict:
     p = _Doc()
     p.feed(html)
     p._flush()
+    p._end_row()
     blocks = p.main or p.body
     return {
         "title": " ".join(p.title.split()),
@@ -428,7 +489,7 @@ def get_doc(url: str, net: Net | None = None) -> dict:
     """Lê e interpreta uma página: cache em disco (7 dias) primeiro; só então a rede. Sem rede permitida e sem cache,
     levanta NeedsNetwork. Levanta ValueError/requests.RequestException em caso de falha."""
     net = net or Net()
-    hit = _cget("pages", url, PAGE_TTL_S, allow_stale=not net.allow)
+    hit = _cget("pages", f"{PARSER_VERSION}|{url}", PAGE_TTL_S, allow_stale=not net.allow)
     if hit:
         net.hit(stale=hit[1])
         return hit[0]
@@ -437,7 +498,7 @@ def get_doc(url: str, net: Net | None = None) -> dict:
     doc = parse_html(html)
     doc["url"] = final
     doc["source"] = source_info(final)
-    _cput("pages", url, doc)
+    _cput("pages", f"{PARSER_VERSION}|{url}", doc)
     return doc
 
 
