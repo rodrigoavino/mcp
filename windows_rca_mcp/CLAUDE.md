@@ -6,8 +6,8 @@ MCP (FastMCP) de **OPS para Windows Server**. Serve para o Claude triar incident
 - **Somente leitura.** Nenhuma tool executa comando arbitrário nem altera o servidor alvo. Única exceção: nenhuma. O `_ps_long` envia o script pelo stdin, sem arquivo temporário no alvo.
 - **Logs com foco em problema.** No Event Viewer, só Crítico(1), Erro(2) e Aviso(3).
 - **Período padrão `days=1`** em toda tool que lê log (Event Viewer, CBS/CbsPersist/dism.log, GPO, logons, cluster). Só amplie se o usuário pedir; `_days()` limita a 90.
-- Logs grandes (CBS) são **agrupados** (mensagens normalizadas + top HRESULTs com dica), nunca devolvidos crus.
-- Toda resposta de saúde usa status **OK / Atenção / Crítico**, com achados e ação recomendada.
+- Logs grandes (CBS) são **agrupados** (mensagens normalizadas + top HRESULTs, sem dica: o significado do código é do RAG), nunca devolvidos crus.
+- Toda análise usa status neutros **sem_sinais / sinais_presentes / verificacao_incompleta**, com achados que mostram o limiar do projeto. Nada de severidade (OK/Atenção/Crítico), ação recomendada ou dica: isso é do RAG.
 - **Segurança (definida na revisão do PR 1):**
   - `WINRM_ALLOWED_HOSTS` é obrigatória (fail-closed, aceita curingas) e nunca deve voltar a ser opcional;
   - o modo `http` exige `MCP_AUTH_TOKEN`;
@@ -21,10 +21,10 @@ MCP (FastMCP) de **OPS para Windows Server**. Serve para o Claude triar incident
   - **Carga do servidor só com evidência:** nunca presumir que o servidor é SQL Server, IIS etc. Use `get_workload_evidence`; sem evidência identificadora vale só o SO e a versão. Cliente (SSMS, ODBC) não identifica servidor. O `context` enviado ao RAG vem só de `docs_context`.
   - **Plataforma:** `get_platform_info` diz se é físico, virtual ou nuvem, só por assinatura com a evidência à vista; `indeterminate` quando nada casa. Serial, UUID, asset tag e id de instância são sensíveis: ficam em `identifiers` e nunca vão ao RAG (só `docs_context`).
   - Nada que saia deste MCP para a internet: nenhuma chamada externa aqui. A única exceção é o serviço de metadados da própria instância (`169.254.169.254`, link-local, executado no servidor alvo e só em campos de lista fixa).
-  - Já migradas para fatos + sinais: `get_stopped_auto_services` e `get_local_groups`. Dívida conhecida: ainda trazem julgamento ou recomendação `get_health_summary` e `validate_cbs` (OK/Atenção/Crítico, ações), `get_time_config` ("o recomendado é NT5DS"), `get_cluster_health` ("configure ... witness"), `get_disk_allocation_analysis` ("candidato a reclamação") e as dicas de HRESULT. Devem migrar. Tool nova já nasce sem julgamento.
+  - Migradas para fatos + sinais: `get_stopped_auto_services`, `get_local_groups`, `get_health_summary`, `validate_cbs`, `get_time_config`, `get_cluster_health`, `get_disk_allocation_analysis`, conexões, teaming e as dicas de HRESULT (removidas). Tool nova já nasce sem julgamento.
 
 ## Arquitetura
-- `src/windows_rca_mcp/server.py`: todas as tools (53) e os prompts (`ops_health_check`, `root_cause_analysis`).
+- `src/windows_rca_mcp/server.py`: todas as tools (54) e os prompts (`ops_health_check`, `root_cause_analysis`).
 - `src/windows_rca_mcp/__init__.py`: `main()`. `MCP_TRANSPORT=stdio` (padrão) ou `http` (`MCP_HOST`/`MCP_PORT`).
 - `src/windows_rca_mcp/diskscan.cs`: scanner de disco em C#, compilado no alvo via `Add-Type` (`get_disk_usage_tree`).
 - Execução remota:
@@ -46,7 +46,7 @@ MCP (FastMCP) de **OPS para Windows Server**. Serve para o Claude triar incident
 Tudo o que o usuário confirmou vale como padrão das respostas deste MCP. Está no código (`envelope.py` e `INSTRUCTIONS` em `server.py`) e aqui.
 - **Envelope mínimo em toda tool:** `{computerName, timestamp, success, data}`; análises completas acrescentam `os` e `summary {status, findings}`; `moreAvailable` é só uma sugestão de uma linha. Aplicado por middleware na fronteira do MCP: as funções Python e as chamadas internas seguem cruas. Tool nova não precisa fazer nada.
 - **Responder só o perguntado.** Não incluir boot, uptime, disco, CPU, memória, serviços, usuários, eventos, volumes ou adaptadores a menos que (1) o usuário peça, (2) seja necessário para responder ou (3) seja erro/diagnóstico relacionado. Dar a tool um parâmetro de recorte (período, nome, limite) em vez de devolver tudo e deixar o Claude filtrar. Sugerir o que mais existe e só coletar se autorizado.
-- **Data de instalação é fato local**: registro, instalação por usuário, eventos MsiInstaller, Package Management, sistema de arquivos, com confiança (high, medium, low). Nunca internet nem documentação. Evento 11724 não vale como instalação. Correspondência de evento por nome igual, nunca por prefixo.
+- **Data de instalação é fato local**: registro, instalação por usuário, MSI em Installer/UserData (high; nunca Win32_Product), eventos MsiInstaller (1033/11707; o 11724 fica de fora: pelo que se sabe é remoção, não confirmado), Package Management, sistema de arquivos, com confiança (high, medium, low). Nunca internet nem documentação. Evento 11724 não vale como instalação. Correspondência de evento por nome igual, nunca por prefixo.
 - **Só fatos e sinais objetivos**; recomendação, boa prática e severidade são do `microsoft-docs`, e só para pergunta de recomendação, suporte, compatibilidade ou boa prática. Inventário, configuração, serviços, usuários, grupos, discos, eventos, SIDs, RIDs e status nunca disparam consulta externa.
 - **Carga do servidor só com evidência** (nunca presumir SQL Server etc.); **nada inventado**.
 - Ao embutir texto em string `'...'` do PowerShell, **dobre as aspas simples** (`'` vira `''`): um XPath com `@Name='X'` quebrou em silêncio um trecho dentro de `try/catch`.

@@ -116,7 +116,7 @@ Depois é só pedir em linguagem natural, por exemplo: *"faça um health check d
 4. Registre no cliente, enviando o token:
    `claude mcp add --transport http windows-ops https://<host>/mcp --header "Authorization: Bearer <token>"`.
 
-## Catálogo de tools (53)
+## Catálogo de tools (54)
 
 Todas recebem `host` (nome ou FQDN do servidor alvo).
 
@@ -166,7 +166,7 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 ### Triagem rápida
 | Tool | O que faz |
 |---|---|
-| `get_health_summary` | **Comece por aqui.** Faz uma única chamada e devolve OK/Atenção/Crítico para CPU, memória, disco, serviços, patches, disponibilidade e eventos. Os limiares são parametrizáveis. |
+| `get_health_summary` | **Comece por aqui.** Faz uma única chamada e devolve `sem_sinais` / `sinais_presentes` / `verificacao_incompleta` para CPU, memória, disco, serviços, patches, disponibilidade e eventos, com o limiar do projeto à vista (parametrizável). Sem severidade nem recomendação. |
 | `get_uptime` | Último boot, uptime, último shutdown planejado (quem/por quê, evento 1074), se o último boot foi inesperado e desligamentos inesperados em 30 dias |
 | `get_system_overview` | SO, build, domínio, CPU/RAM, uptime |
 
@@ -196,6 +196,7 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 | `get_storage_overview` | **Discos**, só fatos: quantidade, modelo, tamanho, barramento (NVMe/SAS/SATA/SCSI/iSCSI/Virtual) e tipo de mídia (SSD/HDD/SCM) em campos **separados** (`Unspecified` quando o sistema não informa, ex.: disco virtual), GPT/MBR, básico/dinâmico (com a base da detecção), online/offline (+ motivo), somente leitura, saúde, bytes por setor lógico/físico (512n/512e/4Kn). Sinais: `diskOffline`, `diskReadOnly`, `diskNotHealthy`, `dynamicDiskPresent`, `mbrDiskAbove2TiB` (limiar do projeto). Serial e GUID do disco em `identifiers` |
 | `get_volumes` | **Partições e volumes** ligados ao disco: letra e pontos de montagem, GUID do volume, rótulo, sistema de arquivos, tamanho do cluster (bytes), tamanho do volume e da partição, espaço livre (bytes e %), saúde, disco/partição/offset, tipo, somente leitura/oculta/ativa e BitLocker (proteção, estado, bloqueio, % criptografado, método, **tipos** de protetor; nunca senha nem chave de recuperação). BitLocker indisponível = `indeterminate`, nunca "desligado". Sinais: `freeSpaceBelowBaseline` (`low_free_pct`, padrão 15, limiar do projeto), `notHealthy`, `readOnly`, `bitLockerIndeterminate` |
 | `get_platform_info` | **Plataforma**: físico, virtual (VMware, Hyper-V, KVM/QEMU, Xen, VirtualBox) ou nuvem (AWS, Azure, GCP), com a evidência usada (cadeias SMBIOS, agentes de guest, metadados). Físico: fabricante, modelo, BIOS, placa, chassi, CPU, sockets, núcleos e memória. `indeterminate` quando nada casa. O serviço de metadados da instância só é consultado se o SMBIOS indicar nuvem possível (`probe_cloud`), em campos de lista fixa, nunca credenciais nem user-data. `docs_context` traz rótulos genéricos para o RAG; `identifiers` (serial, UUID, id da instância) são sensíveis e não vão ao RAG |
+| `get_license_status` | **Licenciamento do Windows, só fatos**: produto, canal da chave (GVLK, Retail, OEM), `LicenseStatus` (número do WMI), HRESULT do motivo, carência restante (min), fim de avaliação (null se não há), rearme, servidor KMS configurado e descoberto, contagens dos eventos Security-SPP (1014/8198/8200/16398) e desligamentos iniciados pelo `wlms.exe`. Não interpreta o status nem diz se a licença é válida: o significado é do RAG |
 | `get_workload_evidence` | **Evidência do que o servidor executa**, sem presumir função: SO e versão, e por carga (SQL Server, IIS, Hyper-V, AD DS, DNS, DHCP, Failover Cluster) o serviço, processo, recurso do Windows, instância do SQL Server no registro (edição, versão, patch) ou software de servidor que a identifica. Cliente do SQL Server (SSMS, ODBC) não conta. `docs_context` lista só cargas com evidência e é o `context` aceitável para o RAG; sem evidência, vale só SO e versão |
 
 ### Patches, CBS e Windows Update
@@ -207,7 +208,7 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 | `get_pending_updates` | Updates pendentes (API do agente de Windows Update) |
 | `get_windows_update_history` | Sucessos, falhas e reboots exigidos (eventos 19/20/21) |
 | `get_update_error_analysis` | Falhas agrupadas por HRESULT, com causa provável |
-| `validate_cbs` | **Veredito "o CBS está quebrado?"** (OK/Atenção/Crítico), com evidências e ações recomendadas |
+| `validate_cbs` | **Verificação objetiva do CBS** (`sem_sinais` / `sinais_presentes` / `verificacao_incompleta`), com as evidências coletadas. Não recomenda ação |
 | `get_cbs_health` | DISM /CheckHealth, pending.xml, flags de reboot, TrustedInstaller |
 | `get_cbs_log_errors` | Problemas no CBS.log, CbsPersist e dism.log do período, **agrupados**, com contagem por nível e top HRESULTs com dica |
 | `get_component_store_analysis` | DISM /AnalyzeComponentStore (1 a 3 min) |
@@ -236,7 +237,7 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 ### Failover Cluster
 | Tool | O que faz |
 |---|---|
-| `get_cluster_health` | Se o servidor for nó de cluster: configuração (nível funcional, S2D, thresholds), quorum/witness, nós (estado, voto), roles (dono, nós preferidos), recursos com falha, redes e interfaces, CSVs (espaço, I/O redirecionado), pool S2D e erros recentes, com status OK/Atenção/Crítico. Fora de cluster, responde `Clustered=false` com o motivo. |
+| `get_cluster_health` | Se o servidor for nó de cluster: configuração (nível funcional, S2D, thresholds), quorum/witness, nós (estado, voto), roles (dono, nós preferidos), recursos com falha, redes e interfaces, CSVs (espaço, I/O redirecionado), pool S2D e erros recentes, com sinais objetivos (sem severidade). Fora de cluster, responde `Clustered=false` com o motivo. |
 
 ### Tarefas agendadas, GPO, sessões e segurança
 | Tool | O que faz |
@@ -248,7 +249,7 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 | `get_local_groups` | **Todos os grupos locais e seus membros**: SID, descrição, tipo e origem de cada membro (`Local`, `Interno (BUILTIN)`, `Sistema (NT AUTHORITY)`, `Domínio`, `Azure AD`, `Externo`), estado das contas locais (habilitada, último logon, senha) e **sinais** (só fatos): SIDs não resolvidos, principais de domínio/Azure AD no Administrators, contas locais habilitadas com senha que nunca expira, contas desabilitadas como membros, grupos vazios. Funciona mesmo com o DC inacessível. Não classifica nada como "privilegiado". Filtro por `group` |
 | `get_failed_logons` | Eventos 4625 agrupados por conta + IP, com o motivo traduzido |
 | `get_security_posture` | Defender, firewall, RDP |
-| `get_time_config` | **Configuração NTP completa**: tipo (NT5DS/NTP), servidores, intervalos, fonte, stratum, último sync, peers, papel no domínio, VMICTimeProvider e **offset medido**, com status OK/Atenção/Crítico |
+| `get_time_config` | **Configuração NTP completa**: tipo (NT5DS/NTP), servidores, intervalos, fonte, stratum, último sync, peers, papel no domínio, VMICTimeProvider e **offset medido**, com sinais objetivos (sem severidade nem recomendação) |
 | `get_expiring_certificates` | Certificados vencidos ou próximos do vencimento |
 
 ### Coleta × interpretação

@@ -8,7 +8,7 @@ Dois servidores MCP **separados**, com responsabilidades diferentes:
 
 | Servidor | Projeto | Papel | Rede |
 |---|---|---|---|
-| `windows-ops` | `windows_rca_mcp` | **Coleta** somente leitura de servidores Windows via WinRM HTTPS 5986. 53 tools. Só fatos e sinais objetivos | Só WinRM para os servidores permitidos. **Nenhuma chamada externa** |
+| `windows-ops` | `windows_rca_mcp` | **Coleta** somente leitura de servidores Windows via WinRM HTTPS 5986. 54 tools. Só fatos e sinais objetivos | Só WinRM para os servidores permitidos. **Nenhuma chamada externa** |
 | `microsoft-docs` | `microsoft_docs_mcp` | **RAG** da documentação oficial Microsoft: boas práticas, recomendação, fonte e data. 5 tools | Só internet (Microsoft Learn etc.). **Sem credenciais, sem WinRM** |
 
 O Claude chama o coletor (fatos), e só quando a pergunta é de recomendação, suporte, compatibilidade ou boa prática chama o RAG, juntando fato e evidência com a fonte.
@@ -19,7 +19,7 @@ O Claude chama o coletor (fatos), e só quando a pergunta é de recomendação, 
 2. **Nada inventado.** Sem evidência: *"Não encontrei documentação oficial da Microsoft que confirme essa informação."*
 3. **Carga do servidor só com evidência** (SQL Server etc.). Sem evidência vale só o SO e a versão.
 4. **Consulta externa só para recomendação, suporte, compatibilidade ou boa prática.** Inventário, configuração, serviços, usuários, grupos, discos, eventos, SIDs, RIDs e status nunca saem para a internet. As tools do RAG exigem `intent` e recusam o resto antes de qualquer requisição.
-5. **Data de instalação de software é fato local** (registro, instalação por usuário, eventos MsiInstaller, Package Management, sistema de arquivos), com confiança `high`, `medium` ou `low`.
+5. **Data de instalação de software é fato local** (registro, instalação por usuário, MSI em Installer/UserData, eventos MsiInstaller, Package Management, sistema de arquivos), com confiança `high`, `medium` ou `low`.
 6. **Resposta objetiva**: só o perguntado, em formato enxuto, com uma linha sugerindo o que mais existe. Todas as tools do coletor respondem `{computerName, timestamp, success, data}` (análises acrescentam `os` e `summary`).
 
 Os dois servidores entregam essas regras ao Claude no handshake (campo `instructions`).
@@ -89,7 +89,7 @@ Pergunte ao Claude, em português, e confira o formato da resposta (curta, só o
 
 ## Limitações conhecidas (não esconder nos testes)
 
-- **Tools antigas do coletor ainda julgam ou recomendam**: `get_health_summary` e `validate_cbs` (OK/Atenção/Crítico e ações), `get_time_config` ("o recomendado é NT5DS"), `get_cluster_health` ("configure ... witness"), `get_disk_allocation_analysis` ("candidato a reclamação") e as dicas de HRESULT. Contrariam a regra 1 e devem migrar para fatos + sinais (registrado em `CLAUDE.md`).
+- **Tools antigas migradas para fatos + sinais** (pós-MVP): `get_health_summary`, `validate_cbs`, `get_time_config`, `get_cluster_health`, `get_disk_allocation_analysis`, conexões, teaming e as dicas de HRESULT. Os status agora são `sem_sinais` / `sinais_presentes` / `verificacao_incompleta`, com o limiar do projeto à vista; sem severidade, ação recomendada ou dica. Os limiares são do projeto, não da Microsoft.
 - **RAG:** a busca do Learn é fraca; "sem evidência" pode ser falso negativo de recuperação (já aconteceu). Teto de 12 páginas novas por consulta (era até 54) e versão do SO ("Windows Server 2025") não entra mais na conferência dos termos; "allocation unit size" e "cluster size" são tratados como sinônimos. Tabelas viram células soltas e perdem a ligação linha/coluna (códigos de erro, RIDs). A extração de valor cobre só tamanhos (KB, MB, GB, TB). A verificação é lexical, não semântica.
 - **Não exercitado em ambiente real:** consulta ao serviço de metadados de AWS, Azure e GCP (o laboratório é KVM; só o caminho de erro); disco dinâmico real e BitLocker instalado (só dados sintéticos); caminho de eventos MsiInstaller (itens simulados). A etiqueta de ativo do chassi do Azure foi deixada de fora por falta de confirmação.
 - **Data de instalação:** o 7-Zip sai com confiança `low` (data da pasta do produto) porque a chave dele não tem `InstallDate`; hives de usuários não carregados não são lidos.

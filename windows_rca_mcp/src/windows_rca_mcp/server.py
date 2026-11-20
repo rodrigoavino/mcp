@@ -195,6 +195,15 @@ def _run_ps(host: str, script: str, timeout: int, via_stdin: bool = False) -> tu
 DATE_RE = re.compile(r"\\/Date\((-?\d+)(?:[+-]\d+)?\)\\/")
 
 
+def _fmt_date(ms: int) -> str:
+    """/Date(ms)/ do PowerShell -> ISO UTC. Datas fora do intervalo do Windows (ex.: 1600-12-31 de 'sem data') não derrubam
+    a resposta: viram null e o campo fica ausente de significado."""
+    try:
+        return datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (OSError, OverflowError, ValueError):
+        return "0001-01-01T00:00:00Z"
+
+
 def _conn_error(host: str, e: Exception) -> dict:
     return {"error": f"{type(e).__name__}: {str(e)[:1000]}", "host": host}
 
@@ -243,8 +252,7 @@ def _exec(host: str, full: str, timeout: int, via_stdin: bool):
     if code != 0:
         return {"error": _clean_err(se) or f"exit code {code}", "host": host}
     out = so.decode(errors="replace").strip()
-    out = DATE_RE.sub(
-        lambda m: datetime.fromtimestamp(int(m.group(1)) / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), out)
+    out = DATE_RE.sub(lambda m: _fmt_date(int(m.group(1))), out)
     if not out:
         return []
     try:
@@ -639,18 +647,19 @@ def _since_label(n: int) -> str:
 
 # Data de instalação = fato LOCAL do host. NUNCA se consulta internet, Microsoft Learn ou documentação para determiná-la.
 # Ordem de evidências (regra do projeto): 1) registro Uninstall (InstallDate), 2) instalação por usuário (HKCU e HKEY_USERS
-# carregados), 3) eventos MsiInstaller (1033 com status 0, 11707), 4) Package Management (só se o provedor expuser data),
+# carregados), 2b) MSI em Installer\UserData (InstallProperties\InstallDate; Win32_Product NUNCA: dispara reparo de MSI), 3) eventos MsiInstaller (1033 com status 0, 11707), 4) Package Management (só se o provedor expuser data),
 # 5) sistema de arquivos (CreationTime da pasta do produto, senão do executável). O evento 11724 NÃO é usado: não confirmado
 # localmente como instalação (pelo que se sabe, é remoção).
-INSTALL_CONFIDENCE = {"Registry": "high", "MsiInstaller": "medium", "PackageManagement": "medium", "FileSystem": "low"}
+INSTALL_CONFIDENCE = {"Registry": "high", "MsiUserData": "high", "MsiInstaller": "medium", "PackageManagement": "medium", "FileSystem": "low"}
 
 
 @mcp.tool
 def get_installed_software(host: str, name_filter: str = "*", installed_since_days: int | None = None):
     """Software instalado, como o 'Adicionar ou remover programas' (registro de Uninstall 64/32 bits e instalações por
     usuário; sem componentes de sistema, entradas sem nome e atualizações). Cada item: name, version, installDate (data de
-    calendário do servidor), confidence (high | medium | low) e source (Registry | MsiInstaller | PackageManagement |
-    FileSystem). A data vem SÓ de evidência local, em ordem: InstallDate do registro (high), eventos MsiInstaller 1033/11707
+    calendário do servidor), confidence (high | medium | low) e source (Registry | MsiUserData | MsiInstaller |
+    PackageManagement | FileSystem). A data vem SÓ de evidência local, em ordem: InstallDate do registro (high), InstallDate do
+    MSI em Installer/UserData (high), eventos MsiInstaller 1033/11707
     (medium), Package Management (medium), CreationTime da pasta/executável (low). installed_since_days filtra por dias de
     calendário do servidor (0 = hoje, 1 = hoje e ontem...): com ele devolve SÓ os programas do período. Sem ele, o inventário.
     Não traz nada além do perguntado; só sugere o que mais pode ser obtido."""
@@ -676,8 +685,22 @@ foreach ($r in $roots) { foreach ($sub in @(Get-ChildItem $r.P -ErrorAction Sile
 function D($d) { $d.ToString('yyyy-MM-dd') }
 # 1 e 2) InstallDate no registro (HKLM, HKCU e HKEY_USERS carregados)
 foreach ($i in $items) { if ($i.ID -match '^\d{8}$') { try { $i.Date = D ([datetime]::ParseExact($i.ID, 'yyyyMMdd', $null)); $i.Source = 'Registry' } catch {} } }
-# 3) eventos MsiInstaller (1033 com status 0; 11707): só se ainda houver item sem data
+# 2b) MSI: Installer\UserData\<SID>\Products\<guid>\InstallProperties (InstallDate), só para item ainda sem data
 $need = @($items | ? { -not $_.Date })
+if ($need.Count) {
+  $ud = @{}
+  try { foreach ($ip in @(Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData' -Recurse -ErrorAction SilentlyContinue | ? { $_.PSChildName -eq 'InstallProperties' })) {
+      $q = Get-ItemProperty $ip.PSPath -ErrorAction SilentlyContinue
+      if ($q.DisplayName -and "$($q.InstallDate)" -match '^\d{8}$') { try { $ud[$q.DisplayName.ToLower()] = D ([datetime]::ParseExact("$($q.InstallDate)", 'yyyyMMdd', $null)) } catch {} } } } catch {}
+  foreach ($i in $need) { $n = $i.Name.ToLower(); $t = $ud[$n]
+    # só igualdade, ignorando sufixo de arquitetura e de versão no FIM do nome (mesma regra dos eventos)
+    if (-not $t) { $nn = $n -replace '\s*\((x64|x86|64-bit|32-bit)\)\s*$', '' -replace '\s+v?\d+(\.\d+)+\s*$', ''
+      $key = $ud.Keys | ? { ($_ -replace '\s*\((x64|x86|64-bit|32-bit)\)\s*$', '' -replace '\s+v?\d+(\.\d+)+\s*$', '') -eq $nn } | select -first 1
+      if ($key) { $t = $ud[$key] } }
+    if ($t) { $i.Date = $t; $i.Source = 'MsiUserData' } }
+  $need = @($items | ? { -not $_.Date })
+}
+# 3) eventos MsiInstaller (1033 com status 0; 11707): só se ainda houver item sem data
 if ($need.Count) {
   $msi = @{}
   try { foreach ($e in @(Ev 'Application' '__XP__' 4000)) { $n = $null
@@ -732,6 +755,81 @@ if ($need.Count) {
             out["dateUnknown"] = unknown   # só aparece se houver itens sem data: afeta a confiança da resposta
     out["more_available"] = _more("inventário completo, editora e local de instalação, patches do período, reinicializações, eventos de erro")
     return out
+
+
+# ---------- licenciamento do Windows (só fatos) ----------
+# Fatos do SoftwareLicensingProduct/Service e eventos do Security-SPP e do wlms. O significado do LicenseStatus, dos HRESULTs
+# e do período de carência é interpretação: fica no RAG (microsoft-docs), com fonte. Aqui só há números, textos e contagens.
+SPP_EVENT_IDS = [1014, 8198, 8200, 16398]
+
+
+def _real_date(v):
+    """Datas sentinela do Windows (ano < 1700, ex.: 1600-12-31) significam 'sem data': viram None."""
+    return None if not v or str(v)[:4] < "1700" else v
+
+
+@mcp.tool
+def get_license_status(host: str, days: int = 1):
+    """Licenciamento do Windows (ativação), só fatos: produto, canal da chave (ex.: Volume:GVLK, Retail, OEM), LicenseStatus
+    (número da enumeração do WMI), HRESULT do motivo, carência restante (minutos), fim de avaliação (null se não há),
+    contagens de rearme, servidor KMS configurado e descoberto, e, no período (days, padrão 1), as contagens dos eventos
+    Security-SPP 1014/8198/8200/16398 e os desligamentos iniciados pelo wlms.exe (evento 1074). Não interpreta o status,
+    não diz se a licença é válida e não recomenda: o significado dos códigos é do RAG (microsoft-docs)."""
+    res = _ps(host, PS_EV + r"""
+$ErrorActionPreference = 'Continue'
+$p = @(Get-CimInstance SoftwareLicensingProduct -Filter "ApplicationId='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL" |
+  select Name,Description,LicenseFamily,ProductKeyChannel,LicenseStatus,LicenseStatusReason,GracePeriodRemaining,
+    @{n='EvalEnd';e={ if ($_.EvaluationEndDate -and $_.EvaluationEndDate.Year -gt 1700) { $_.EvaluationEndDate.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null } }},
+    RemainingAppReArmCount,RemainingSkuReArmCount,KeyManagementServiceMachine,KeyManagementServicePort,
+    DiscoveredKeyManagementServiceMachineName,DiscoveredKeyManagementServiceMachinePort,VLActivationType)
+$s = Get-CimInstance SoftwareLicensingService | select Version,RemainingWindowsReArmCount,IsKeyManagementServiceMachine
+$os = Get-CimInstance Win32_OperatingSystem
+$spp = @(Ev 'Application' '__XS__' 3000)
+$w = @(Ev 'System' '__XW__' 500 | ? { "$($_.Properties[0].Value)" -like '*wlms.exe*' })  # 1074: Properties[0] = processo que iniciou o desligamento
+$wl = Get-Service wlms -ErrorAction SilentlyContinue
+[pscustomobject]@{
+  Products=$p; Service=$s
+  OsInstall=$os.InstallDate.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  WlmsService=$(if ($wl) { [pscustomobject]@{ Status="$($wl.Status)"; StartType="$($wl.StartType)" } } else { $null })
+  SppEvents=@($spp | group Id | % { [pscustomobject]@{ Id=$_.Name; Count=$_.Count
+    Last=($_.Group | sort TimeCreated -desc | select -first 1).TimeCreated.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } })
+  WlmsShutdowns=@($w | sort TimeCreated -desc | select -first 10 | % { [pscustomobject]@{
+    Time=$_.TimeCreated.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'); Message=(Desc $_ 300) } })
+  WlmsShutdownCount=$w.Count
+} | ConvertTo-Json -Depth 5 -Compress
+""".replace("__XS__", _xpath(ids=SPP_EVENT_IDS, provider="Microsoft-Windows-Security-SPP", days=_days(days)).replace("'", "''"))
+       .replace("__XW__", _xpath(ids=[1074], days=_days(days)).replace("'", "''")), timeout=120)
+    if not isinstance(res, dict) or "Products" not in res:
+        return res
+    prods = []
+    for x in _lst(res.get("Products")):
+        reason = x.get("LicenseStatusReason")
+        kms_cfg = (x.get("KeyManagementServiceMachine") or "").strip()
+        kms_disc = (x.get("DiscoveredKeyManagementServiceMachineName") or "").strip()
+        prods.append({
+            "name": x.get("Name"), "description": x.get("Description"), "license_family": x.get("LicenseFamily"),
+            "product_key_channel": x.get("ProductKeyChannel"),
+            "license_status": x.get("LicenseStatus"),
+            "license_status_reason": ("0x%08X" % (int(reason) & 0xFFFFFFFF)) if reason is not None else None,
+            "grace_period_remaining_min": x.get("GracePeriodRemaining"),
+            "evaluation_end": _real_date(x.get("EvalEnd")),
+            "rearm_remaining": {"app": x.get("RemainingAppReArmCount"), "sku": x.get("RemainingSkuReArmCount")},
+            "kms": {"configured_host": kms_cfg or None, "configured_port": x.get("KeyManagementServicePort"),
+                    "discovered_host": kms_disc or None, "discovered_port": x.get("DiscoveredKeyManagementServiceMachinePort") or None},
+            "signals": {"gracePeriodRemainingIsZero": x.get("GracePeriodRemaining") == 0,
+                        "kmsHostConfigured": bool(kms_cfg), "kmsHostDiscovered": bool(kms_disc),
+                        "evaluationEndDatePresent": bool(_real_date(x.get("EvalEnd")))}})
+    spp = {str(e.get("Id")): {"count": e.get("Count"), "last": e.get("Last")} for e in _lst(res.get("SppEvents"))}
+    wl = _lst(res.get("WlmsShutdowns"))
+    return {"host": host, "period_days": _days(days), "products": prods,
+            "os_install_date": res.get("OsInstall"),
+            "licensing_service": {"version": (res.get("Service") or {}).get("Version"),
+                                  "windows_rearm_remaining": (res.get("Service") or {}).get("RemainingWindowsReArmCount"),
+                                  "is_kms_host": bool((res.get("Service") or {}).get("IsKeyManagementServiceMachine"))},
+            "wlms_service": res.get("WlmsService"),
+            "events": {"security_spp": spp,
+                       "wlms_shutdowns": {"count": res.get("WlmsShutdownCount") or 0, "recent": wl}},
+            "more_available": _more("eventos de licenciamento de mais dias, logs de ativação, estado do serviço de licença")}
 
 
 # ---------- camada de armazenamento (discos, partições, volumes, BitLocker) ----------
@@ -1291,23 +1389,6 @@ Get-ChildItem Cert:\LocalMachine\My |
 
 # ---------- saúde do CBS e do Windows Update (erros escondidos na aplicação de patches) ----------
 HEX_RE = re.compile(r"0x[0-9A-Fa-f]{8}")
-WU_HINTS = {
-    "0x80073712": "Component store corrompido/arquivo ausente (CBS). Rodar DISM /RestoreHealth.",
-    "0x80073701": "Assembly ausente no component store (CBS). Rodar DISM /RestoreHealth.",
-    "0x800f081f": "Arquivos-fonte não encontrados (CBS). DISM /RestoreHealth com fonte válida.",
-    "0x800f0831": "Store corrompido ou pré-requisito (KB anterior) ausente.",
-    "0x800f0922": "Falha genérica de instalação; comum: pouco espaço na System Reserved/EFI, corrupção CBS, rollback.",
-    "0x80070070": "Disco cheio.",
-    "0x80070005": "Acesso negado (permissões, antivírus, TrustedInstaller).",
-    "0x80070002": "Arquivo não encontrado (cache do WU/CBS).",
-    "0x8007000d": "Dados inválidos (cache do WU ou store corrompido).",
-    "0x80070bc9": "Reboot pendente impedindo a instalação.",
-    "0x800705b4": "Timeout na operação.",
-    "0x80240034": "Falha no download do update.",
-    "0x80246007": "Update não foi baixado.",
-    "0x8024402c": "Falha de resolução de nome/proxy/WSUS.",
-    "0x80244022": "Serviço WSUS/Microsoft indisponível (HTTP 503).",
-}
 PATH_RE = re.compile(r"^[A-Za-z]:\\[^'\"`$;|&<>*?\r\n]{0,240}$")
 
 
@@ -1343,13 +1424,12 @@ $cbs = Get-ChildItem "$env:SystemRoot\Logs\CBS" -Force -ErrorAction SilentlyCont
     if isinstance(res, dict) and "DismCheckHealth" in res:
         txt = res["DismCheckHealth"] or ""
         res["Heuristic_StoreRepairable"] = bool(re.search(r"repairable|repar[aá]vel", txt, re.I))
-        res["Heuristic_Healthy"] = res["DismExitCode"] == 0 and not res["Heuristic_StoreRepairable"]
     return res
 
 
 @mcp.tool
 def get_component_store_analysis(host: str, max_seconds: int = 300):
-    """DISM /AnalyzeComponentStore: tamanho real do WinSxS, espaço recuperável e se limpeza é recomendada.
+    """DISM /AnalyzeComponentStore: tamanho real do WinSxS, espaço recuperável e o que o próprio DISM informa sobre limpeza.
     Somente leitura, mas pode levar de 1 a 5 minutos. Não inicia se já houver um DISM rodando; se exceder
     'max_seconds' o DISM é encerrado (nada fica pendurado no servidor)."""
     return _ps(host, PS_DISM + r"""
@@ -1358,14 +1438,6 @@ RunDism '/Online /Cleanup-Image /AnalyzeComponentStore' __S__ | ConvertTo-Json -
 """.replace("__S__", str(max(60, min(int(max_seconds), 900)))), timeout=max(60, min(int(max_seconds), 900)) + 60)
 
 
-SERVICING_HINTS = {
-    "0x800f0805": "CBS_E_INVALID_PACKAGE: pacote inválido/não aplicável; costuma ser benigno ao enumerar pacotes.",
-    "0x800f080c": "CBS_E_UNKNOWN_UPDATE: feature/pacote desconhecido; normalmente benigno.",
-    "0x80070490": "Elemento não encontrado (manifesto/registro do CBS); pode indicar corrupção.",
-    "0x800f0982": "PSFX: falta de manifesto/arquivo do pacote; rodar DISM /RestoreHealth.",
-    "0x800f0988": "Falha na limpeza do component store; reboot e repetir.",
-    "0x80070020": "Arquivo em uso por outro processo (antivírus/backup).",
-}
 
 
 # Busca nos logs CBS/DISM em 2 estágios:
@@ -1525,8 +1597,6 @@ foreach ($f in $files) {
        .replace("__T__", str(max(1, min(int(top), 100)))).replace("__B__", str(budget))
        .replace("__MB__", str(max_mb)))
     if isinstance(res, dict) and "FilesScanned" in res:
-        for h in _lst(res.get("TopHResults")):
-            h["Hint"] = SERVICING_HINTS.get(h["Code"]) or WU_HINTS.get(h["Code"]) or ""
         res["Scope"] = cfg["scope"]
         files = _lst(res.get("FilesScanned"))
         read_mb = sum(f.get("ReadMB") or 0 for f in files)
@@ -1572,7 +1642,7 @@ $ld = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'"
 
 @mcp.tool
 def get_update_error_analysis(host: str, days: int = 1):
-    """Falhas de instalação/download de updates agrupadas por código de erro (HRESULT), com causa provável.
+    """Falhas de instalação/download de updates agrupadas por código de erro (HRESULT). O significado do código é do RAG (microsoft-docs).
     days: padrão 1 (aumente se pedido, máx. 90)."""
     ev = _ps(host, r"""
 Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-WindowsUpdateClient/Operational';
@@ -1587,8 +1657,7 @@ Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-WindowsUpdateClient/O
     agg = {}
     for e in events:
         for code in {c.lower() for c in HEX_RE.findall(e.get("Message") or "")}:
-            a = agg.setdefault(code, {"error_code": code, "count": 0, "last_seen": None,
-                                      "hint": WU_HINTS.get(code, "Código sem dica local; pesquisar o HRESULT.")})
+            a = agg.setdefault(code, {"error_code": code, "count": 0, "last_seen": None})
             a["count"] += 1
             a["last_seen"] = max(filter(None, [a["last_seen"], e.get("TimeCreated")]), default=None)
     return {"failure_events": len(events),
@@ -1684,7 +1753,7 @@ $vss = try { Get-CimInstance Win32_ShadowStorage | select @{n='Volume';e={$_.Vol
 @mcp.tool
 def get_disk_allocation_analysis(host: str):
     """Discos físicos/virtuais alocados à VM/servidor mas sem uso: discos OFFLINE, RAW (não inicializados),
-    espaço não alocado, partições sem letra/ponto de montagem e volumes muito subutilizados (possível desperdício)."""
+    espaço não alocado, partições sem letra/ponto de montagem e volumes com muito espaço livre (limiar à vista)."""
     data = _ps(host, r"""
 $disks = @(Get-Disk | % { [pscustomobject]@{
   Number=$_.Number; Name=$_.FriendlyName; BusType=$_.BusType.ToString(); Partitioning=$_.PartitionStyle.ToString()
@@ -1709,7 +1778,7 @@ $vols = @(Get-Volume | ? { $_.DriveType -eq 'Fixed' } | select DriveLetter,FileS
     for d in _lst(data["Disks"]):
         tag = f"Disco {d['Number']} ({d['Name']}, {d['SizeGB']} GB, {d['BusType']})"
         if d["Offline"]:
-            findings.append(f"{tag}: OFFLINE – capacidade alocada sem uso (candidato a reclamação).")
+            findings.append(f"{tag}: OFFLINE – capacidade alocada sem uso.")
         elif d["Partitioning"] == "RAW":
             findings.append(f"{tag}: não inicializado (RAW) – alocado e nunca utilizado.")
         elif d["UnallocatedGB"] >= 1:
@@ -1719,12 +1788,12 @@ $vols = @(Get-Volume | ? { $_.DriveType -eq 'Fixed' } | select DriveLetter,FileS
     for p in _lst(data["Partitions"]):
         if p["Type"] == "Basic" and not p["DriveLetter"] and not _lst(p["MountPaths"]):
             findings.append(f"Disco {p['DiskNumber']} partição {p['PartitionNumber']} ({p['SizeGB']} GB): "
-                            "sem letra nem ponto de montagem – dados inacessíveis/possível desperdício.")
+                            "sem letra nem ponto de montagem.")
     for v in _lst(data["Volumes"]):
         if v["SizeGB"] and v["SizeGB"] >= 100 and (v["FreePct"] or 0) >= 90:
             findings.append(f"Volume {v['DriveLetter'] or v['FileSystemLabel']}: {v['SizeGB']} GB com "
-                            f"{v['FreePct']}% livre – subutilizado (candidato a right-sizing).")
-    data["Findings"] = findings or ["Nenhuma anomalia de alocação encontrada."]
+                            f"{v['FreePct']}% livre (limiar do projeto: volume >= 100 GB com >= 90% livre).")
+    data["Findings"] = findings or ["Nenhum sinal encontrado."]
     return data
 
 
@@ -1795,20 +1864,22 @@ $lastDays = $null; if ($hf.Count) { $lastDays = $hf[0].DaysAgo }
 
 
 CBS_CODES = {"0x80073712", "0x80073701", "0x800f081f", "0x800f0831", "0x800f0922", "0x800f0982", "0x800f0988"}
-_RANK = {"OK": 0, "Atenção": 1, "Crítico": 2}
+SEM, SIG, INC = "sem_sinais", "sinais_presentes", "verificacao_incompleta"
+_RANK = {SEM: 0, SIG: 1, INC: 2}  # só fatos: nada de severidade (OK/Atenção/Crítico é interpretação do RAG)
 
 
 def _worst(*st: str) -> str:
-    return max(st, key=lambda s: _RANK[s]) if st else "OK"
+    return max(st, key=lambda s: _RANK[s]) if st else SEM
 
 
 @mcp.tool
 def validate_cbs(host: str, days: int = 1, log_mode: str = "rapida"):
-    """Veredito 'o CBS está quebrado?': combina DISM /CheckHealth, flags de pending/reboot, contagens de
-    'Cannot repair'/'corrupt' nos logs CBS/DISM e falhas de update com códigos típicos de corrupção.
+    """Verificação objetiva do CBS: combina DISM /CheckHealth, flags de pending/reboot, contagens de
+    'Cannot repair'/'corrupt' nos logs CBS/DISM e falhas de update com códigos HRESULT do CBS.
     As três coletas rodam EM PARALELO. Período dos logs: último dia por padrão (days ampliável até 90 se pedido).
     log_mode='rapida' (padrão, segundos) ou 'detalhada' (cobertura total dos logs, pode levar minutos).
-    Retorna status OK/Atenção/Crítico, evidências e ações recomendadas."""
+    Retorna status (sem_sinais | sinais_presentes | verificacao_incompleta) e as evidências coletadas. Não recomenda
+    ação nem classifica gravidade: isso é do RAG (microsoft-docs)."""
     lm = _cbs_mode(log_mode)
     with ThreadPoolExecutor(max_workers=3) as pool:
         f_health = pool.submit(get_cbs_health, host)
@@ -1818,55 +1889,47 @@ def validate_cbs(host: str, days: int = 1, log_mode: str = "rapida"):
     if not isinstance(health, dict) or "error" in health:
         return {"status": "Desconhecido", "error": health}
 
-    status, evid, actions = "OK", [], []
+    status, evid = SEM, []
     dism = health.get("DismCheckHealth") or ""
     if re.search(r"cannot be repaired|não pode ser reparad", dism, re.I):
-        status = _worst(status, "Crítico")
-        evid.append("DISM: component store NÃO reparável.")
-        actions.append("Store irreparável: reparo in-place (upgrade) ou reconstrução do servidor.")
+        status = _worst(status, SIG)
+        evid.append("DISM: component store reportado como NÃO reparável.")
     elif health.get("Heuristic_StoreRepairable"):
-        status = _worst(status, "Crítico")
+        status = _worst(status, SIG)
         evid.append("DISM /CheckHealth: component store corrompido (reparável).")
-        actions.append("DISM /Online /Cleanup-Image /RestoreHealth (com /Source se não houver acesso ao WU) e depois sfc /scannow.")
     elif health.get("DismBusy") or health.get("DismTimedOut"):
-        status = _worst(status, "Atenção")
-        evid.append("DISM /CheckHealth não concluiu: " + (health.get("DismCheckHealth") or "")
-                    + " (um DISM travado pode indicar servicing preso; verifique TiWorker/TrustedInstaller).")
+        status = _worst(status, SIG)
+        evid.append("DISM /CheckHealth não concluiu: " + (health.get("DismCheckHealth") or ""))
     elif health.get("DismExitCode") not in (0, None):
-        status = _worst(status, "Atenção")
-        evid.append(f"DISM retornou código {health.get('DismExitCode')} (pode ser falta de privilégio administrativo).")
+        status = _worst(status, SIG)
+        evid.append(f"DISM retornou código {health.get('DismExitCode')}.")
 
     if health.get("PendingXmlExists") or health.get("RebootPending") or health.get("RebootInProgress"):
-        status = _worst(status, "Atenção")
-        evid.append("Operações de servicing pendentes (pending.xml/RebootPending): reboot necessário.")
-        actions.append("Agendar reboot antes de novas instalações de patch.")
+        status = _worst(status, SIG)
+        evid.append("Operações de servicing pendentes (pending.xml/RebootPending/RebootInProgress).")
     if health.get("SessionsPending") or health.get("PackagesPending"):
-        status = _worst(status, "Atenção")
+        status = _worst(status, SIG)
         evid.append("Sessões/pacotes CBS pendentes.")
 
     ti = health.get("TrustedInstaller") or {}
     if str(ti.get("StartType")) in ("4", "Disabled"):
-        status = _worst(status, "Atenção")
-        evid.append("Serviço TrustedInstaller desabilitado (impede instalação de updates).")
-        actions.append("Voltar o TrustedInstaller para início Manual.")
+        status = _worst(status, SIG)
+        evid.append("Serviço TrustedInstaller com início desabilitado.")
 
     # Uma verificação que falhou NÃO pode contar como limpa: eleva para Atenção e registra o motivo.
     incomplete = []
     if isinstance(log, dict) and "TotalProblemLines" in log:
         if (log.get("CannotRepairCount") or 0) > 0:
-            status = _worst(status, "Crítico")
+            status = _worst(status, SIG)
             evid.append(f"CBS.log: {log['CannotRepairCount']} ocorrência(s) de 'Cannot repair'.")
         if (log.get("CorruptCount") or 0) > 0:
-            status = _worst(status, "Atenção")
+            status = _worst(status, SIG)
             evid.append(f"CBS.log: {log['CorruptCount']} menção(ões) a 'corrupt'.")
         if log.get("Partial"):
             incomplete.append("leitura dos logs CBS/DISM foi parcial (limite de tempo); contagens são mínimas")
         elif log.get("Coverage") == "parcial":
             # Limite de tamanho do modo rápido: sinaliza sem rebaixar o status (não é falha de verificação).
             evid.append(f"Logs CBS: busca {log.get('Mode')} leu o trecho mais recente; {log.get('Note')}")
-            if log.get("Recommendation"):
-                actions.append(log["Recommendation"].replace("get_cbs_log_errors(mode='detalhada'",
-                                                             "validate_cbs(log_mode='detalhada'"))
     else:
         incomplete.append(f"não foi possível ler os logs CBS/DISM: {log.get('error') if isinstance(log, dict) else log}")
 
@@ -1874,30 +1937,25 @@ def validate_cbs(host: str, days: int = 1, log_mode: str = "rapida"):
         incomplete.append("não foi possível ler as falhas do Windows Update: "
                           f"{upd.get('error') if isinstance(upd, dict) else upd}")
     for msg in incomplete:
-        status = _worst(status, "Atenção")
+        status = _worst(status, INC)
         evid.append(f"Verificação incompleta: {msg}.")
-    if incomplete:
-        actions.append("Repetir validate_cbs (ou as tools individuais) para completar as verificações que falharam.")
 
     if isinstance(upd, dict) and "by_error_code" in upd:
         bad = [c for c in upd["by_error_code"] if c["error_code"] in CBS_CODES]
         if bad:
-            status = _worst(status, "Crítico")
+            status = _worst(status, SIG)
             for c in bad:
-                evid.append(f"Windows Update: {c['error_code']} x{c['count']} (último {c['last_seen']}) - {c['hint']}")
-            actions.append("Rodar DISM /RestoreHealth e repetir a instalação do update.")
+                evid.append(f"Windows Update: {c['error_code']} x{c['count']} (último {c['last_seen']}).")
 
     if (health.get("CbsLogDir_MB") or 0) > 2048:
         evid.append(f"Pasta de logs do CBS com {health['CbsLogDir_MB']} MB.")
     return {
         "host": host, "status": status,
-        "verdict": {"OK": "CBS saudável.",
-                    "Atenção": ("CBS com pendências ou verificação incompleta; não necessariamente corrompido."
-                                if incomplete else "CBS com pendências; não necessariamente corrompido."),
-                    "Crítico": "CBS quebrado/corrompido: patches tendem a falhar."}[status],
+        "verdict": {SEM: "Nenhum sinal encontrado nas verificações executadas.",
+                    SIG: "Há sinais nas verificações executadas (ver evidence); a interpretação é do RAG.",
+                    INC: "Há verificação incompleta (ver evidence); o resultado não cobre tudo."}[status],
         "complete": not incomplete,
-        "evidence": evid or ["Nenhuma evidência de problema no CBS."],
-        "recommended_actions": list(dict.fromkeys(actions)),
+        "evidence": evid or ["Nenhum sinal encontrado."],
         "details": {"cbs_health": health, "cbs_log": log,
                     "update_errors": (upd.get("by_error_code") if isinstance(upd, dict) and "by_error_code" in upd
                                       else upd)},
@@ -2050,13 +2108,13 @@ $est = @($c | ? { "$($_.State)" -eq 'Established' })
         st = {s["State"]: s["Count"] for s in _lst(res["ByState"])}
         alerts = []
         if st.get("TimeWait", 0) > 5000:
-            alerts.append(f"{st['TimeWait']} conexões em TIME_WAIT (churn alto de conexões curtas).")
+            alerts.append(f"{st['TimeWait']} conexões em TIME_WAIT (limiar do projeto: 5000).")
         if st.get("CloseWait", 0) > 100:
-            alerts.append(f"{st['CloseWait']} em CLOSE_WAIT (aplicação não fecha sockets; ver TopProcesses).")
+            alerts.append(f"{st['CloseWait']} em CLOSE_WAIT (limiar do projeto: 100; ver TopProcesses).")
         cap = res.get("EphemeralCapacity") or 0
         if cap and res.get("EphemeralInUse", 0) > 0.7 * cap:
-            alerts.append(f"Portas efêmeras {res['EphemeralInUse']}/{cap} em uso: risco de esgotamento.")
-        res["Alerts"] = alerts or ["Nenhuma anomalia de conexões."]
+            alerts.append(f"Portas efêmeras {res['EphemeralInUse']}/{cap} em uso (limiar do projeto: 70%).")
+        res["Alerts"] = alerts or ["Nenhum sinal encontrado."]
     return res
 
 
@@ -2171,12 +2229,12 @@ $set = @(try { foreach ($s in @(Get-VMSwitch -ErrorAction Stop | ? EmbeddedTeami
                 alerts.append(f"Team '{t['Name']}': membro {m['Name']} {m.get('OperationalStatus')} "
                               f"(motivo: {m.get('FailureReason')}).")
             if m.get("AdministrativeMode") == "Standby":
-                alerts.append(f"Team '{t['Name']}': membro {m['Name']} em Standby (sem redundância ativa-ativa).")
+                alerts.append(f"Team '{t['Name']}': membro {m['Name']} em Standby.")
         speeds = {m.get("LinkSpeedGbps") for m in mem}
         if len(speeds) > 1:
             alerts.append(f"Team '{t['Name']}': membros com velocidades diferentes {sorted(speeds)} Gbps.")
         if len(mem) < 2:
-            alerts.append(f"Team '{t['Name']}' com {len(mem)} membro(s): sem redundância.")
+            alerts.append(f"Team '{t['Name']}' com {len(mem)} membro(s).")
     for s in _lst(d.get("Set")):
         mem = _lst(s.get("Members"))
         for m in mem:
@@ -2185,9 +2243,9 @@ $set = @(try { foreach ($s in @(Get-VMSwitch -ErrorAction Stop | ? EmbeddedTeami
         if len({m.get("LinkSpeed") for m in mem}) > 1:
             alerts.append(f"SET '{s['Name']}': membros com velocidades diferentes.")
         if len(mem) < 2:
-            alerts.append(f"SET '{s['Name']}' com {len(mem)} membro(s): sem redundância.")
+            alerts.append(f"SET '{s['Name']}' com {len(mem)} membro(s).")
     d["Configured"] = bool(_lst(d.get("Lbfo")) or _lst(d.get("Set")))
-    d["Alerts"] = alerts or (["Teaming saudável."] if d["Configured"] else
+    d["Alerts"] = alerts or (["Nenhum sinal encontrado."] if d["Configured"] else
                              ["Nenhum NIC Teaming (LBFO/SET) configurado neste servidor."])
     return d
 
@@ -2197,7 +2255,7 @@ def get_time_config(host: str):
     """Configuração completa de NTP/tempo (w32time): tipo de sincronização (NT5DS=hierarquia do domínio, NTP=
     servidores manuais), servidores NTP configurados, intervalos, fonte atual, stratum, último sync, peers,
     se é o PDC/servidor de tempo confiável, provedor de tempo do Hyper-V (VMICTimeProvider) e o OFFSET medido
-    contra a fonte. Desvio > 5 min quebra Kerberos/AD."""
+    contra a fonte. Só fatos e sinais com limiar à vista; interpretação é do RAG (microsoft-docs)."""
     d = _ps(host, r"""
 $ErrorActionPreference='Continue'
 $base = 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time'
@@ -2241,32 +2299,20 @@ $cs = Get-CimInstance Win32_ComputerSystem
     d["DomainRoleText"] = {0: "Estação standalone", 1: "Estação membro", 2: "Servidor standalone",
                            3: "Servidor membro", 4: "DC (backup)", 5: "DC (PDC emulator)"}.get(role, role)
     src, typ, off = (d.get("CurrentSource") or ""), (d.get("PolicyType") or d.get("Type") or ""), d.get("OffsetSeconds")
-    status, findings = "OK", []
+    status, findings = SEM, []
     if re.search(r"Local CMOS|Free-running", src, re.I):
-        status = "Crítico" if d.get("PartOfDomain") and role != 5 else "Atenção"
-        findings.append("Fonte de tempo = relógio local (CMOS): o servidor NÃO está sincronizando com ninguém.")
-    if d.get("PartOfDomain") and role != 5 and typ.upper() == "NTP":
-        status = _worst(status, "Atenção")
-        findings.append("Membro de domínio com Type=NTP (manual); o recomendado é NT5DS (hierarquia do domínio).")
-    if role == 5 and typ.upper() != "NTP":
-        status = _worst(status, "Atenção")
-        findings.append("PDC emulator deveria sincronizar com fonte externa confiável (Type=NTP + NtpServer).")
-    if d.get("VMICTimeProviderEnabled") == 1 and d.get("PartOfDomain"):
-        findings.append("VMICTimeProvider habilitado: em VM de domínio pode disputar com o NT5DS (avaliar desabilitar).")
+        status = SIG
+        findings.append(f"Fonte de tempo atual: relógio local ({src}).")
     if off is None and not re.search(r"Local CMOS|Free-running|VM IC", src, re.I):
-        status = _worst(status, "Atenção")
+        status = _worst(status, INC)
         findings.append(f"Não foi possível medir o offset contra '{src}' (fonte inacessível ou não resolvível agora).")
-    if off is not None:
-        if abs(off) >= 300:
-            status = _worst(status, "Crítico")
-            findings.append(f"Offset de {off}s (>5 min): Kerberos falha.")
-        elif abs(off) >= 1:
-            status = _worst(status, "Atenção")
-            findings.append(f"Offset de {off}s em relação à fonte.")
+    if off is not None and abs(off) >= 1:
+        status = _worst(status, SIG)
+        findings.append(f"Offset de {off}s em relação à fonte (limiar do projeto: 1 s).")
     if d.get("ServiceStatus") != "Running":
-        status = _worst(status, "Crítico")
+        status = _worst(status, SIG)
         findings.append(f"Serviço W32Time {d.get('ServiceStatus')}.")
-    d["status"], d["findings"] = status, findings or ["Sincronização de tempo saudável."]
+    d["status"], d["findings"] = status, findings or ["Nenhum sinal encontrado."]
     return d
 
 
@@ -2381,51 +2427,51 @@ $since = (Get-Date).AddDays(-__H__)
 """.replace("__H__", str(_days(days))), timeout=180)
     if not isinstance(d, dict) or not d.get("Clustered"):
         return d
-    status, findings = "OK", []
+    status, findings = SEM, []
     for n in _lst(d.get("Nodes")):
         if n.get("State") != "Up":
-            status = _worst(status, "Crítico" if n.get("State") == "Down" else "Atenção")
+            status = _worst(status, SIG)
             findings.append(f"Nó {n['Name']} está {n['State']} {n.get('StatusInfo') or ''}".strip())
     q = d.get("Quorum") or {}
     if q.get("Resource") and q.get("WitnessState") not in ("Online", ""):
-        status = _worst(status, "Crítico")
+        status = _worst(status, SIG)
         findings.append(f"Witness '{q['Resource']}' está {q.get('WitnessState')}.")
     if q.get("Type") == "NodeMajority" and len(_lst(d.get("Nodes"))) % 2 == 0:
-        status = _worst(status, "Atenção")
-        findings.append("Número par de nós sem witness: configure Cloud/File Share/Disk witness.")
+        status = _worst(status, SIG)
+        findings.append(f"Quorum NodeMajority com {len(_lst(d.get('Nodes')))} nós (número par) e sem witness configurado.")
     for g in _lst(d.get("Groups")):
         if g.get("State") not in ("Online",) and g.get("GroupType") != "AvailableStorage":
-            status = _worst(status, "Crítico" if g.get("State") == "Failed" else "Atenção")
+            status = _worst(status, SIG)
             findings.append(f"Role '{g['Name']}' {g['State']} (dono {g.get('OwnerNode')}).")
     for r in _lst(d.get("ResourcesNotOnline")):
         if r.get("State") == "Failed":
-            status = _worst(status, "Crítico")
+            status = _worst(status, SIG)
             findings.append(f"Recurso '{r['Name']}' ({r['Type']}) FAILED no grupo {r['Group']}.")
     for n in _lst(d.get("Networks")):
         if n.get("State") != "Up":
-            status = _worst(status, "Atenção")
+            status = _worst(status, SIG)
             findings.append(f"Rede do cluster '{n['Name']}' {n['State']}.")
     for i in _lst(d.get("NetInterfacesNotUp")):
-        status = _worst(status, "Atenção")
+        status = _worst(status, SIG)
         findings.append(f"Interface {i['Name']} ({i['Node']}) {i['State']}.")
     for c in _lst(d.get("CSVs")):
         if c.get("State") != "Online":
-            status = _worst(status, "Crítico")
+            status = _worst(status, SIG)
             findings.append(f"CSV {c['Name']} {c['State']}.")
         if c.get("FreePct") is not None and c["FreePct"] < 10:
-            status = _worst(status, "Atenção")
-            findings.append(f"CSV {c['Name']} com {c['FreePct']}% livre.")
+            status = _worst(status, SIG)
+            findings.append(f"CSV {c['Name']} com {c['FreePct']}% livre (limiar do projeto: 10%).")
         if "Redirected" in (c.get("Redirected") or ""):
-            status = _worst(status, "Atenção")
+            status = _worst(status, SIG)
             findings.append(f"CSV {c['Name']} em I/O redirecionado ({c.get('RedirectReason')}).")
     for p in _lst(d.get("StoragePools")):
         if p.get("Health") != "Healthy":
-            status = _worst(status, "Crítico")
+            status = _worst(status, SIG)
             findings.append(f"Pool {p['Name']} HealthStatus={p['Health']} ({p['Operational']}).")
     if _lst(d.get("RecentProblems")):
-        status = _worst(status, "Atenção")
+        status = _worst(status, SIG)
         findings.append(f"{len(_lst(d['RecentProblems']))} evento(s) de problema do FailoverClustering em {_days(days)} dia(s).")
-    d["status"], d["findings"] = status, findings or ["Cluster saudável."]
+    d["status"], d["findings"] = status, findings or ["Nenhum sinal encontrado."]
     return d
 
 
@@ -2658,7 +2704,7 @@ $rows = foreach ($e in $ev) {
         for g in _lst(res.get("Groups")):
             g["Reasons"] = [LOGON_SUBSTATUS.get(s, s) for s in _lst(g.get("SubStatus"))]
         if res.get("Truncated"):
-            res["Note"] = (f"Mais de {LOGON_CAP} falhas no período (provável força bruta): foram lidas só as mais "
+            res["Note"] = (f"Mais de {LOGON_CAP} falhas no período (limite de leitura): foram lidas só as mais "
                            "recentes. TotalEvents e Count são LIMITE INFERIOR e 'First' pode ser posterior ao início "
                            "real (veja OldestRead). Reduza 'days' para ver o período completo.")
     return res
@@ -2671,13 +2717,14 @@ def get_health_summary(
     cpu_warn: int = 80,
     mem_warn: int = 85,
     disk_warn_pct: int = 15,
-    disk_crit_pct: int = 5,
     patch_warn_days: int = 45,
     uptime_warn_days: int = 120,
 ):
     """Painel de saúde em UMA chamada: CPU, memória, discos, serviços automáticos parados, reboot pendente,
     uptime, dias sem patch, flags do CBS, eventos críticos (24h) e desligamentos inesperados (7d).
-    Devolve status OK/Atenção/Crítico por área, status geral e achados. Comece a triagem por aqui."""
+    Só fatos e sinais: devolve status por área (sem_sinais | sinais_presentes | verificacao_incompleta), status geral
+    e achados com o limiar do projeto à vista (parâmetros *_warn / *_pct / *_days). Não classifica gravidade nem
+    recomenda: isso é do RAG (microsoft-docs)."""
     d = _ps(host, PS_EV + r"""
 $os = Get-CimInstance Win32_OperatingSystem
 $c0 = Get-CimInstance Win32_PerfRawData_PerfOS_Processor -Filter "Name='_Total'"; Start-Sleep -Milliseconds 1000
@@ -2713,62 +2760,58 @@ $last = Get-HotFix | ? InstalledOn | sort InstalledOn -desc | select -first 1
     areas, findings = {}, []
 
     def flag(area, st, msg=None):
-        areas[area] = _worst(areas.get(area, "OK"), st)
+        areas[area] = _worst(areas.get(area, SEM), st)
         if msg:
-            findings.append(f"[{st}] {area}: {msg}")
+            findings.append(f"{area}: {msg}")
 
     cpu = d.get("CpuPct") or 0
-    flag("CPU", "Crítico" if cpu >= 95 else "Atenção" if cpu >= cpu_warn else "OK",
-         f"{cpu}% de uso" if cpu >= cpu_warn else None)
+    flag("CPU", SIG if cpu >= cpu_warn else SEM,
+         f"{cpu}% de uso (limiar do projeto: {cpu_warn}%)" if cpu >= cpu_warn else None)
     mu, mc = d.get("MemUsedPct") or 0, d.get("MemCommitPct") or 0
-    flag("Memória", "Crítico" if mu >= 95 else "Atenção" if mu >= mem_warn else "OK",
-         f"{mu}% da RAM em uso" if mu >= mem_warn else None)
+    flag("Memória", SIG if mu >= mem_warn else SEM,
+         f"{mu}% da RAM em uso (limiar do projeto: {mem_warn}%)" if mu >= mem_warn else None)
     if mc >= 90:
-        flag("Memória", "Atenção", f"commit em {mc}% (risco de falta de memória virtual)")
-    flag("Disco", "OK")
+        flag("Memória", SIG, f"commit em {mc}% (limiar do projeto: 90%)")
+    flag("Disco", SEM)
     for dk in _lst(d.get("Disks")):
         fp, fg = dk.get("FreePct") or 0, dk.get("FreeGB") or 0
-        if fp <= disk_crit_pct or fg < 2:
-            flag("Disco", "Crítico", f"{dk['DeviceID']} com {fg} GB livres ({fp}%)")
-        elif fp <= disk_warn_pct:
-            flag("Disco", "Atenção", f"{dk['DeviceID']} com {fg} GB livres ({fp}%)")
-    flag("Serviços", "OK")
+        if fp <= disk_warn_pct or fg < 2:
+            flag("Disco", SIG, f"{dk['DeviceID']} com {fg} GB livres ({fp}%) (limiar do projeto: {disk_warn_pct}% ou 2 GB)")
+    flag("Serviços", SEM)
     svc = _service_facts(_lst(d.get("StoppedAuto")))
     failed = [x for x in svc["services"] if x["failed_exit_code"] or x["transitional_state"]]
     if failed:
-        flag("Serviços", "Atenção", "automáticos parados com código de saída de falha ou em estado transitório: " +
+        flag("Serviços", SIG, "automáticos parados com código de saída de falha ou em estado transitório: " +
              ", ".join(f"{x['Name']} ({x['State']}, exit {x['ExitCode']})" for x in failed[:10]))
-    flag("Patches", "OK")
+    flag("Patches", SEM)
     dp = d.get("DaysSincePatch")
     if dp is None:
-        flag("Patches", "Atenção", "não foi possível determinar o último patch")
-    elif dp >= 2 * patch_warn_days:
-        flag("Patches", "Crítico", f"{dp} dias sem patch (último {d.get('LastHotfix')})")
+        flag("Patches", INC, "não foi possível determinar o último patch")
     elif dp >= patch_warn_days:
-        flag("Patches", "Atenção", f"{dp} dias sem patch (último {d.get('LastHotfix')})")
+        flag("Patches", SIG, f"{dp} dias desde o último patch ({d.get('LastHotfix')}) (limiar do projeto: {patch_warn_days})")
     if d.get("RebootCBS") or d.get("RebootWU") or d.get("PendingXml"):
-        flag("Patches", "Atenção", "reboot pendente (CBS/WU/pending.xml)")
+        flag("Patches", SIG, "reboot pendente (CBS/WU/pending.xml)")
     up = d.get("UptimeDays") or 0
-    flag("Disponibilidade", "OK")
+    flag("Disponibilidade", SEM)
     if up >= uptime_warn_days:
-        flag("Disponibilidade", "Atenção", f"{up} dias sem reboot (patches de kernel não aplicados)")
+        flag("Disponibilidade", SIG, f"{up} dias desde o último boot (limiar do projeto: {uptime_warn_days})")
     if d.get("Unexpected7d"):
-        flag("Disponibilidade", "Atenção", f"{d['Unexpected7d']} desligamento(s) inesperado(s) em 7 dias")
-    flag("Eventos", "OK")
+        flag("Disponibilidade", SIG, f"{d['Unexpected7d']} desligamento(s) inesperado(s) em 7 dias")
+    flag("Eventos", SEM)
     if d.get("Critical24h"):
-        flag("Eventos", "Atenção", f"{d['Critical24h']} evento(s) crítico(s) nas últimas 24h")
+        flag("Eventos", SIG, f"{d['Critical24h']} evento(s) crítico(s) nas últimas 24h")
     if (d.get("Error24h") or 0) >= 50:
-        flag("Eventos", "Atenção", f"{d['Error24h']} eventos de erro nas últimas 24h (System+Application)")
+        flag("Eventos", SIG, f"{d['Error24h']} eventos de erro nas últimas 24h (limiar do projeto: 50; System+Application)")
 
     return {
         "host": d["Host"], "os": d.get("OS"), "overall": _worst(*areas.values()),
-        "areas": areas, "findings": findings or ["Nenhum problema encontrado."],
+        "areas": areas, "findings": findings or ["Nenhum sinal encontrado."],
         "metrics": {k: d.get(k) for k in ("CpuPct", "MemUsedPct", "MemCommitPct", "UptimeDays", "LastBoot",
                                           "DaysSincePatch", "LastHotfix", "Critical24h", "Error24h", "Unexpected7d")},
         "disks": _lst(d.get("Disks")),
         "stopped_auto_services": svc["services"], "stopped_auto_signals": svc["signals"],
-        "next_steps": "Aprofunde áreas não-OK: validate_cbs, get_event_summary, get_top_processes, "
-                      "get_disk_usage_tree, get_service_failures.",
+        "next_steps": "Áreas com sinais podem ser aprofundadas com: validate_cbs, get_event_summary, "
+                      "get_top_processes, get_disk_usage_tree, get_service_failures.",
     }
 
 
@@ -2805,8 +2848,8 @@ def ops_health_check(host: str) -> str:
         "get_cbs_log_errors, get_windows_update_health, get_update_error_analysis) e o disco "
         "(get_common_space_offenders, get_disk_allocation_analysis e, nos volumes com pouco espaço, "
         "get_disk_usage_tree). Todas as coletas de log usam o padrão de 1 dia e só Crítico/Erro/Aviso. "
-        "Entregue um resumo com status (OK/Atenção/Crítico) por área, "
-        "os achados priorizados e as ações recomendadas."
+        "Entregue um resumo só com fatos e sinais por área (sem severidade). Recomendação, suporte ou boa prática "
+        "só se o usuário pedir, via microsoft-docs."
     )
 
 
