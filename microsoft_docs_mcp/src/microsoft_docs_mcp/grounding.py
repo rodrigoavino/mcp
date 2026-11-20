@@ -865,11 +865,18 @@ def validate_configuration(question: str, observed: dict | None = None, context:
 # pesquisa externa. O código exige a intenção declarada e recusa pedidos de inventário antes de qualquer requisição.
 ALLOWED_INTENTS = ("recommendation", "support", "compatibility", "best_practice")
 _CUE = re.compile(r"recommend|best[- ]practice|should|\bsupport|compatib|requirement|limit\b|maximum|minimum|deprecat|guideline|"
-                  r"\bmust\b|prefer|avoid|not supported|\bsupported\b", re.I)
+                  r"\bmust\b|prefer|avoid|not supported|\bsupported\b|"
+                  r"recomend|melhor pr[aá]tica|boa pr[aá]tica|suportad|compatibil|requisito|limite|m[aá]ximo|m[ií]nimo|obsolet", re.I)
 _SID_RID = re.compile(r"\bS-1-\d|\bR?SIDs?\b|\bRIDs?\b", re.I)
-_INVENTORY = re.compile(r"^\s*(list|enumerate|show|get|count|inventory|how many|what(?:'s| is| are) (?:the )?(?:current|installed|running|"
-                        r"configured))\b|\b(inventory|inventário|installed software|running (?:processes|services))\b", re.I)
-_INV_TOPIC = re.compile(r"\b(users?|groups?|services?|disks?|volumes?|events?|logs?|processes|software|sids?|rids?|status)\b", re.I)
+# Pedido de inventário/status: começa com interrogativo ou verbo de listagem (inglês e português) ou traz a expressão de inventário.
+# A pergunta com termo de recomendação/suporte/limite (_CUE) NUNCA é tratada como inventário.
+_INVENTORY = re.compile(r"^\s*(list|enumerate|show|get|count|inventory|how many|who|which|what|where|when|status of|"
+                        r"liste|listar|mostre|mostrar|quais|quem|quantos|quantas|qual|onde|quando)\b|"
+                        r"\b(inventory|inventário|installed software|running (?:processes|services))\b", re.I)
+_WHO = re.compile(r"^\s*(who|quem)\b", re.I)   # "quem/who ..." é sempre sobre pessoas (usuários, sessões): inventário
+_INV_TOPIC = re.compile(r"\b(users?|groups?|services?|disks?|volumes?|events?|logs?|processes|software|programs?|patches|hotfix(?:es)?|"
+                        r"ports?|adapters?|nics?|routes?|tasks?|sessions?|shares?|sids?|rids?|status|"
+                        r"usu[aá]rios?|grupos?|servi[cç]os?|discos?|eventos?|processos?|programas?|portas?|tarefas?)\b", re.I)
 CHECKLIST = ["1. O dado já existe no servidor? Use o coletor (windows-ops).",
              "2. O dado pertence à baseline do projeto? Use a baseline.",
              "3. O item é conhecimento Windows conhecido? Responda sem consulta externa.",
@@ -890,7 +897,7 @@ def external_gate(intent: str | None, *texts: str) -> dict | None:
         return None   # a própria pergunta fala de recomendação/suporte/limite: autorizada
     if _SID_RID.search(text):
         return refuse("SIDs e RIDs são resolvidos localmente (o coletor devolve o SID e o RID); não disparam pesquisa externa.")
-    if _INVENTORY.search(text) and _INV_TOPIC.search(text):
+    if _WHO.match(text) or (_INVENTORY.search(text) and _INV_TOPIC.search(text)):
         return refuse("é pedido de inventário/status (usuários, grupos, serviços, discos, eventos...). Isso vem do coletor, "
                       "nunca de consulta externa.")
     return None

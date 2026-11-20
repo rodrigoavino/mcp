@@ -135,7 +135,7 @@ claude mcp add microsoft-docs --scope user -- uv --directory C:\mcp\microsoft_do
 | BM25 sintético | bloco com termo raro (3,03) pesa mais que blocos só com termos comuns (0,92 a 1,02) |
 | Contexto obrigatório: página do comando `format` (fala de unidade de alocação, não de SQL Server) | rejeitada |
 | `verify_claim`: "sempre usar 8.8.8.8 como DNS alternativo" | `sem suporte` (`8.8.8.8` ausente da página) |
-| Porta de entrada (13 casos): perguntas de recomendação, suporte, compatibilidade e boa prática; inventário de usuários, grupos, serviços, discos e eventos; "o que é o RID 512"; "significado do SID S-1-5-32-544"; sem `intent`; `intent` inválido | os 5 casos de recomendação/suporte/compatibilidade/boa prática autorizados; os 8 restantes recusados, sem nenhuma requisição |
+| Porta de entrada (25 casos, inglês e português): recomendação, suporte, compatibilidade e boa prática (inclusive as que citam NIC ou serviço mas pedem recomendação); inventário de usuários, grupos, serviços, discos, portas e eventos com `list`, `show`, `which`, `who`, `what`, `quais`, `quem`, `liste`, `quantos`; "o que é o RID 512"; "significado do SID"; sem `intent`; `intent` inválido | todos conforme o esperado: os 10 de recomendação/suporte/compatibilidade/boa prática autorizados e os 15 restantes recusados, sem nenhuma requisição |
 | Pelo cliente MCP: `intent` no esquema das 5 tools; inventário; RID com `intent` válido | `intent` obrigatório nas 5; inventário e RID recusados com 0 requisições; chamada sem `intent` rejeitada na validação |
 | Cache: pergunta repetida; `cache_only` com cache; `cache_only` sem cache; `MS_DOCS_OFFLINE=true`; consulta com IP | repetida = 0 requisições; com cache responde; sem cache devolve `needs_network` com 0 requisições; offline idem; IP recusado antes de qualquer requisição |
 
@@ -146,7 +146,8 @@ Defeitos achados e corrigidos nos testes:
 4. o termo de contexto era dispensável (agora obrigatório);
 5. **`matches_observed` dava `true` para 4 KB**, o padrão do disco temporário citado entre parênteses na mesma frase (valores entre parênteses e "default" saem de `recommendation`);
 6. afirmação inventada saía como `parcial` (valor específico ausente derruba para `sem suporte`);
-7. a busca progressiva parava na 1ª página que passava no portão, mesmo sem trazer a recomendação (o SQL Server voltou `rec=None`): agora só para com recomendação explícita.
+7. a busca progressiva parava na 1ª página que passava no portão, mesmo sem trazer a recomendação (o SQL Server voltou `rec=None`): agora só para com recomendação explícita;
+8. **a porta de entrada não recusava "which users are in the administrators group"** (a regra só reconhecia inventário que começava com `list`, `show`, `get`...), achado no teste de ponta a ponta: agora reconhece interrogativos (`which`, `who`, `what`, `quais`, `quem`...) e termos em português; pergunta com termo de recomendação, suporte ou limite nunca é tratada como inventário.
 
 ## Limitações
 
