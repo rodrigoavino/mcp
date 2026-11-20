@@ -53,7 +53,8 @@ Validação feita na **árvore integrada** (coletor + RAG juntos, a partir dos p
 |---|---|
 | Instalação limpa (`uv sync` nos dois projetos) | OK; scripts de entrada criados; `uv.lock` estável |
 | Handshake stdio real, pelos executáveis instalados | Coletor: 53 tools, 2 prompts, instruções entregues. RAG: 5 tools, 1 prompt, instruções entregues |
-| Regressão completa do coletor | **66 chamadas, 53 tools, 63 aprovadas e as 3 recusas esperadas** (host inválido, caminho com aspas, host fora da allowlist); 435 s |
+| Regressão pós-migração para fatos (54 tools, 67 chamadas por servidor, em paralelo) | **`fastmcp`:** 64 aprovadas e as 3 recusas esperadas, 436 s. **`dc-w25-03` (controlador de domínio):** 61 aprovadas e 6 não aprovadas, todas explicadas: 3 recusas esperadas, `get_local_groups` x2 (DC não tem grupos locais, a tool orienta usar AD) e `get_pending_updates` (erro HRESULT 0x8024402C do Windows Update neste DC, fato de ambiente). Envelope padrão em todas as respostas legíveis (63 e 60), nenhuma chave fora do padrão. Nenhum termo de julgamento nos dados (só os nomes de campo `CandidateLines` e o texto "evento(s) crítico(s)", que é o nível do Event Viewer) |
+| Regressão completa do coletor (MVP original, 53 tools) | **66 chamadas, 53 tools, 63 aprovadas e as 3 recusas esperadas** (host inválido, caminho com aspas, host fora da allowlist); 435 s |
 | Envelope padrão | 45 respostas legíveis, **nenhuma com chave fora do padrão** e nenhuma falha de coleta |
 | RAG: porta de entrada | 25 casos (inglês e português): 10 autorizados e 15 recusados sem requisição |
 | RAG: 6 temas de disco e DNS | todos corretos, dentro de 3 documentos e 5 trechos; ampliação de escopo avisada |

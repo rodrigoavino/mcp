@@ -32,6 +32,8 @@
 
 ## 3. Resultado por tool
 
+> **Nota (2026-11-20):** as colunas e os achados abaixo foram escritos quando o coletor ainda classificava em OK/Atenção/Crítico. Isso é histórico: hoje as análises devolvem só `sem_sinais` / `sinais_presentes` / `verificacao_incompleta`, sem severidade nem recomendação. A regressão pós-migração (54 tools, dois servidores) está no `MVP.md`.
+
 | # | Tool | Resultado | Tempo | Observação |
 |---|---|---|---|---|
 | 1 | get_health_summary | ✅ | 9 s | Geral **Atenção** (patches/reboot pendente, eventos críticos) |
