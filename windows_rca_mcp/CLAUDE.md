@@ -42,6 +42,15 @@ MCP (FastMCP) de **OPS para Windows Server**. Serve para o Claude triar incident
 - Config por `.env` (python-dotenv): `find_dotenv(usecwd=True)` lê o arquivo do diretório de trabalho; `WINRM_ENV_FILE` sobrepõe. Veja `.env.example`. **O `.env` nunca vai para o git.**
 - O lab usa `WINRM_ALLOWED_HOSTS=*.familia.local,localhost`.
 
+## Padrão de resposta do MCP (decidido pelo usuário)
+Tudo o que o usuário confirmou vale como padrão das respostas deste MCP. Está no código (`envelope.py` e `INSTRUCTIONS` em `server.py`) e aqui.
+- **Envelope mínimo em toda tool:** `{computerName, timestamp, success, data}`; análises completas acrescentam `os` e `summary {status, findings}`; `moreAvailable` é só uma sugestão de uma linha. Aplicado por middleware na fronteira do MCP: as funções Python e as chamadas internas seguem cruas. Tool nova não precisa fazer nada.
+- **Responder só o perguntado.** Não incluir boot, uptime, disco, CPU, memória, serviços, usuários, eventos, volumes ou adaptadores a menos que (1) o usuário peça, (2) seja necessário para responder ou (3) seja erro/diagnóstico relacionado. Dar a tool um parâmetro de recorte (período, nome, limite) em vez de devolver tudo e deixar o Claude filtrar. Sugerir o que mais existe e só coletar se autorizado.
+- **Data de instalação é fato local**: registro, instalação por usuário, eventos MsiInstaller, Package Management, sistema de arquivos, com confiança (high, medium, low). Nunca internet nem documentação. Evento 11724 não vale como instalação. Correspondência de evento por nome igual, nunca por prefixo.
+- **Só fatos e sinais objetivos**; recomendação, boa prática e severidade são do `microsoft-docs`, e só para pergunta de recomendação, suporte, compatibilidade ou boa prática. Inventário, configuração, serviços, usuários, grupos, discos, eventos, SIDs, RIDs e status nunca disparam consulta externa.
+- **Carga do servidor só com evidência** (nunca presumir SQL Server etc.); **nada inventado**.
+- Ao embutir texto em string `'...'` do PowerShell, **dobre as aspas simples** (`'` vira `''`): um XPath com `@Name='X'` quebrou em silêncio um trecho dentro de `try/catch`.
+
 ## Armadilhas do PowerShell 5.1 (já custaram bugs)
 - `if` como valor de hashtable na mesma linha com `;` não funciona; use `Key=$(if (...) {...})`.
 - `foreach (...) {...} | Cmd` é erro de parser; use `@(foreach ...) | Cmd`.

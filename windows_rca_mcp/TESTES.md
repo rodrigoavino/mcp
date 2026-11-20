@@ -290,3 +290,25 @@ Fatos que o código usa e que foram **conferidos na documentação oficial** (vi
 | `get_local_groups` (real) | sem `findings`; `signals` com `FAMILIA\Domain Admins` no Administrators e a conta `Guest` desabilitada como membro; origem dos membros por SID |
 
 **Limite achado no RAG (não neste PR):** a busca do RAG não trouxe a página dos códigos de erro nem a dos RIDs. A causa é que tabelas viram células soltas (cada `td` é um bloco), perdendo a ligação linha/coluna. Os fatos acima foram conferidos lendo as páginas diretamente. Registrado em Pendências.
+
+## Anexo D. Envelope padrão e coleta objetiva (revisão 5)
+Padrão confirmado pelo usuário: toda tool responde `{computerName, timestamp, success, data}` (análises acrescentam `os` e `summary`), responde só o perguntado e apenas sugere o resto (`moreAvailable`). Data de instalação de software é fato local, com confiança.
+
+| Teste | Resultado |
+|---|---|
+| Envelope (unidade): lista, dicionário com `Host`, falha, análise (`os` e `summary`), `more_available`, erro parcial com dados, texto cru, formato do timestamp | todos conforme o padrão; erro parcial com dados continua `success: true` |
+| Envelope pelo cliente MCP: 6 tools de natureza diferente | nenhuma chave fora do padrão; host inalcançável vira `success: false`; host inválido continua erro do MCP |
+| **Regressão completa com o envelope** | 62 chamadas, 49 tools, 59 aprovadas e as 3 recusas esperadas; todas as respostas em JSON legível tinham o envelope e nenhuma chave fora do padrão; nenhuma falha de coleta |
+| Instruções do servidor (handshake stdio real) | entregues ao cliente (1574 caracteres, com o padrão) |
+| "Software instalado hoje" (`installed_since_days=0`) | só o **7-Zip 26.06**, `installDate 2026-11-20`, `confidence low`, `source FileSystem` (a chave não tem `InstallDate`); bate com o "Adicionar ou remover programas" |
+| "Patches de hoje" | só **KB5131079** e **KB5131080** |
+| Instalações por usuário (HKCU e HKEY_USERS) | achou o **Visual Studio Code (User)** e o **uv**, que o `HKLM` não mostra |
+| Eventos MsiInstaller (itens simulados) | `GitHub CLI` casa pelo evento 1033 (2026-11-19, `MsiInstaller`); com sufixo de versão ou arquitetura casa; com palavra extra, inexistente e `Git` **não** casam |
+
+**Defeitos achados e corrigidos nos testes:**
+1. A coleta lia só o `InstallDate` e dava "sem data" ao 7-Zip, que o Windows mostra como instalado hoje. Agora segue a ordem de evidências locais (registro, por usuário, eventos MSI, Package Management, arquivos).
+2. O XPath do provedor (`@Name='MsiInstaller'`) tem aspas simples e quebrava a string do PowerShell **em silêncio**, dentro de um `try/catch`: nenhum evento era lido. Agora as aspas são dobradas.
+3. A correspondência de evento por **prefixo** fazia `Git` herdar a data do `GitHub CLI`. Agora só nome igual (ignorando arquitetura e versão no fim).
+4. O teste usou o nome `NI` para uma função, que colide com o alias `ni` do PowerShell (já está nas armadilhas).
+
+**Não validado / limites:** (1) o caminho MsiInstaller foi testado com itens simulados, porque nenhum programa real do servidor de teste dependeu dele; (2) o provedor `Programs` do Package Management não expõe data; (3) hives de outros usuários não carregados não são lidos; (4) o evento 11724 não é usado (pelo que se sabe, é remoção; não há nenhum no servidor de teste para confirmar); (5) a data do `Get-HotFix` não tem hora; (6) a data por pasta (`FileSystem`) tem confiança baixa.
