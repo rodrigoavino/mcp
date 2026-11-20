@@ -21,7 +21,7 @@ MCP (FastMCP) de **OPS para Windows Server**. Serve para o Claude triar incident
   - **Carga do servidor só com evidência:** nunca presumir que o servidor é SQL Server, IIS etc. Use `get_workload_evidence`; sem evidência identificadora vale só o SO e a versão. Cliente (SSMS, ODBC) não identifica servidor. O `context` enviado ao RAG vem só de `docs_context`.
   - **Plataforma:** `get_platform_info` diz se é físico, virtual ou nuvem, só por assinatura com a evidência à vista; `indeterminate` quando nada casa. Serial, UUID, asset tag e id de instância são sensíveis: ficam em `identifiers` e nunca vão ao RAG (só `docs_context`).
   - Nada que saia deste MCP para a internet: nenhuma chamada externa aqui. A única exceção é o serviço de metadados da própria instância (`169.254.169.254`, link-local, executado no servidor alvo e só em campos de lista fixa).
-  - Dívida conhecida: tools antigas ainda trazem julgamento (`get_health_summary` e `validate_cbs` com OK/Atenção/Crítico e ações, `get_stopped_auto_services` com suspeito/esperado no PR 3, `get_local_groups` com achados, dicas de HRESULT). Devem migrar para fatos + sinais. Tool nova já nasce sem julgamento.
+  - Já migradas para fatos + sinais: `get_stopped_auto_services` e `get_local_groups`. Dívida conhecida: ainda trazem julgamento ou recomendação `get_health_summary` e `validate_cbs` (OK/Atenção/Crítico, ações), `get_time_config` ("o recomendado é NT5DS"), `get_cluster_health` ("configure ... witness"), `get_disk_allocation_analysis` ("candidato a reclamação") e as dicas de HRESULT. Devem migrar. Tool nova já nasce sem julgamento.
 
 ## Arquitetura
 - `src/windows_rca_mcp/server.py`: todas as tools (53) e os prompts (`ops_health_check`, `root_cause_analysis`).
@@ -78,7 +78,7 @@ uv run python teste.py get_health_summary host=fastmcp.familia.local  # uma tool
 - Novas mudanças: usar um branch de feature, para o `/code-review ultra` funcionar sem argumentos.
 
 ## Pendências (retomar)
-- [ ] **Melhorar `get_stopped_auto_services`**: classificar cada serviço parado como "esperado" ou "suspeito" e mostrar só os suspeitos por padrão. Critérios (lidos de `HKLM\SYSTEM\CurrentControlSet\Services\<nome>`): `DelayedAutostart` (atraso), subchave `TriggerInfo` (gatilho) e `ExitCode`. Esperado = tem gatilho, ou atraso e uptime curto. Suspeito = automático sem atraso e sem gatilho, ou `ExitCode` diferente de 0. No lab: `GoogleUpdaterService*` e `GoogleUpdaterInternalService*` seriam suspeitos; `AppXSvc`, `edgeupdate`, `RemoteRegistry` e `sppsvc` esperados; `InventorySvc` esperado só nas primeiras horas após o boot. Reaproveitar a mesma classificação no `get_health_summary` (hoje ele lista todos os parados).
-- [ ] Reiniciar o Claude Code para carregar as 49 tools; commit, push e PR do branch `feat/cbs-busca-otimizada`.
-- [ ] Limpar os branches `baseline` e `fix/ultrareview-pr1`, fechar o PR 1.
-- [ ] Lab: remover o DNS 10.10.0.1 do servidor; conferir os SIDs de domínio não resolvidos em Administradores/Users (`get_local_groups`).
+- [x] `get_stopped_auto_services` e `get_local_groups` só com fatos e sinais (sem classificar nem recomendar).
+- [ ] Migrar para fatos + sinais o que ainda julga (lista na seção de fronteira acima).
+- [ ] RAG (`microsoft_docs_mcp`): **tabelas** viram células soltas (cada `td`/`th` é um bloco), então o trecho perde a associação linha/coluna e a busca dá falso negativo (ex.: código 1077, RIDs de domínio). Juntar as células de cada linha num bloco.
+- [ ] Lab: **avaliar** o DNS secundário 10.10.0.1 (servidor válido, decisão do usuário; não resolve `familia.local`: com o DC fora do ar o cliente cai nele e recebe "não existe"). Opções: manter, trocar por um 2º DC, ou DC com encaminhador e só o DC no cliente.
