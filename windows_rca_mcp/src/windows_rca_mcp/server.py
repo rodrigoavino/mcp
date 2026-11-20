@@ -8,9 +8,12 @@ Variáveis de ambiente (podem vir de um arquivo .env no diretório de trabalho):
   WINRM_SSL                      true (padrão) -> HTTPS | false -> HTTP
   WINRM_PORT                     porta (padrão 5986 com SSL, 5985 sem SSL)
   WINRM_VALIDATE_CERT            validate (padrão) | ignore
-  WINRM_ALLOWED_HOSTS            lista separada por vírgula (allowlist de servidores)
+  WINRM_ALLOWED_HOSTS            OBRIGATÓRIA: allowlist separada por vírgula; aceita curingas (*.dominio.local).
+                                 '*' libera qualquer host (opt-in explícito, não recomendado).
+  WINRM_ENV_FILE                 caminho explícito do .env (opcional; padrão: .env do diretório de trabalho)
 """
 import base64
+import fnmatch
 import json
 import os
 import re
@@ -19,16 +22,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import winrm
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 from fastmcp import FastMCP
 
-load_dotenv()
+# O .env é procurado a partir do DIRETÓRIO DE TRABALHO (usecwd=True), e não da pasta do pacote, para funcionar
+# também quando instalado via wheel em site-packages.
+load_dotenv(os.getenv("WINRM_ENV_FILE") or find_dotenv(usecwd=True))
 
 mcp = FastMCP("windows-server-ops")
 
-ALLOWED = {h.strip().lower() for h in os.getenv("WINRM_ALLOWED_HOSTS", "").split(",") if h.strip()}
+ALLOWED = [h.strip().lower() for h in os.getenv("WINRM_ALLOWED_HOSTS", "").split(",") if h.strip()]
 HOST_RE = re.compile(r"^[A-Za-z0-9._-]{1,253}$")
 NAME_RE = re.compile(r"^[A-Za-z0-9 ._/-]{1,100}$")
+
+
+def _host_allowed(host: str) -> bool:
+    h = host.lower()
+    return any(p == "*" or fnmatch.fnmatchcase(h, p) for p in ALLOWED)
 
 # Funções PowerShell injetadas em todo script.
 # Msg: normaliza espaços e trunca a mensagem do evento com segurança (eventos podem vir sem Message).
@@ -36,6 +46,10 @@ PS_HELPERS = r"""
 $ProgressPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch {}
 function Msg($m, $n) { if (-not $m) { return $null }; $t = ($m -replace '\s+', ' ').Trim(); $t.Substring(0, [math]::Min($n, $t.Length)) }
+"""
+
+# Só para as tools de DISM (não é injetado em todo script, para não inflar o tamanho dos comandos).
+PS_DISM = r"""
 function RunDism($a, $sec) {
   if (Get-Process dism -ErrorAction SilentlyContinue) {
     return [pscustomobject]@{ ExitCode=$null; Output='Outra instância do DISM já está em execução neste servidor; não foi iniciada uma nova.'; Busy=$true; TimedOut=$false } }
@@ -53,7 +67,12 @@ function RunDism($a, $sec) {
 def _session(host: str, timeout: int = 60) -> winrm.Session:
     if not HOST_RE.match(host):
         raise ValueError("Hostname inválido")
-    if ALLOWED and host.lower() not in ALLOWED:
+    # Fail-closed: credenciais só são enviadas a hosts explicitamente permitidos (evita que texto injetado em
+    # logs/eventos leve o modelo a autenticar em um host do atacante).
+    if not ALLOWED:
+        raise ValueError("WINRM_ALLOWED_HOSTS não configurada: defina os servidores permitidos "
+                         "(ex.: *.dominio.local,srv01) no .env. Use '*' apenas conscientemente.")
+    if not _host_allowed(host):
         raise ValueError(f"Host '{host}' fora da allowlist WINRM_ALLOWED_HOSTS")
     user, pwd = os.getenv("WINRM_USER"), os.getenv("WINRM_PASSWORD")
     if not user or not pwd:
@@ -293,6 +312,8 @@ Get-WinEvent -FilterHashtable @{{{flt}}} -MaxEvents {min(int(max_events), 200)} 
 """)
 
 
+EVENT_CAP = 20000          # máximo de eventos lidos por log em get_event_summary
+LOGON_CAP = 5000           # máximo de eventos 4625 lidos em get_failed_logons
 EVENT_LOGS_DEFAULT = ["System", "Application", "Setup"]
 EVENT_LOGS_OPERATIONAL = [
     "Microsoft-Windows-GroupPolicy/Operational",
@@ -328,29 +349,39 @@ def get_event_summary(
     res = _ps(host, r"""
 $since = (Get-Date).AddDays(-__D__)
 $logs = @(__LOGS__)
-$totals = @(); $groups = @()
+$totals = @(); $groups = @(); $capped = @()
 foreach ($l in $logs) {
   if (-not (Get-WinEvent -ListLog $l -ErrorAction SilentlyContinue)) { continue }
-  $ev = @(Get-WinEvent -FilterHashtable @{LogName=$l;StartTime=$since;Level=__LV__} -MaxEvents 20000 -ErrorAction SilentlyContinue)
+  $ev = @(Get-WinEvent -FilterHashtable @{LogName=$l;StartTime=$since;Level=__LV__} -MaxEvents __CAP__ -ErrorAction SilentlyContinue)
   if (-not $ev.Count) { continue }
+  if ($ev.Count -ge __CAP__) { $capped += [pscustomobject]@{ Log=$l; CappedAt=__CAP__; OldestRead=$ev[-1].TimeCreated } }
   $totals += @($ev | group LevelDisplayName | % { [pscustomobject]@{ Log=$l; Level=$_.Name; Count=$_.Count } })
   $groups += @($ev | group ProviderName,Id,LevelDisplayName | sort Count -desc | select -first __T__ | % {
       $g = $_.Group | sort TimeCreated
       [pscustomobject]@{ Log=$l; Level=$g[0].LevelDisplayName; Provider=$g[0].ProviderName; Id=$g[0].Id; Count=$_.Count
         First=$g[0].TimeCreated; Last=$g[-1].TimeCreated; Sample=(Msg $g[-1].Message 300) } })
 }
-[pscustomobject]@{ Totals=$totals; Groups=$groups } | ConvertTo-Json -Depth 3 -Compress
+[pscustomobject]@{ Totals=$totals; Groups=$groups; Capped=$capped } | ConvertTo-Json -Depth 3 -Compress
 """.replace("__D__", str(_days(days))).replace("__LV__", _ints(levels))
        .replace("__T__", str(max(1, min(int(top), 100))))
-       .replace("__LOGS__", ",".join(f"'{lg}'" for lg in logs)), timeout=180)
+       .replace("__LOGS__", ",".join(f"'{lg}'" for lg in logs))
+       .replace("__CAP__", str(EVENT_CAP)), timeout=180)
     if not isinstance(res, dict) or "error" in res:
         return res
     totals = sorted(_lst(res.get("Totals")), key=lambda t: -t["Count"])
     groups = sorted(_lst(res.get("Groups")), key=lambda g: -g["Count"])
-    return {"period_days": _days(days), "logs": logs, "levels": levels,
-            "total_events": sum(t["Count"] for t in totals),
-            "totals_by_log_level": totals,
-            "groups": groups or "Nenhum evento de problema no período."}
+    capped = _lst(res.get("Capped"))
+    out = {"period_days": _days(days), "logs": logs, "levels": levels,
+           "total_events": sum(t["Count"] for t in totals),
+           "truncated": bool(capped),
+           "totals_by_log_level": totals,
+           "groups": groups or "Nenhum evento de problema no período."}
+    if capped:
+        out["capped_logs"] = capped
+        out["note"] = (f"Logs com mais de {EVENT_CAP} eventos no período foram cortados nos mais recentes: os totais "
+                       "desses logs são um LIMITE INFERIOR e 'First' pode ser posterior ao início real. "
+                       "Reduza 'days' ou filtre com get_events.")
+    return out
 
 
 @mcp.tool
@@ -423,11 +454,13 @@ $wu = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
 
 
 @mcp.tool
-def get_pending_updates(host: str):
+def get_pending_updates(host: str, max_seconds: int = 300):
     """Updates pendentes (não instalados) segundo o agente do Windows Update / WSUS.
+    A busca do WUA pode levar minutos (WSUS, primeira varredura); prazo padrão de 300 s (máx. 900).
     Obs.: a API COM do WUA pode retornar 'Access denied' em sessões remotas WinRM;
     nesse caso use get_patch_status + get_windows_update_history."""
-    return _ps(host, r"""
+    secs = max(60, min(int(max_seconds), 900))
+    return _ps(host, timeout=secs, script=r"""
 try {
   $s = New-Object -ComObject Microsoft.Update.Session
   $r = $s.CreateUpdateSearcher().Search("IsInstalled=0 and IsHidden=0")
@@ -530,15 +563,6 @@ $rdp = ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Serve
 """)
 
 
-@mcp.tool
-def get_time_sync_status(host: str):
-    """Status do w32time (fonte, último sync, offset). Desvio de hora quebra Kerberos/AD."""
-    return _ps(host, r"""
-[pscustomobject]@{
-  Source=(w32tm /query /source | Out-String).Trim()
-  Status=(w32tm /query /status | Out-String).Trim()
-} | ConvertTo-Json -Compress
-""")
 
 
 @mcp.tool
@@ -588,7 +612,7 @@ def _path(p: str) -> str:
 def get_cbs_health(host: str):
     """Saúde do CBS (Component Based Servicing): DISM /CheckHealth (rápido, só leitura), pending.xml,
     flags de reboot/pacotes/sessões pendentes, TrustedInstaller e tamanho dos logs do CBS."""
-    res = _ps(host, r"""
+    res = _ps(host, PS_DISM + r"""
 $ErrorActionPreference='Continue'
 $k='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing'
 $d = RunDism '/Online /Cleanup-Image /CheckHealth' 90
@@ -615,7 +639,7 @@ def get_component_store_analysis(host: str, max_seconds: int = 300):
     """DISM /AnalyzeComponentStore: tamanho real do WinSxS, espaço recuperável e se limpeza é recomendada.
     Somente leitura, mas pode levar de 1 a 5 minutos. Não inicia se já houver um DISM rodando; se exceder
     'max_seconds' o DISM é encerrado (nada fica pendurado no servidor)."""
-    return _ps(host, r"""
+    return _ps(host, PS_DISM + r"""
 $ErrorActionPreference='Continue'
 RunDism '/Online /Cleanup-Image /AnalyzeComponentStore' __S__ | ConvertTo-Json -Compress
 """.replace("__S__", str(max(60, min(int(max_seconds), 900)))), timeout=max(60, min(int(max_seconds), 900)) + 60)
@@ -632,27 +656,50 @@ SERVICING_HINTS = {
 
 
 @mcp.tool
-def get_cbs_log_errors(host: str, days: int = 1, include_dism: bool = True, top: int = 25):
+def get_cbs_log_errors(
+    host: str,
+    days: int = 1,
+    include_dism: bool = True,
+    top: int = 25,
+    max_seconds: int = 120,
+    max_mb_per_file: int = 256,
+):
     """Problemas nos logs de servicing (CBS.log + CbsPersist_*.log e, se include_dism, dism.log) do ÚLTIMO DIA
     (days ampliável até 90 se pedido). Considera só linhas Error/Warning e Info com HRESULT de falha (0x8...),
     'Cannot repair' e 'corrupt'. Para otimizar a análise, AGRUPA mensagens repetidas (números normalizados),
     conta por fonte/nível, lista os HRESULTs mais frequentes com dica e devolve só os 'top' grupos.
-    Revela corrupção e falhas de patch que não aparecem no Event Viewer. Arquivos .cab compactados são ignorados."""
-    res = _ps(host, r"""
+    Leitura LIMITADA: de cada arquivo lê no máximo os últimos 'max_mb_per_file' MB, em blocos, e para ao atingir
+    'max_seconds', devolvendo resultado PARCIAL (Partial=true, com os arquivos/trechos não lidos) em vez de falhar.
+    Arquivos .cab compactados são ignorados."""
+    budget = max(15, min(int(max_seconds), 600))
+    res = _ps(host, timeout=budget + 90, script=r"""
 $cutDate = (Get-Date).AddDays(-__D__); $cut = $cutDate.ToString('yyyy-MM-dd HH:mm:ss')
+$budget = __B__; $maxBytes = [int64]__MB__ * 1MB
 $cbsDir = "$env:SystemRoot\Logs\CBS"
 $files = @(Get-ChildItem $cbsDir -Filter 'CBS.log' -File -ErrorAction SilentlyContinue)
-$files += @(Get-ChildItem $cbsDir -Filter 'CbsPersist_*.log' -File -ErrorAction SilentlyContinue | ? { $_.LastWriteTime -ge $cutDate })
+$files += @(Get-ChildItem $cbsDir -Filter 'CbsPersist_*.log' -File -ErrorAction SilentlyContinue | ? { $_.LastWriteTime -ge $cutDate } | sort LastWriteTime -desc)
 if (__DISM__) { $files += @(Get-ChildItem "$env:SystemRoot\Logs\DISM" -Filter 'dism*.log' -File -ErrorAction SilentlyContinue | ? { $_.LastWriteTime -ge $cutDate }) }
 $cabs = @(Get-ChildItem $cbsDir -Filter 'CbsPersist_*.cab' -File -ErrorAction SilentlyContinue | ? { $_.LastWriteTime -ge $cutDate }).Count
 $hit = '^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d, (Error|Warning) |HRESULT = 0x8|Cannot repair|[Cc]orrupt'
 $pat = '^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d), (\w+)\s+(\S+)\s+(.*)$'
-$groups = @{}; $byLevel = @{}; $hr = @{}; $stats = @(); $cr = 0; $co = 0; $total = 0
+$groups = @{}; $byLevel = @{}; $hr = @{}; $stats = @(); $cr = 0; $co = 0; $total = 0; $partial = $false; $notRead = @()
 $sw = [Diagnostics.Stopwatch]::StartNew()
+$buf = New-Object char[] (4MB)
 foreach ($f in $files) {
-  $src = if ($f.Name -like 'dism*') { 'DISM' } else { 'CBS' }; $n = 0
-  foreach ($m in (Select-String -LiteralPath $f.FullName -Pattern $hit -ErrorAction SilentlyContinue)) {
-    $l = $m.Line
+  if ($sw.Elapsed.TotalSeconds -ge $budget) { $partial = $true; $notRead += $f.Name; continue }
+  $src = if ($f.Name -like 'dism*') { 'DISM' } else { 'CBS' }; $n = 0; $stopped = $false
+  $fs = [IO.File]::Open($f.FullName, 'Open', 'Read', 'ReadWrite, Delete')
+  $start = [math]::Max([int64]0, $fs.Length - $maxBytes); $tailOnly = $start -gt 0
+  [void]$fs.Seek($start, 'Begin'); $sr = New-Object IO.StreamReader($fs); $carry = ''
+  if ($tailOnly) { [void]$sr.ReadLine() }
+  while ($true) {
+    $read = $sr.Read($buf, 0, $buf.Length)
+    if ($read -le 0) { $lines = @($carry) ; $carry = '' }
+    else { $parts = ($carry + [string]::new($buf, 0, $read)).Split("`n"); $carry = $parts[-1]
+           $lines = if ($parts.Length -gt 1) { @($parts[0..($parts.Length - 2)]) } else { @() } }
+    $lines = @($lines)
+    foreach ($l in ($lines -match $hit)) {
+    $l = $l.TrimEnd("`r")
     if ($l.Length -lt 19 -or $l.Substring(0,19) -lt $cut) { continue }
     if ($l -notmatch $pat) { continue }
     $ts = $matches[1]; $lv = $matches[2]; $comp = $matches[3]; $msg = $matches[4].Trim()
@@ -670,12 +717,18 @@ foreach ($f in $files) {
         Sample=$msg.Substring(0,[math]::Min(300,$msg.Length)) }; $groups[$key] = $g }
     $g.Count++; if ($ts -lt $g.First) { $g.First = $ts }
     if ($ts -gt $g.Last) { $g.Last = $ts; $g.Sample = $msg.Substring(0,[math]::Min(300,$msg.Length)) }
+    }
+    if ($read -le 0) { break }
+    if ($sw.Elapsed.TotalSeconds -ge $budget) { $partial = $true; $stopped = $true; break }
   }
-  $stats += [pscustomobject]@{ File=$f.Name; SizeMB=[math]::Round($f.Length/1MB,1); ProblemLines=$n }
+  $sr.Close()
+  $stats += [pscustomobject]@{ File=$f.Name; SizeMB=[math]::Round($f.Length/1MB,1); ProblemLines=$n
+    ReadMB=[math]::Round([math]::Min($f.Length, $maxBytes)/1MB,1); TailOnly=$tailOnly; StoppedByTime=$stopped }
   $total += $n
 }
 [pscustomobject]@{
   PeriodDays=__D__; Since=$cut; ScanSeconds=[math]::Round($sw.Elapsed.TotalSeconds,1)
+  Partial=$partial; FilesNotRead=$notRead; TimeBudgetSeconds=$budget; MaxMBPerFile=__MB__
   FilesScanned=$stats; CompressedCabsSkipped=$cabs
   TotalProblemLines=$total; DistinctProblems=$groups.Count; CannotRepairCount=$cr; CorruptCount=$co
   ByLevel=@($byLevel.GetEnumerator() | sort Value -desc | % { [pscustomobject]@{ Source=$_.Key.Split('|')[0]; Level=$_.Key.Split('|')[1]; Count=$_.Value } })
@@ -683,10 +736,14 @@ foreach ($f in $files) {
   TopProblems=@($groups.Values | sort Count -desc | select -first __T__)
 } | ConvertTo-Json -Depth 4 -Compress
 """.replace("__D__", str(_days(days))).replace("__DISM__", "$true" if include_dism else "$false")
-       .replace("__T__", str(max(1, min(int(top), 100)))), timeout=300)
+       .replace("__T__", str(max(1, min(int(top), 100)))).replace("__B__", str(budget))
+       .replace("__MB__", str(max(8, min(int(max_mb_per_file), 4096)))))
     if isinstance(res, dict):
         for h in _lst(res.get("TopHResults")):
             h["Hint"] = SERVICING_HINTS.get(h["Code"]) or WU_HINTS.get(h["Code"]) or ""
+        if res.get("Partial") or any(f.get("TailOnly") for f in _lst(res.get("FilesScanned"))):
+            res["Note"] = ("Leitura parcial: contagens são um limite inferior. Aumente max_seconds/max_mb_per_file "
+                           "se precisar de cobertura total.")
     return res
 
 
@@ -963,6 +1020,8 @@ def validate_cbs(host: str, days: int = 1):
         evid.append("Serviço TrustedInstaller desabilitado (impede instalação de updates).")
         actions.append("Voltar o TrustedInstaller para início Manual.")
 
+    # Uma verificação que falhou NÃO pode contar como limpa: eleva para Atenção e registra o motivo.
+    incomplete = []
     if isinstance(log, dict) and "TotalProblemLines" in log:
         if (log.get("CannotRepairCount") or 0) > 0:
             status = _worst(status, "Crítico")
@@ -970,6 +1029,19 @@ def validate_cbs(host: str, days: int = 1):
         if (log.get("CorruptCount") or 0) > 0:
             status = _worst(status, "Atenção")
             evid.append(f"CBS.log: {log['CorruptCount']} menção(ões) a 'corrupt'.")
+        if log.get("Partial"):
+            incomplete.append("leitura dos logs CBS/DISM foi parcial (limite de tempo); contagens são mínimas")
+    else:
+        incomplete.append(f"não foi possível ler os logs CBS/DISM: {log.get('error') if isinstance(log, dict) else log}")
+
+    if not (isinstance(upd, dict) and "by_error_code" in upd):
+        incomplete.append("não foi possível ler as falhas do Windows Update: "
+                          f"{upd.get('error') if isinstance(upd, dict) else upd}")
+    for msg in incomplete:
+        status = _worst(status, "Atenção")
+        evid.append(f"Verificação incompleta: {msg}.")
+    if incomplete:
+        actions.append("Repetir validate_cbs (ou as tools individuais) para completar as verificações que falharam.")
 
     if isinstance(upd, dict) and "by_error_code" in upd:
         bad = [c for c in upd["by_error_code"] if c["error_code"] in CBS_CODES]
@@ -983,12 +1055,16 @@ def validate_cbs(host: str, days: int = 1):
         evid.append(f"Pasta de logs do CBS com {health['CbsLogDir_MB']} MB.")
     return {
         "host": host, "status": status,
-        "verdict": {"OK": "CBS saudável.", "Atenção": "CBS com pendências; não necessariamente corrompido.",
+        "verdict": {"OK": "CBS saudável.",
+                    "Atenção": ("CBS com pendências ou verificação incompleta; não necessariamente corrompido."
+                                if incomplete else "CBS com pendências; não necessariamente corrompido."),
                     "Crítico": "CBS quebrado/corrompido: patches tendem a falhar."}[status],
+        "complete": not incomplete,
         "evidence": evid or ["Nenhuma evidência de problema no CBS."],
         "recommended_actions": list(dict.fromkeys(actions)),
         "details": {"cbs_health": health, "cbs_log": log,
-                    "update_errors": upd.get("by_error_code") if isinstance(upd, dict) else upd},
+                    "update_errors": (upd.get("by_error_code") if isinstance(upd, dict) and "by_error_code" in upd
+                                      else upd)},
     }
 
 
@@ -1624,24 +1700,29 @@ def get_failed_logons(host: str, days: int = 1, top: int = 25):
     motivo (SubStatus traduzido). Detecta força bruta, contas de serviço com senha antiga e bloqueios.
     Requer permissão de leitura no log Security (admin local ou equivalente)."""
     res = _ps(host, r"""
-$ev = @(Get-WinEvent -FilterHashtable @{LogName='Security';Id=4625;StartTime=(Get-Date).AddDays(-__H__)} -MaxEvents 5000 -ErrorAction SilentlyContinue)
+$ev = @(Get-WinEvent -FilterHashtable @{LogName='Security';Id=4625;StartTime=(Get-Date).AddDays(-__H__)} -MaxEvents __CAP__ -ErrorAction SilentlyContinue)
 $rows = foreach ($e in $ev) {
   $d = @{}; ([xml]$e.ToXml()).Event.EventData.Data | % { $d[$_.Name] = $_.'#text' }
   [pscustomobject]@{ Time=$e.TimeCreated; Account="$($d.TargetDomainName)\$($d.TargetUserName)"; SourceIp=$d.IpAddress
     Workstation=$d.WorkstationName; LogonType=$d.LogonType; SubStatus=$(if ("$($d.SubStatus)" -match "^0x0+$") { "$($d.Status)".ToLower() } else { "$($d.SubStatus)".ToLower() }); Process=$d.ProcessName }
 }
 [pscustomobject]@{
-  TotalEvents=$ev.Count
+  TotalEvents=$ev.Count; Truncated=($ev.Count -ge __CAP__); OldestRead=$(if ($ev.Count) { $ev[-1].TimeCreated })
   Groups=@($rows | group Account,SourceIp | sort Count -desc | select -first __T__ | % {
     $g=$_.Group | sort Time
     [pscustomobject]@{ Count=$_.Count; Account=$g[0].Account; SourceIp=$g[0].SourceIp; Workstation=$g[0].Workstation
       LogonTypes=(@($g.LogonType | select -unique) -join ','); SubStatus=@($g.SubStatus | select -unique)
       Process=$g[-1].Process; First=$g[0].Time; Last=$g[-1].Time } })
 } | ConvertTo-Json -Depth 4 -Compress
-""".replace("__H__", str(_days(days))).replace("__T__", str(max(1, min(int(top), 100)))), timeout=180)
+""".replace("__H__", str(_days(days))).replace("__T__", str(max(1, min(int(top), 100))))
+       .replace("__CAP__", str(LOGON_CAP)), timeout=180)
     if isinstance(res, dict):
         for g in _lst(res.get("Groups")):
             g["Reasons"] = [LOGON_SUBSTATUS.get(s, s) for s in _lst(g.get("SubStatus"))]
+        if res.get("Truncated"):
+            res["Note"] = (f"Mais de {LOGON_CAP} falhas no período (provável força bruta): foram lidas só as mais "
+                           "recentes. TotalEvents e Count são LIMITE INFERIOR e 'First' pode ser posterior ao início "
+                           "real (veja OldestRead). Reduza 'days' para ver o período completo.")
     return res
 
 
@@ -1776,7 +1857,7 @@ def ops_health_check(host: str) -> str:
         "get_system_overview, "
         "get_patch_status (+ get_pending_updates e get_windows_update_history), "
         "get_performance_snapshot, get_disks, get_stopped_auto_services e get_service_failures, "
-        "get_roles_and_features, get_security_posture, get_time_sync_status e "
+        "get_roles_and_features, get_security_posture e "
         "get_expiring_certificates. Inclua a saúde do CBS/Windows Update (get_cbs_health, "
         "get_cbs_log_errors, get_windows_update_health, get_update_error_analysis) e o disco "
         "(get_common_space_offenders, get_disk_allocation_analysis e, nos volumes com pouco espaço, "

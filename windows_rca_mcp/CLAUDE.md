@@ -8,10 +8,16 @@ MCP (FastMCP) de **OPS para Windows Server**. Serve para o Claude triar incident
 - **Período padrão `days=1`** em toda tool que lê log (Event Viewer, CBS/CbsPersist/dism.log, GPO, logons, cluster). Só amplie se o usuário pedir; `_days()` limita a 90.
 - Logs grandes (CBS) são **agrupados** (mensagens normalizadas + top HRESULTs com dica), nunca devolvidos crus.
 - Toda resposta de saúde usa status **OK / Atenção / Crítico**, com achados e ação recomendada.
+- **Segurança (definida na revisão do PR 1):**
+  - `WINRM_ALLOWED_HOSTS` é obrigatória (fail-closed, aceita curingas) e nunca deve voltar a ser opcional;
+  - o modo `http` exige `MCP_AUTH_TOKEN`;
+  - uma verificação que falhou nunca conta como "OK";
+  - limites (`-MaxEvents`, tamanho ou tempo de leitura) são sempre **sinalizados** na resposta (`truncated`/`Partial`).
+- Toda tool que pode ser lenta passa um `timeout` explícito ao `_ps`. O padrão de 60 s é um prazo total rígido.
 - Idioma: português (docstrings, mensagens, README).
 
 ## Arquitetura
-- `src/windows_rca_mcp/server.py`: todas as tools (49) e os prompts (`ops_health_check`, `root_cause_analysis`).
+- `src/windows_rca_mcp/server.py`: todas as tools (48) e os prompts (`ops_health_check`, `root_cause_analysis`).
 - `src/windows_rca_mcp/__init__.py`: `main()`. `MCP_TRANSPORT=stdio` (padrão) ou `http` (`MCP_HOST`/`MCP_PORT`).
 - `src/windows_rca_mcp/diskscan.cs`: scanner de disco em C#, compilado no alvo via `Add-Type` (`get_disk_usage_tree`).
 - Execução remota:
@@ -22,9 +28,10 @@ MCP (FastMCP) de **OPS para Windows Server**. Serve para o Claude triar incident
   - `$ProgressPreference` silencioso;
   - saída em UTF-8;
   - `Msg` trunca mensagem de evento com segurança contra nulo;
-  - `RunDism` tem timeout e não inicia se já houver um DISM rodando.
+  - `RunDism` fica em `PS_DISM`, injetado **só** nas tools de DISM (não infle o `PS_HELPERS`: cada byte a mais empurra scripts para o `_ps_long`).
 - Validação de entrada com `HOST_RE`, `NAME_RE`, `SVC_RE`, `PATH_RE`. Números via `int()` e limitados.
-- Config por `.env` (python-dotenv), lido do diretório de trabalho. Veja `.env.example`. **O `.env` nunca vai para o git.**
+- Config por `.env` (python-dotenv): `find_dotenv(usecwd=True)` lê o arquivo do diretório de trabalho; `WINRM_ENV_FILE` sobrepõe. Veja `.env.example`. **O `.env` nunca vai para o git.**
+- O lab usa `WINRM_ALLOWED_HOSTS=*.familia.local,localhost`.
 
 ## Armadilhas do PowerShell 5.1 (já custaram bugs)
 - `if` como valor de hashtable na mesma linha com `;` não funciona; use `Key=$(if (...) {...})`.

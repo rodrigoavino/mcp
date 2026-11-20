@@ -1,7 +1,7 @@
 # Relatório de testes: windows-rca-mcp v0.2.0
 
 **Data:** 19/11/2026 · **Executado por:** Claude Code (bateria automatizada via `fastmcp.Client` em memória + `teste.py`)
-**Resultado:** ✅ **49/49 tools aprovadas**, 2/2 prompts registrados, 3/3 casos negativos rejeitados corretamente.
+**Resultado:** ✅ **48/48 tools aprovadas** (revisão 3, após Ultrareview; versão anterior: 49/49), 2/2 prompts registrados, 3/3 casos negativos rejeitados corretamente.
 
 ## 1. Ambiente de teste
 
@@ -182,7 +182,24 @@ Pedido: foco em problema, período padrão de 1 dia com opção de ampliar, vale
 
 Medições depois da mudança (último dia): `get_event_summary` 6 s (3 logs) ou 15 s (11 logs) · `get_events` 8 s · `get_failed_logons` 6 s · `get_service_failures` 5 s · `get_cbs_log_errors` 52 s.
 
-## 7. Limitações dos testes
+## 7. Correções da revisão de código (Ultrareview do PR 1, revisão 3)
+
+Todos os 10 achados foram aceitos e corrigidos.
+
+| # | Achado | Correção | Teste |
+|---|---|---|---|
+| 1 | O modo HTTP expunha as 49 tools sem autenticação | `MCP_AUTH_TOKEN` (Bearer, 32 ou mais caracteres, via `StaticTokenVerifier`) passou a ser obrigatório. Sem token só é aceito em loopback com opt-in | ✅ Sem token ou token curto: o servidor não sobe. Sem `Authorization` ou com token errado: **401**. Com o token: **200** |
+| 2 | `get_pending_updates` cortado em 60 s (WSUS é lento) | Parâmetro `max_seconds=300` | ✅ Funciona (12 s no lab) |
+| 3 | `load_dotenv()` buscava a partir do pacote (quebrava instalação por wheel) | `find_dotenv(usecwd=True)`, mais `WINRM_ENV_FILE` | ✅ Com cwd sem `.env`: não carrega. Com `WINRM_ENV_FILE`: carrega |
+| 4 | `get_cbs_log_errors` sem limite de leitura (logs de vários GB estouravam o prazo) | Leitura em blocos de 4 MB, só a cauda de `max_mb_per_file` (256) e orçamento de `max_seconds` (120), com resultado **parcial** em vez de erro | ✅ Com 50 MB: `TailOnly`. Com 15 s: `Partial=true` e `FilesNotRead` listados |
+| 5 | `validate_cbs` dava "saudável" quando uma verificação falhava | Falha vira **Atenção**, `complete=false`, evidência "Verificação incompleta" e erro bruto nos detalhes | ✅ Falha simulada: Atenção, `complete=false` |
+| 6 | `-MaxEvents` cortava totais em silêncio | `truncated`/`capped_logs`/`OldestRead` e uma nota explicando que os totais são limite inferior | ✅ Com limite 10/2 forçado: sinalizado |
+| 7 | Credenciais enviadas a qualquer host com allowlist vazia (risco de prompt injection) | **Allowlist obrigatória (fail-closed)**, com curingas; `*` só por opt-in | ✅ Bloqueia `evil.example.com`, outro domínio e allowlist vazia; aceita `*.familia.local` |
+| 8 | `.env.example` fixava `WINRM_PORT=5986` (quebrava `WINRM_SSL=false`) | Porta comentada; o padrão segue o SSL | ✅ |
+| 9 | O `RunDism` em `PS_HELPERS` inflava todos os scripts e empurrava tools para o `_ps_long` | Movido para `PS_DISM`, injetado só nas 2 tools de DISM | ✅ `get_cbs_health` OK |
+| 10 | `get_time_sync_status` duplicava o `get_time_config` | Removido (agora são **48 tools**) | ✅ |
+
+## 8. Limitações dos testes
 
 - **Cluster e NIC Teaming** foram validados só no caminho "não existe", porque o servidor não tem essas configurações. Os caminhos positivos foram implementados pelos cmdlets oficiais, mas **não foram exercitados**.
 - Os testes foram feitos **contra o próprio servidor** (loopback). Um teste contra um segundo servidor validará firewall, certificado e NTLM entre máquinas.

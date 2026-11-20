@@ -62,13 +62,16 @@ Copie `.env.example` para `.env` e preencha (o `.env` está no `.gitignore`):
 | `WINRM_USER` / `WINRM_PASSWORD` | (obrigatório) | Credencial (`DOMINIO\usuario` ou `usuario@dominio`) |
 | `WINRM_TRANSPORT` | `ntlm` | `ntlm` · `kerberos` · `credssp` · `basic` |
 | `WINRM_SSL` | `true` | `true` = HTTPS; `false` = HTTP |
-| `WINRM_PORT` | `5986` (SSL) / `5985` | Porta do WinRM |
+| `WINRM_PORT` | `5986` (SSL) / `5985` | Só defina para porta não padrão. Se ficar comentada, a porta segue o `WINRM_SSL` |
 | `WINRM_VALIDATE_CERT` | `validate` | `ignore` **só em laboratório** |
-| `WINRM_ALLOWED_HOSTS` | (vazio = qualquer) | Allowlist de servidores, separada por vírgula |
+| `WINRM_ALLOWED_HOSTS` | **(obrigatória)** | Allowlist separada por vírgula, com curingas (`*.dominio.local,srv01`). **Vazia = nenhum host** (fail-closed). `*` libera tudo: use só conscientemente |
+| `WINRM_ENV_FILE` | (vazio) | Caminho explícito do `.env`, se ele não estiver no diretório de trabalho |
 | `MCP_TRANSPORT` | `stdio` | `stdio` (Claude Code/Desktop) · `http` (deploy remoto) |
 | `MCP_HOST` / `MCP_PORT` | `127.0.0.1` / `8000` | Endereço no modo `http` |
+| `MCP_AUTH_TOKEN` | (vazio) | **Obrigatório no modo `http`**: token Bearer com 32 ou mais caracteres |
+| `MCP_ALLOW_INSECURE_LOOPBACK` | `false` | `true` permite `http` sem token, **somente em loopback** (testes) |
 
-O `.env` é lido do **diretório de trabalho** do processo. Por isso o Claude usa `uv --directory <pasta do projeto>`.
+O `.env` é lido do **diretório de trabalho** do processo (por isso o Claude usa `uv --directory <pasta do projeto>`) ou do caminho em `WINRM_ENV_FILE`.
 
 ## Instalação e execução
 
@@ -76,7 +79,9 @@ O `.env` é lido do **diretório de trabalho** do processo. Por isso o Claude us
 cd C:\mcp\windows_rca_mcp
 uv sync
 uv run windows-rca-mcp                       # stdio
-$env:MCP_TRANSPORT='http'; uv run windows-rca-mcp   # HTTP em 127.0.0.1:8000/mcp
+# HTTP em 127.0.0.1:8000/mcp (exige token)
+$env:MCP_TRANSPORT='http'; $env:MCP_AUTH_TOKEN = (uv run python -c "import secrets;print(secrets.token_urlsafe(32))")
+uv run windows-rca-mcp
 ```
 
 Teste rápido de uma tool pela linha de comando:
@@ -106,11 +111,12 @@ Depois é só pedir em linguagem natural, por exemplo: *"faça um health check d
 ## Deploy em outro ambiente
 
 1. Copie a pasta (sem `.venv` e `.env`), ou gere o pacote com `uv build` e instale o `.whl`.
-2. Crie o `.env` do ambiente, com uma conta de serviço própria, `WINRM_VALIDATE_CERT=validate` e `WINRM_ALLOWED_HOSTS` preenchido.
-3. Para uso compartilhado, rode em modo HTTP (`MCP_TRANSPORT=http`, `MCP_HOST=0.0.0.0`) **atrás de um proxy com TLS e autenticação**. O endpoint HTTP não tem autenticação própria.
-4. Registre no cliente: `claude mcp add --transport http windows-ops https://<host>/mcp`.
+2. Crie o `.env` do ambiente, com uma conta de serviço própria, `WINRM_VALIDATE_CERT=validate` e `WINRM_ALLOWED_HOSTS` preenchido. O `.env` precisa estar no diretório de onde o serviço é iniciado; senão, aponte `WINRM_ENV_FILE` para ele.
+3. Para uso compartilhado, rode em modo HTTP (`MCP_TRANSPORT=http`) com **`MCP_AUTH_TOKEN`** definido; sem token o servidor não inicia. Se expor fora do host (`MCP_HOST=0.0.0.0`), coloque **TLS na frente** (proxy reverso), porque o token trafega no cabeçalho `Authorization`.
+4. Registre no cliente, enviando o token:
+   `claude mcp add --transport http windows-ops https://<host>/mcp --header "Authorization: Bearer <token>"`.
 
-## Catálogo de tools (49)
+## Catálogo de tools (48)
 
 Todas recebem `host` (nome ou FQDN do servidor alvo).
 
@@ -118,6 +124,8 @@ Todas recebem `host` (nome ou FQDN do servidor alvo).
 - **Event Viewer:** só **Crítico (1), Erro (2) e Aviso (3)**. Informativos ficam de fora, a não ser que `levels=[4]` seja pedido explicitamente.
 - **Período padrão: `days=1`** (último dia) em todas as tools de log: `get_events`, `get_event_summary`, `get_reboot_and_crash_history`, `get_service_failures`, `get_windows_update_history`, `get_update_error_analysis`, `get_cbs_log_errors`, `validate_cbs`, `get_applied_gpos`, `get_failed_logons` e `get_cluster_health`. Para analisar mais dias, informe `days` (máximo 90).
 - **Logs de servicing** (CBS.log, CbsPersist_*.log, dism.log): mesma regra. São lidas só as linhas Error/Warning e as Info com HRESULT de falha, "Cannot repair" ou "corrupt", dentro do período. Mensagens repetidas são **agrupadas** (números normalizados) e os HRESULTs mais frequentes vêm com dica. Arquivos `.cab` compactados são ignorados.
+- **Leitura limitada.** O `get_cbs_log_errors` lê no máximo os últimos `max_mb_per_file` MB de cada arquivo (padrão 256) e para em `max_seconds` (padrão 120). Nesse caso devolve **resultado parcial** (`Partial=true`, `FilesNotRead`), em vez de falhar.
+- **Limites sinalizados.** O `get_event_summary` lê até 20.000 eventos por log e o `get_failed_logons` até 5.000. Se o limite for atingido, a resposta traz `truncated`/`Truncated=true`, informando que os totais são um limite inferior.
 - O `get_event_summary` cobre System, Application e Setup. Com `include_operational=true`, inclui também GroupPolicy, WindowsUpdateClient, TaskScheduler, RDS, SMBClient, Time-Service, FailoverClustering e DNS-Client.
 
 ### Triagem rápida
@@ -201,7 +209,6 @@ Todas recebem `host` (nome ou FQDN do servidor alvo).
 | `get_failed_logons` | Eventos 4625 agrupados por conta + IP, com o motivo traduzido |
 | `get_security_posture` | Defender, firewall, RDP |
 | `get_time_config` | **Configuração NTP completa**: tipo (NT5DS/NTP), servidores, intervalos, fonte, stratum, último sync, peers, papel no domínio, VMICTimeProvider e **offset medido**, com status OK/Atenção/Crítico |
-| `get_time_sync_status` | w32time: fonte e status (versão rápida) |
 | `get_expiring_certificates` | Certificados vencidos ou próximos do vencimento |
 
 ### Prompts
@@ -210,9 +217,10 @@ Todas recebem `host` (nome ou FQDN do servidor alvo).
 
 ## Segurança
 
-- **Somente leitura.** Única exceção: as tools grandes (`get_disk_usage_tree`) enviam o script em pedaços para um arquivo temporário em `%TEMP%` no alvo, executam e apagam o arquivo.
+- **Somente leitura.** Única exceção: quando o script passa do limite de cerca de 8 KB da linha de comando do WinRM (por exemplo `get_disk_usage_tree`, `get_cluster_health`, `get_cbs_log_errors`), ele é enviado em pedaços para um arquivo temporário `%TEMP%\mcp_*.b64` no alvo, executado e apagado.
 - **Validação de entradas**: hostname, nomes, filtros e caminhos passam por regex que bloqueia aspas, `;`, `|`, `$` etc. Números são forçados para `int` e limitados.
-- **Allowlist** (`WINRM_ALLOWED_HOSTS`) para restringir os servidores alvo.
+- **Allowlist obrigatória (fail-closed).** A credencial só é enviada a hosts que estejam em `WINRM_ALLOWED_HOSTS`. Isso impede que texto malicioso em eventos, logs ou linhas de comando induza o modelo a autenticar num host do atacante.
+- **Modo HTTP autenticado.** O servidor não inicia em `http` sem `MCP_AUTH_TOKEN` (a não ser em loopback com opt-in explícito). Requisições sem o token Bearer correto recebem `401`.
 - **Prazo total por tool.** Se o prazo estourar, o shell WinRM remoto é fechado, o que encerra o `powershell.exe` e os processos filhos no servidor. A tool devolve `{"error": "RemoteTimeout..."}` e nada fica órfão.
 - **DISM protegido.** As tools de CBS não iniciam o DISM se já houver outro em execução, e o encerram se ele passar do limite. Isso evita fila de DISM travados.
 - Use **HTTPS com certificado válido** (`WINRM_VALIDATE_CERT=validate`) fora do laboratório e uma conta de serviço de menor privilégio. Nunca versione o `.env`.
