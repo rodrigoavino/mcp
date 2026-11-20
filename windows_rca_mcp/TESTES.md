@@ -230,7 +230,12 @@ Resultado no lab (uptime 0,2 h): 6 parados, 2 suspeitos e 4 esperados. O `Invent
 
 **Mudança de contrato:** a tool agora devolve um objeto (`suspicious`, `expected_names`, contagens) em vez de uma lista. `stopped_auto_services` do `get_health_summary` também mudou de formato.
 
-## 10. Limitações dos testes
+## 10. Regressão completa das 49 tools (revisão 5)
+Depois das mudanças do PR 3 rodei a bateria inteira contra o servidor de teste: **61 chamadas, 49 tools, 58 aprovadas e os 3 casos negativos rejeitados corretamente** (host inválido, caminho com aspas, host fora da allowlist). Tempo total 413 s; as mais lentas são as esperadas: `get_largest_folders` (101 s) e `get_largest_files` (100 s), alternativas em PowerShell puro, e `get_component_store_analysis` (61 s, DISM). Incluí os casos novos: `get_stopped_auto_services` (com e sem `include_expected`), `get_local_groups` (todos os grupos e filtrado por `Administrators`) e os dois modos do `validate_cbs`/`get_cbs_log_errors`.
+
+Atenção ao comparar tempos: nesta rodada `get_cbs_log_errors` e `validate_cbs` levaram ~1,3 s **nos dois modos**, mais rápido que os 2,5 s e 12 s da seção 8. Isso não é ganho de código: depois do reboot os logs do CBS estão bem menores. O ganho de código está na seção 8, medido com o `CbsPersist` de 617 MB.
+
+## 11. Limitações dos testes
 
 - **Cluster e NIC Teaming** foram validados só no caminho "não existe", porque o servidor não tem essas configurações. Os caminhos positivos foram implementados pelos cmdlets oficiais, mas **não foram exercitados**.
 - Os testes foram feitos **contra o próprio servidor** (loopback). Um teste contra um segundo servidor validará firewall, certificado e NTLM entre máquinas.

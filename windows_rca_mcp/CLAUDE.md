@@ -75,5 +75,5 @@ uv run python teste.py get_health_summary host=fastmcp.familia.local  # uma tool
 - [x] `get_local_groups`: campos vazios como `null` e origem do membro por SID (PR 3).
 - [x] MCP recarregado com as 49 tools; PR 1 fechado e branches antigos apagados.
 - [ ] Mesclar o PR 3 (https://github.com/rodrigoavino/mcp/pull/3).
-- [ ] Lab: remover o DNS 10.10.0.1 do servidor. (Os SIDs `S-1-5-21-439607407-*` de Domain Admins/Users agora resolvem como `FAMILIA\...`: eram só o DC fora do ar.)
-- [ ] Rodar a bateria completa de regressão contra as 49 tools depois do merge do PR 3 (a última cobriu 48 e antes da classificação de serviços).
+- [ ] Lab: **avaliar o DNS secundário 10.10.0.1** (é um servidor válido, decisão do usuário; mas não resolve `familia.local`: com o DC fora do ar o cliente cai nele e recebe "não existe"). Opções: manter, trocar por um 2º DC, ou DC com encaminhador e só o DC no cliente. (Os SIDs `S-1-5-21-439607407-*` de Domain Admins/Users agora resolvem como `FAMILIA\...`: eram só o DC fora do ar.)
+- [x] Bateria completa de regressão das 49 tools (PR 3): 58 ok + 3 negativos rejeitados.
