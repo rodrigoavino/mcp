@@ -44,15 +44,35 @@ Resultado real do teste com esse exemplo (servidor de teste, fonte lida em 2026-
 
 Note o escopo: essa página é de **SQL Server em VMs do Azure**; a ferramenta avisa, e quem interpreta precisa dizer isso ao usuário.
 
+## Quando consultar (e quando NÃO)
+
+A consulta externa é o **último** recurso. Antes de chamar qualquer tool deste MCP:
+
+1. O dado já existe no servidor? **Use o coletor** (`windows-ops`).
+2. O dado pertence à baseline do projeto? **Use a baseline.**
+3. O item é conhecimento Windows conhecido? **Responda sem consulta externa.**
+4. A pergunta fala de **recomendação, suporte, compatibilidade ou boa prática**? **Só o item 4 autoriza consulta externa.**
+
+Inventário, configuração, serviços, usuários, grupos, discos, eventos, SIDs, RIDs e status operacionais **nunca** disparam pesquisa externa.
+
+O código impõe isso: toda tool que pode sair para a internet **exige `intent`** (`recommendation`, `support`, `compatibility` ou `best_practice`). Sem `intent`, ou com pedido de inventário/status ou de SID/RID, a tool **recusa antes de qualquer requisição** e devolve o checklist acima. As responsabilidades 1 a 3 são do chamador; o código só consegue verificar a intenção declarada e o tipo de pedido.
+
+### Consulta externa o mínimo possível
+- **Cache em disco primeiro:** páginas por 7 dias, buscas por 1 dia (`MS_DOCS_CACHE_DIR`, `MS_DOCS_PAGE_TTL_DAYS`, `MS_DOCS_SEARCH_TTL_DAYS`; no máximo 400 arquivos por tipo). Repetir uma pergunta custa **zero** requisição.
+- **Busca progressiva:** 1ª passada com 1 consulta e até 6 páginas, escolhidas pelo título e pela descrição que a própria busca já devolveu; só se não houver resposta amplia (todas as consultas e até 24 páginas, depois fora do domínio). No `validate_configuration` só para quando há uma **recomendação explícita**: evidência sem valor não basta.
+- **Transparência:** toda resposta traz `network` (requisições de busca, de página, acertos de cache, se a rede era permitida).
+- **`cache_only=true` e `MS_DOCS_OFFLINE=true`** nunca saem: se o cache não responde, devolvem `needs_network` (sem a frase "não encontrei"), e quem decide repetir sem `cache_only` é o chamador.
+- Medido: pergunta do DNS a frio = 1 busca e 6 páginas; SQL Server + cluster (caso difícil) a frio = 3 buscas e 24 páginas; **repetida = 0**.
+
 ## Tools
 
 | Tool | O que faz |
 |---|---|
-| `validate_configuration` | **Principal.** Pergunta genérica + valor observado + `context` coletado → evidência com recomendação literal, força (`requirement`, `recommendation`, `avoid`) e fonte. `search_hints` (até 2) acrescenta termos só para a **busca**, porque a busca do Learn é fraca |
-| `ground_in_microsoft_docs` | Busca no Learn (1 a 3 consultas), **lê as páginas** e só devolve as que têm um trecho com os termos principais |
-| `search_microsoft_docs` | Só localiza candidatas. **Não é evidência** (em teste trouxe Power Platform para consulta de DNS) |
-| `get_microsoft_doc` | Lê uma página de fonte permitida; caminho para `support`, `techcommunity`, `aka.ms` e `github.com/microsoft`, que não têm busca aqui |
-| `verify_claim_in_microsoft_docs` | Confere se os termos de uma afirmação aparecem na página. Valor específico (número, IP, código) ausente derruba para `sem suporte` |
+| `validate_configuration` | **Principal.** Exige `intent`. Pergunta genérica + valor observado + `context` coletado → evidência com recomendação literal, força (`requirement`, `recommendation`, `avoid`) e fonte. `search_hints` (até 2) acrescenta termos só para a **busca**, porque a busca do Learn é fraca |
+| `ground_in_microsoft_docs` | Exige `intent`. Busca no Learn (1 a 3 consultas), **lê as páginas** e só devolve as que têm um trecho com os termos principais |
+| `search_microsoft_docs` | Exige `intent`. Só localiza candidatas. **Não é evidência** (em teste trouxe Power Platform para consulta de DNS) |
+| `get_microsoft_doc` | Exige `intent`. Lê uma página de fonte permitida; caminho para `support`, `techcommunity`, `aka.ms` e `github.com/microsoft`, que não têm busca aqui |
+| `verify_claim_in_microsoft_docs` | Exige `intent`. Confere se os termos de uma afirmação aparecem na página. Valor específico (número, IP, código) ausente derruba para `sem suporte` |
 
 Prompt: `microsoft_grounded_answer(question)` traz a regra de governança.
 
@@ -115,6 +135,9 @@ claude mcp add microsoft-docs --scope user -- uv --directory C:\mcp\microsoft_do
 | BM25 sintético | bloco com termo raro (3,03) pesa mais que blocos só com termos comuns (0,92 a 1,02) |
 | Contexto obrigatório: página do comando `format` (fala de unidade de alocação, não de SQL Server) | rejeitada |
 | `verify_claim`: "sempre usar 8.8.8.8 como DNS alternativo" | `sem suporte` (`8.8.8.8` ausente da página) |
+| Porta de entrada (13 casos): perguntas de recomendação, suporte, compatibilidade e boa prática; inventário de usuários, grupos, serviços, discos e eventos; "o que é o RID 512"; "significado do SID S-1-5-32-544"; sem `intent`; `intent` inválido | os 5 casos de recomendação/suporte/compatibilidade/boa prática autorizados; os 8 restantes recusados, sem nenhuma requisição |
+| Pelo cliente MCP: `intent` no esquema das 5 tools; inventário; RID com `intent` válido | `intent` obrigatório nas 5; inventário e RID recusados com 0 requisições; chamada sem `intent` rejeitada na validação |
+| Cache: pergunta repetida; `cache_only` com cache; `cache_only` sem cache; `MS_DOCS_OFFLINE=true`; consulta com IP | repetida = 0 requisições; com cache responde; sem cache devolve `needs_network` com 0 requisições; offline idem; IP recusado antes de qualquer requisição |
 
 Defeitos achados e corrigidos nos testes:
 1. a validação aceitava páginas irrelevantes por termos genéricos (corte por termos principais);
@@ -122,7 +145,8 @@ Defeitos achados e corrigidos nos testes:
 3. o corte de páginas lidas descartava a página da última consulta (resultados intercalados);
 4. o termo de contexto era dispensável (agora obrigatório);
 5. **`matches_observed` dava `true` para 4 KB**, o padrão do disco temporário citado entre parênteses na mesma frase (valores entre parênteses e "default" saem de `recommendation`);
-6. afirmação inventada saía como `parcial` (valor específico ausente derruba para `sem suporte`).
+6. afirmação inventada saía como `parcial` (valor específico ausente derruba para `sem suporte`);
+7. a busca progressiva parava na 1ª página que passava no portão, mesmo sem trazer a recomendação (o SQL Server voltou `rec=None`): agora só para com recomendação explícita.
 
 ## Limitações
 
