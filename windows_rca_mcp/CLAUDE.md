@@ -3,7 +3,7 @@
 MCP (FastMCP) de **OPS para Windows Server**. Serve para o Claude triar incidentes, fazer health check e RCA em servidores remotos via **WinRM HTTPS 5986**. Documentação completa em `README.md`, resultados de teste em `TESTES.md`.
 
 ## Regras do projeto (decididas pelo usuário)
-- **Somente leitura.** Nenhuma tool executa comando arbitrário nem altera o servidor alvo. Única exceção: o arquivo temporário em `%TEMP%` usado por `_ps_long`, que é apagado em seguida.
+- **Somente leitura.** Nenhuma tool executa comando arbitrário nem altera o servidor alvo. Única exceção: nenhuma. O `_ps_long` envia o script pelo stdin, sem arquivo temporário no alvo.
 - **Logs com foco em problema.** No Event Viewer, só Crítico(1), Erro(2) e Aviso(3).
 - **Período padrão `days=1`** em toda tool que lê log (Event Viewer, CBS/CbsPersist/dism.log, GPO, logons, cluster). Só amplie se o usuário pedir; `_days()` limita a 90.
 - Logs grandes (CBS) são **agrupados** (mensagens normalizadas + top HRESULTs com dica), nunca devolvidos crus.
@@ -17,13 +17,15 @@ MCP (FastMCP) de **OPS para Windows Server**. Serve para o Claude triar incident
 - Idioma: português (docstrings, mensagens, README).
 
 ## Arquitetura
-- `src/windows_rca_mcp/server.py`: todas as tools (48) e os prompts (`ops_health_check`, `root_cause_analysis`).
+- `src/windows_rca_mcp/server.py`: todas as tools (49) e os prompts (`ops_health_check`, `root_cause_analysis`).
 - `src/windows_rca_mcp/__init__.py`: `main()`. `MCP_TRANSPORT=stdio` (padrão) ou `http` (`MCP_HOST`/`MCP_PORT`).
 - `src/windows_rca_mcp/diskscan.cs`: scanner de disco em C#, compilado no alvo via `Add-Type` (`get_disk_usage_tree`).
 - Execução remota:
   - `_run_ps`: abre o shell WinRM e aplica **prazo total real**. Ao estourar, fecha o shell, o que encerra os processos remotos.
   - `_ps`: injeta `$ErrorActionPreference='Stop'` + `PS_HELPERS` + o script + `exit 0`, e devolve JSON (datas ISO, `_flatten_dates`).
-  - Se o script passar de ~8 KB, `_ps` delega para `_ps_long` (envio em blocos).
+  - Se o script passar de ~8 KB, ele vai pelo **stdin** do powershell.exe (`_run_ps(via_stdin=True)`); `_ps_long` é só um atalho para isso.
+- **Busca em arquivos de texto/logs grandes:** nunca use `-match` por linha em centenas de MB (medido: 17 s por 617 MB). Padrão do projeto: pré-filtro `String.IndexOf` ordinal em blocos de 16 MB, busca binária de data para pular o que está fora do período, classificação regex só nas candidatas, e **dois modos** (`rapida`/`detalhada`) com `Coverage`/`Recommendation` quando parcial.
+- **Event Viewer:** `Get-WinEvent` renderiza a mensagem de todo evento (7,7 s para 319 eventos do TaskScheduler; `EventLogReader` fez o mesmo em 28 ms). Use `PS_EV` (`Ev`, `Desc`) e `_xpath()`; só chame `Desc` nas amostras. Log inexistente lança exceção: use try/catch e registre em `skipped_logs`.
 - `PS_HELPERS` (injetado em todo script):
   - `$ProgressPreference` silencioso;
   - saída em UTF-8;
@@ -67,3 +69,9 @@ uv run python teste.py get_health_summary host=fastmcp.familia.local  # uma tool
 ## Git
 - Repositório em `C:\mcp` (remoto `rodrigoavino/mcp`), branch `main`. Branch `baseline` (commit `11d920e`) criado só para abrir um PR de revisão; pode ser apagado depois.
 - Novas mudanças: usar um branch de feature, para o `/code-review ultra` funcionar sem argumentos.
+
+## Pendências (retomar)
+- [ ] **Melhorar `get_stopped_auto_services`**: classificar cada serviço parado como "esperado" ou "suspeito" e mostrar só os suspeitos por padrão. Critérios (lidos de `HKLM\SYSTEM\CurrentControlSet\Services\<nome>`): `DelayedAutostart` (atraso), subchave `TriggerInfo` (gatilho) e `ExitCode`. Esperado = tem gatilho, ou atraso e uptime curto. Suspeito = automático sem atraso e sem gatilho, ou `ExitCode` diferente de 0. No lab: `GoogleUpdaterService*` e `GoogleUpdaterInternalService*` seriam suspeitos; `AppXSvc`, `edgeupdate`, `RemoteRegistry` e `sppsvc` esperados; `InventorySvc` esperado só nas primeiras horas após o boot. Reaproveitar a mesma classificação no `get_health_summary` (hoje ele lista todos os parados).
+- [ ] Reiniciar o Claude Code para carregar as 49 tools; commit, push e PR do branch `feat/cbs-busca-otimizada`.
+- [ ] Limpar os branches `baseline` e `fix/ultrareview-pr1`, fechar o PR 1.
+- [ ] Lab: remover o DNS 10.10.0.1 do servidor; conferir os SIDs de domínio não resolvidos em Administradores/Users (`get_local_groups`).

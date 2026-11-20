@@ -1,7 +1,7 @@
 # Relatório de testes: windows-rca-mcp v0.2.0
 
 **Data:** 19/11/2026 · **Executado por:** Claude Code (bateria automatizada via `fastmcp.Client` em memória + `teste.py`)
-**Resultado:** ✅ **48/48 tools aprovadas** (revisão 3, após Ultrareview; versão anterior: 49/49), 2/2 prompts registrados, 3/3 casos negativos rejeitados corretamente.
+**Resultado:** ✅ **49/49 tools aprovadas** (revisão 4: busca otimizada e `get_local_groups`; a bateria completa da revisão 4 cobriu 48 e o `get_local_groups` foi testado à parte), 2/2 prompts registrados, 3/3 casos negativos rejeitados corretamente.
 
 ## 1. Ambiente de teste
 
@@ -199,7 +199,29 @@ Todos os 10 achados foram aceitos e corrigidos.
 | 9 | O `RunDism` em `PS_HELPERS` inflava todos os scripts e empurrava tools para o `_ps_long` | Movido para `PS_DISM`, injetado só nas 2 tools de DISM | ✅ `get_cbs_health` OK |
 | 10 | `get_time_sync_status` duplicava o `get_time_config` | Removido (agora são **48 tools**) | ✅ |
 
-## 8. Limitações dos testes
+## 8. Busca otimizada em logs e Event Viewer (revisão 4)
+Pedido: pesquisa o mais rápida possível nos arquivos de texto (CBS e demais) e no Event Viewer, com busca **rápida** e **detalhada**. O `validate_cbs` levava mais de 1 minuto.
+
+**Onde estava o tempo (medido no servidor de teste):** `get_cbs_log_errors` gastava 29 s lendo um `CbsPersist` de 617 MB com `-match` por linha (uma regex com alternativas de literais levou 17 s só nesse arquivo). No Event Viewer, `Get-WinEvent` renderiza a mensagem de todo evento: 7,7 s para 319 eventos do TaskScheduler, contra 28 ms com `EventLogReader`.
+
+| Mudança | Antes | Depois |
+|---|---|---|
+| `get_cbs_log_errors` modo `rapida` (novo padrão, só erros, últimos 128 MB/arquivo) | ~35 s | **2,5 s** |
+| `get_cbs_log_errors` modo `detalhada` (erros + avisos + Failed/Missing, cobertura total, 617 MB) | não existia | **12 a 17 s** |
+| `validate_cbs` (3 coletas em paralelo; `log_mode`) | >60 s | **2,6 s** (rápida) / **11,7 s** (detalhada) |
+| `get_event_summary` 30 dias + logs operacionais | 16 s | **1,4 s** |
+| `get_event_summary` 30 dias incluindo Informação | 5,2 s e **erro** (log sem metadados) | **1,4 s**, sem erro |
+| `get_health_summary` (CPU em 1 s com contador bruto; eventos via leitor rápido) | 9,1 s | **4,7 s** |
+| `get_failed_logons` | 1,0 s | 0,8 s (campos por posição, sem `ToXml`) |
+| Scripts grandes (stdin em vez de arquivo temporário) | vários processos | 1 processo, nada gravado no servidor |
+
+Qualidade da busca: no modo rápido a resposta diz `Coverage='parcial'` e recomenda a busca detalhada com tempo estimado; o ruído conhecido (`IIS-HttpErrors`, `CorruptedFileRepair`, linhas `Appl: DetectUpdate`) deixou de contar como problema. Um log inexistente (ex.: FailoverClustering em servidor sem cluster) agora vai para `skipped_logs`. CPU conferida sob carga: 54% (fórmula nova) contra 55% (`Get-Counter`).
+
+Nova tool **`get_local_groups`** (49 tools): 27 grupos locais, membros com SID, origem e estado da conta, achados. Testada em 1,4 s. Achado real no lab: os membros `S-1-5-21-439607407-...-512` (Domain Admins) em Administradores e `...-513` (Domain Users) em Users **não resolvem**, e o `Get-LocalGroupMember` falha com erro 1789; o `get_local_groups` contorna isso por ADSI. Esses SIDs podem ser de um domínio anterior (o servidor já teve outro nome); vale conferir.
+
+**Regressão completa:** 58 chamadas, 55 aprovadas e os 3 casos negativos rejeitados corretamente (host inválido, caminho com aspas, host fora da allowlist). A bateria rodou antes do `get_local_groups` existir; ele foi testado à parte.
+
+## 9. Limitações dos testes
 
 - **Cluster e NIC Teaming** foram validados só no caminho "não existe", porque o servidor não tem essas configurações. Os caminhos positivos foram implementados pelos cmdlets oficiais, mas **não foram exercitados**.
 - Os testes foram feitos **contra o próprio servidor** (loopback). Um teste contra um segundo servidor validará firewall, certificado e NTLM entre máquinas.
