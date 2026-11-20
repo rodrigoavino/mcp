@@ -158,7 +158,7 @@ Todas recebem `host` (nome ou FQDN do servidor alvo).
 | Tool | O que faz |
 |---|---|
 | `get_services` | Lista com filtros (nome/wildcard, estado, tipo de início) |
-| `get_stopped_auto_services` | Serviços automáticos parados |
+| `get_stopped_auto_services` | Serviços automáticos parados, **só fatos** por serviço: estado, código de saída (e o específico), conta, início atrasado (`Delayed`), início por gatilho (`Trigger`) e se nunca iniciou desde o boot (código 1077, que não é falha). Sinais: `failedExitCode` (diferente de 0 e de 1077) e `transitionalState` (diferente de `Stopped`). **Não** classifica como esperado ou suspeito: o estado esperado de cada serviço é interpretação do RAG |
 | `get_service_failures` | Falhas do Service Control Manager (eventos 70xx) |
 | `get_server_roles` | **Roles instaladas em hierarquia** (role → role services), features e estado dos serviços das roles principais (AD DS, DNS, DHCP, IIS, Hyper-V, Cluster, DFS, RDS, WSUS, AD CS…) |
 | `get_roles_and_features` | Lista plana de roles e features (inclui as não instaladas com `only_installed=false`) |
@@ -215,7 +215,7 @@ Todas recebem `host` (nome ou FQDN do servidor alvo).
 | `get_scheduled_tasks` | Tarefas (fora de `\Microsoft\`) com último resultado em hex. `only_failed=True` por padrão |
 | `get_user_sessions` | Sessões logadas (console/RDP), estado e tempo ocioso |
 | `get_local_admins` | Membros do grupo Administradores local (pelo SID, independe do idioma) |
-| `get_local_groups` | **Todos os grupos locais e seus membros**: SID, descrição, tipo e origem de cada membro, estado das contas locais (habilitada, último logon, senha) e achados (grupos privilegiados, SIDs não resolvidos, senha que nunca expira). Funciona mesmo com o DC inacessível. Filtro por `group` |
+| `get_local_groups` | **Todos os grupos locais e seus membros**: SID, descrição, tipo e origem de cada membro (`Local`, `Interno (BUILTIN)`, `Sistema (NT AUTHORITY)`, `Domínio`, `Azure AD`, `Externo`), estado das contas locais (habilitada, último logon, senha) e **sinais** (só fatos): SIDs não resolvidos, principais de domínio/Azure AD no Administrators, contas locais habilitadas com senha que nunca expira, contas desabilitadas como membros, grupos vazios. Funciona mesmo com o DC inacessível. Não classifica nada como "privilegiado". Filtro por `group` |
 | `get_failed_logons` | Eventos 4625 agrupados por conta + IP, com o motivo traduzido |
 | `get_security_posture` | Defender, firewall, RDP |
 | `get_time_config` | **Configuração NTP completa**: tipo (NT5DS/NTP), servidores, intervalos, fonte, stratum, último sync, peers, papel no domínio, VMICTimeProvider e **offset medido**, com status OK/Atenção/Crítico |

@@ -44,7 +44,7 @@
 | 8 | get_event_summary | ✅ | 1,4 s | *Corrigido* (erro de parser no original) |
 | 9 | get_reboot_and_crash_history | ✅ | 1,8 s | |
 | 10 | get_services | ✅ | 1,2 s | |
-| 11 | get_stopped_auto_services | ✅ | 1,0 s | 5 serviços (todos com ExitCode 0, ou seja, normal) |
+| 11 | get_stopped_auto_services | ✅ | 1,6 s | Revisão 5: só fatos e sinais. 7 serviços parados no lab (4 com gatilho, 3 de início atrasado, 2 sem nenhum dos dois), todos com ExitCode 0; `failedExitCode` e `transitionalState` vazios |
 | 12 | get_service_failures | ✅ | 1,2 s | |
 | 13 | get_server_roles | ✅ | 2,8 s | Hierarquia role → role services |
 | 14 | get_roles_and_features | ✅ | 2,5 s | |
@@ -217,7 +217,7 @@ Pedido: pesquisa o mais rápida possível nos arquivos de texto (CBS e demais) e
 
 Qualidade da busca: no modo rápido a resposta diz `Coverage='parcial'` e recomenda a busca detalhada com tempo estimado; o ruído conhecido (`IIS-HttpErrors`, `CorruptedFileRepair`, linhas `Appl: DetectUpdate`) deixou de contar como problema. Um log inexistente (ex.: FailoverClustering em servidor sem cluster) agora vai para `skipped_logs`. CPU conferida sob carga: 54% (fórmula nova) contra 55% (`Get-Counter`).
 
-Nova tool **`get_local_groups`** (49 tools): 27 grupos locais, membros com SID, origem e estado da conta, achados. Testada em 1,4 s. Achado real no lab: os membros `S-1-5-21-439607407-...-512` (Domain Admins) em Administradores e `...-513` (Domain Users) em Users **não resolvem**, e o `Get-LocalGroupMember` falha com erro 1789; o `get_local_groups` contorna isso por ADSI. Esses SIDs podem ser de um domínio anterior (o servidor já teve outro nome); vale conferir.
+Nova tool **`get_local_groups`** (49 tools): 27 grupos locais, membros com SID, origem e estado da conta, achados. Testada em 1,4 s. Achado real no lab: os membros `S-1-5-21-439607407-...-512` (Domain Admins) em Administradores e `...-513` (Domain Users) em Users **não resolvem**, e o `Get-LocalGroupMember` falha com erro 1789; o `get_local_groups` contorna isso por ADSI. **Correção:** depois que o controlador de domínio voltou, os mesmos SIDs passaram a resolver como `FAMILIA\\Domain Admins` e `FAMILIA\\Domain Users`; o motivo era o DC fora do ar, não um domínio anterior.
 
 **Regressão completa:** 58 chamadas, 55 aprovadas e os 3 casos negativos rejeitados corretamente (host inválido, caminho com aspas, host fora da allowlist). A bateria rodou antes do `get_local_groups` existir; ele foi testado à parte.
 
@@ -266,3 +266,27 @@ Duas tools novas do coletor (53 tools), só com fatos e sinais objetivos: `get_s
 | `low_free_pct=500` | limitado a 99 |
 
 **Não validado:** (1) a detecção de **disco dinâmico** foi testada só com dados sintéticos, porque o laboratório não tem disco dinâmico; os critérios (MBR 0x42, GUIDs LDM, Logical Disk Manager no WMI) estão confirmados na documentação, mas a leitura real desses campos num disco dinâmico não foi exercitada; (2) o caminho **com BitLocker instalado** foi testado só com dados sintéticos, porque o recurso não existe no servidor de teste; (3) o mapeamento de BitLocker é por letra de unidade.
+
+## Anexo C. Serviços e grupos locais: só fatos e sinais (revisão 5)
+Pedido: o coletor só coleta; classificações e recomendações ficam no RAG. Este anexo cobre `get_stopped_auto_services` e `get_local_groups` (substitui o PR 3, que classificava serviços como "suspeito" e "esperado").
+
+| Mudança | Detalhe |
+|---|---|
+| `get_stopped_auto_services` | Devolve, por serviço, estado, `ExitCode`, `SvcExitCode`, conta, `Delayed`, `Trigger`, `never_started_since_boot`, `failed_exit_code`, `transitional_state`. **Sem** `Classification`, `Reason`, `Severity`, `suspicious` nem `expected` |
+| `get_health_summary` | Usa os mesmos fatos; só `failed_exit_code` ou `transitional_state` mudam o status de Serviços (como já era para código de saída diferente de 0). O código 1077 deixa de contar como falha |
+| `get_local_groups` | `findings` com severidade foi substituído por `signals` (só fatos). `PRIV_GROUPS` (descrições do que cada grupo "pode fazer", sem fonte) e `DOMAIN_RIDS` (rótulos de RID) foram removidos; fica o `rid` numérico |
+| Correções do `get_local_groups` | Campos de conta que não é local saem `null` (antes `{}`); a origem do membro vem do SID (`Local`, `Interno (BUILTIN)`, `Sistema (NT AUTHORITY)`, `Domínio`, `Azure AD`, `Externo`) |
+
+Fatos que o código usa e que foram **conferidos na documentação oficial** (via `microsoft-docs-mcp`):
+- código **1077** = `ERROR_SERVICE_NEVER_STARTED`, "No attempts to start the service have been made since the last boot" (*System Error Codes 1000-1299*, atualizada em 2025-07-16);
+- SID `S-1-5-32-544` (Administrators), nas páginas *Well-known SIDs* e *Security Identifiers*.
+
+**Não é consulta em tempo de execução:** listar usuários e grupos usa só o servidor (ADSI e Get-LocalUser); o coletor não faz chamada externa. A conferência acima foi feita uma vez, no desenvolvimento. Por isso a tabela de rótulos de RID (512 = Domain Admins etc.) **foi removida** do coletor: ele devolve o fato (o RID numérico em `rid`) e o significado fica com o RAG, com fonte. (Os 11 rótulos tinham sido confirmados na página *Security Identifiers*, atualizada em 2026-10-20.)
+
+| Teste | Resultado |
+|---|---|
+| Serviços sintéticos: código 1066, `StartPending`, 1077 com gatilho, atraso, sem código | sinais corretos (`failedExitCode=[a]`, `transitionalState=[b]`); nenhuma chave de classificação |
+| Servidor de teste (real) | 7 serviços parados com fatos completos, sem sinais; painel de saúde com Serviços em OK |
+| `get_local_groups` (real) | sem `findings`; `signals` com `FAMILIA\Domain Admins` no Administrators e a conta `Guest` desabilitada como membro; origem dos membros por SID |
+
+**Limite achado no RAG (não neste PR):** a busca do RAG não trouxe a página dos códigos de erro nem a dos RIDs. A causa é que tabelas viram células soltas (cada `td` é um bloco), perdendo a ligação linha/coluna. Os fatos acima foram conferidos lendo as páginas diretamente. Registrado em Pendências.

@@ -440,13 +440,48 @@ Get-WinEvent -FilterHashtable @{{LogName='System';StartTime=(Get-Date).AddDays(-
 """)
 
 
+# Serviços automáticos parados: só FATOS (estado, código de saída, início atrasado, gatilho). O coletor NÃO diz se o serviço
+# "deveria" estar parado ou rodando: o estado esperado de cada serviço é interpretação e fica no RAG (microsoft-docs), com fonte.
+PS_STOPPED_AUTO = r"""@(Get-CimInstance Win32_Service -Filter "StartMode='Auto' AND State<>'Running'" | % {
+  $k = "HKLM:\SYSTEM\CurrentControlSet\Services\$($_.Name)"; $rp = Get-ItemProperty -LiteralPath $k -ErrorAction SilentlyContinue
+  [pscustomobject]@{ Name=$_.Name; DisplayName=$_.DisplayName; State="$($_.State)"; ExitCode=$_.ExitCode
+    SvcExitCode=$_.ServiceSpecificExitCode; StartName=$_.StartName; Delayed=[bool]$rp.DelayedAutostart
+    Trigger=(Test-Path -LiteralPath "$k\TriggerInfo") } })"""
+SVC_NEVER_STARTED = 1077   # ERROR_SERVICE_NEVER_STARTED: nenhuma tentativa de iniciar desde o boot; não é falha
+
+
+def _service_facts(svcs: list) -> dict:
+    """Função pura: acrescenta a cada serviço parado os sinais objetivos derivados dos fatos. Nada é classificado."""
+    out, failed, trans = [], [], []
+    for sv in svcs:
+        code, state = sv.get("ExitCode"), sv.get("State")
+        failed_code = code not in (0, None, SVC_NEVER_STARTED)
+        transitional = state not in (None, "Stopped")
+        out.append({**sv, "never_started_since_boot": code == SVC_NEVER_STARTED, "failed_exit_code": failed_code,
+                    "transitional_state": transitional})
+        if failed_code:
+            failed.append(sv.get("Name"))
+        if transitional:
+            trans.append(sv.get("Name"))
+    return {"services": out, "signals": {"failedExitCode": failed, "transitionalState": trans}}
+
+
 @mcp.tool
 def get_stopped_auto_services(host: str):
-    """Serviços com início automático que não estão em execução."""
-    return _ps(host, r"""
-Get-CimInstance Win32_Service | ? { $_.StartMode -eq 'Auto' -and $_.State -ne 'Running' } |
-  select Name,DisplayName,State,ExitCode,StartName | ConvertTo-Json -Compress
-""")
+    """Serviços com início AUTOMÁTICO que não estão em execução, só fatos por serviço: estado, código de saída (e o
+    específico do serviço), conta, início atrasado (Delayed), início por gatilho (Trigger) e se nunca iniciou desde o boot
+    (código 1077, que não é falha). Sinais objetivos: failedExitCode (código diferente de 0 e de 1077) e
+    transitionalState (estado diferente de Stopped, ex.: StartPending). NÃO classifica o serviço como esperado ou
+    suspeito: qual é o estado esperado de cada serviço é interpretação do RAG (microsoft-docs), com fonte."""
+    res = _ps(host, r"""
+$up = [math]::Round(((Get-Date) - (Get-CimInstance Win32_OperatingSystem).LastBootUpTime).TotalHours, 1)
+[pscustomobject]@{ Host=$env:COMPUTERNAME; UptimeHours=$up; Services=__SVC__ } | ConvertTo-Json -Depth 4 -Compress
+""".replace("__SVC__", PS_STOPPED_AUTO))
+    if not isinstance(res, dict) or "Services" not in res:
+        return res
+    f = _service_facts(_lst(res.get("Services")))
+    return {"host": res.get("Host") or host, "uptime_hours": res.get("UptimeHours"),
+            "total_stopped_auto": len(f["services"]), "services": f["services"], "signals": f["signals"]}
 
 
 @mcp.tool
@@ -2347,22 +2382,24 @@ try {
 """)
 
 
-PRIV_GROUPS = {  # SID -> motivo de merecer revisão quando tem membros além do padrão
-    "S-1-5-32-544": "Administradores: controle total do servidor",
-    "S-1-5-32-551": "Backup Operators: lê qualquer arquivo e ignora ACLs",
-    "S-1-5-32-549": "Server Operators: administra serviços e compartilhamentos",
-    "S-1-5-32-548": "Account Operators: gerencia contas",
-    "S-1-5-32-550": "Print Operators: carrega drivers no servidor",
-    "S-1-5-32-578": "Hyper-V Administrators: controle total do Hyper-V",
-    "S-1-5-32-580": "Remote Management Users: acesso remoto via WinRM",
-    "S-1-5-32-555": "Remote Desktop Users: logon via RDP",
-    "S-1-5-32-562": "Distributed COM Users: ativação remota de DCOM",
-    "S-1-5-32-547": "Power Users: grupo legado com privilégios elevados",
-    "S-1-5-32-552": "Replicator",
-}
-DOMAIN_RIDS = {"500": "Administrator (domínio)", "502": "krbtgt", "512": "Domain Admins", "513": "Domain Users",
-               "514": "Domain Guests", "515": "Domain Computers", "516": "Domain Controllers", "518": "Schema Admins",
-               "519": "Enterprise Admins", "520": "Group Policy Creator Owners", "525": "Protected Users"}
+# O coletor devolve só FATOS: o SID e, em SID de domínio (S-1-5-21-...), o RID numérico. O SIGNIFICADO de um RID (ex.: 512)
+# e o que cada grupo 'pode fazer' são interpretação e ficam no RAG (microsoft-docs), com fonte. Nenhuma tabela de rótulos aqui.
+
+
+def _member_source(sid: str, is_local: bool) -> str:
+    """Origem do membro pelo SID: conta local, grupo interno, principal do sistema (NT AUTHORITY, Everyone...),
+    domínio (S-1-5-21-...) ou Azure AD (S-1-12-1-...). Antes tudo que não era local virava 'Domínio/Externo'."""
+    if is_local:
+        return "Local"
+    if sid.startswith("S-1-12-1-"):
+        return "Azure AD"
+    if sid.startswith("S-1-5-21-"):
+        return "Domínio"
+    if sid.startswith("S-1-5-32-"):
+        return "Interno (BUILTIN)"
+    if re.fullmatch(r"S-1-(1-0|2-\d+|3-\d+|5-\d{1,2}|5-(80|82|83|90|96)-[\d-]+)", sid):
+        return "Sistema (NT AUTHORITY)"
+    return "Externo"
 
 
 @mcp.tool
@@ -2370,10 +2407,11 @@ def get_local_groups(host: str, group: str | None = None, include_users: bool = 
     """TODOS os grupos locais e seus membros (independe do idioma: usa SID). Para cada grupo: nome, SID, descrição,
     se é grupo interno, e membros com tipo (usuário/grupo), origem (local/domínio/AzureAD), SID, e, para contas
     locais, estado (habilitada, último logon, senha alterada em, senha nunca expira). Resolve SIDs de domínio
-    mesmo com o DC inacessível (Get-LocalGroupMember falha com erro 1789 nesse caso) e rotula os RIDs conhecidos
-    (Domain Admins etc.). Inclui 'findings': membros em grupos privilegiados (Administradores, Backup Operators,
-    RDP, WinRM...), SIDs órfãos/não resolvidos, contas desabilitadas ou sem expiração de senha em grupos
-    privilegiados. 'group' filtra por nome; include_users=False omite a lista de contas locais.
+    mesmo com o DC inacessível (Get-LocalGroupMember falha com erro 1789 nesse caso) e devolve o RID numérico (último componente) dos SIDs S-1-5-21-...
+    de domínio (o significado do RID é do RAG). Inclui 'signals' (só fatos): SIDs não resolvidos, principais de domínio/Azure AD no grupo
+    Administradores, contas locais habilitadas com senha que nunca expira, contas desabilitadas como membros e
+    quantidade de grupos vazios. Não classifica nada como 'privilegiado' nem recomenda: isso é do RAG (microsoft-docs).
+    'group' filtra por nome; include_users=False omite a lista de contas locais.
     Em controlador de domínio não há grupos locais (use as ferramentas de AD)."""
     if group is not None and not NAME_RE.match(group):
         raise ValueError("group inválido")
@@ -2395,8 +2433,9 @@ $groups = foreach ($g in @(Get-LocalGroup -ErrorAction SilentlyContinue | ? { -n
     $local = [bool]$u -or ($sid -and $sid -match '^S-1-5-32-') -or ($path -like "$env:COMPUTERNAME/*")
     $unres = [bool]($sid -and -not (Rs $sid))
     [pscustomobject]@{ Name=$name; SID=$sid; Class=$cls; Local=$local; Unresolved=$unres
-      Enabled=$(if ($u) { $u.Enabled }); LastLogon=$(if ($u) { $u.LastLogon }); PasswordLastSet=$(if ($u) { $u.PasswordLastSet })
-      PasswordNeverExpires=$(if ($u) { [bool]($u.PasswordNeverExpires -or -not $u.PasswordExpires) }) }
+      Enabled=$(if ($u) { $u.Enabled } else { $null }); LastLogon=$(if ($u) { $u.LastLogon } else { $null })
+      PasswordLastSet=$(if ($u) { $u.PasswordLastSet } else { $null })
+      PasswordNeverExpires=$(if ($u) { [bool]($u.PasswordNeverExpires -or -not $u.PasswordExpires) } else { $null }) }
   }
   [pscustomobject]@{ Name=$g.Name; SID="$($g.SID)"; Description=$g.Description; BuiltIn=("$($g.SID)" -like 'S-1-5-32-*')
     Members=@($mem) }
@@ -2411,7 +2450,7 @@ $users = if (__U__) { @($lu.Values | sort Name | % { [pscustomobject]@{ Name=$_.
             return {"host": host, "error": "Controlador de domínio: não há grupos locais. Use ferramentas de AD."}
         return res
     groups = _lst(res.get("Groups"))
-    findings, empty = [], []
+    empty, unresolved, domain_in_admins, never_expires, disabled = [], [], [], [], []
     for g in groups:
         members = _lst(g.get("Members"))
         g["Members"] = members
@@ -2419,33 +2458,25 @@ $users = if (__U__) { @($lu.Values | sort Name | % { [pscustomobject]@{ Name=$_.
         for m in members:
             sid = m.get("SID") or ""
             rid = sid.rsplit("-", 1)[-1] if sid.startswith("S-1-5-21-") else None
-            if rid in DOMAIN_RIDS and (m.get("Unresolved") or "\\" not in (m.get("Name") or "")):
-                m["WellKnown"] = DOMAIN_RIDS[rid]
-            m["Source"] = ("Local" if m.get("Local") else "Domínio/Externo")
+            m["Rid"] = int(rid) if rid and rid.isdigit() else None
+            m["Source"] = _member_source(sid, bool(m.get("Local")))
+            ref = {"group": g["Name"], "member": m.get("Name")}
+            if m.get("Unresolved"):
+                unresolved.append({**ref, "sid": sid, "rid": m["Rid"]})
+            if g.get("SID") == "S-1-5-32-544" and m["Source"] in ("Domínio", "Azure AD"):
+                domain_in_admins.append({**ref, "source": m["Source"], "sid": sid, "rid": m["Rid"]})
+            if m.get("Enabled") is True and m.get("PasswordNeverExpires"):
+                never_expires.append(ref)
+            if m.get("Enabled") is False:
+                disabled.append(ref)
         if not members:
             empty.append(g["Name"])
-        why = PRIV_GROUPS.get(g.get("SID"))
-        for m in members:
-            tag = f"{g['Name']}: {m.get('Name')}"
-            if m.get("Unresolved"):
-                findings.append({"severity": "Atenção", "group": g["Name"], "member": m.get("Name"),
-                                 "issue": "SID não resolvido (conta removida ou DC inacessível)"
-                                          + (f"; RID de {m['WellKnown']}" if m.get("WellKnown") else "")})
-            if why and g["SID"] == "S-1-5-32-544" and m.get("Local") is False:
-                findings.append({"severity": "Info", "group": g["Name"], "member": m.get("Name"),
-                                 "issue": "Principal de domínio com administração local" + (f" ({m['WellKnown']})" if m.get("WellKnown") else "")})
-            if why and m.get("Enabled") is True and m.get("PasswordNeverExpires") and g["SID"] in ("S-1-5-32-544", "S-1-5-32-551", "S-1-5-32-549"):
-                findings.append({"severity": "Atenção", "group": g["Name"], "member": m.get("Name"),
-                                 "issue": "Conta local privilegiada com senha que nunca expira"})
-            if why and m.get("Enabled") is False:
-                findings.append({"severity": "Info", "group": g["Name"], "member": m.get("Name"),
-                                 "issue": "Conta desabilitada dentro de grupo privilegiado"})
-        if why and members and g["SID"] != "S-1-5-32-544":
-            findings.append({"severity": "Info", "group": g["Name"], "issue": f"{len(members)} membro(s) em grupo privilegiado ({why})"})
     return {"host": host, "computer": res.get("Computer"), "group_count": len(groups),
             "groups": [g for g in groups if g["Members"] or group],
             "empty_groups": empty, "local_users": _lst(res.get("Users")),
-            "findings": findings or ["Nenhum achado relevante."]}
+            "signals": {"unresolvedSids": unresolved, "domainPrincipalsInLocalAdministrators": domain_in_admins,
+                        "enabledLocalAccountsPasswordNeverExpires": never_expires, "disabledAccountsAsMembers": disabled,
+                        "emptyGroupCount": len(empty)}}
 
 
 LOGON_SUBSTATUS = {
@@ -2534,7 +2565,7 @@ $last = Get-HotFix | ? InstalledOn | sort InstalledOn -desc | select -first 1
   Disks=@(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ? Size | select DeviceID,
     @{n='SizeGB';e={[math]::Round($_.Size/1GB,1)}},@{n='FreeGB';e={[math]::Round($_.FreeSpace/1GB,1)}},
     @{n='FreePct';e={[math]::Round(100*$_.FreeSpace/$_.Size,1)}})
-  StoppedAuto=@(Get-CimInstance Win32_Service -Filter "StartMode='Auto' AND State<>'Running'" | select Name,DisplayName,ExitCode)
+  StoppedAuto=__SVC__
   RebootCBS=(Test-Path "$k\Component Based Servicing\RebootPending")
   RebootWU=(Test-Path "$k\WindowsUpdate\Auto Update\RebootRequired")
   PendingXml=(Test-Path "$env:SystemRoot\WinSxS\pending.xml")
@@ -2543,7 +2574,7 @@ $last = Get-HotFix | ? InstalledOn | sort InstalledOn -desc | select -first 1
   Error24h=(@(Ev 'System' '__XE__' 5000).Count + @(Ev 'Application' '__XE__' 5000).Count)
   Unexpected7d=@(Ev 'System' '__XU__' | ? { $_.Id -eq 6008 -or $_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' }).Count
 } | ConvertTo-Json -Depth 3 -Compress
-""".replace("__XC__", _xpath(levels=[1], days=1)).replace("__XE__", _xpath(levels=[2], days=1))
+""".replace("__SVC__", PS_STOPPED_AUTO).replace("__XC__", _xpath(levels=[1], days=1)).replace("__XE__", _xpath(levels=[2], days=1))
        .replace("__XU__", _xpath(ids=[41, 6008], days=7)), timeout=120)
     if not isinstance(d, dict) or "Host" not in d:
         return d
@@ -2571,10 +2602,11 @@ $last = Get-HotFix | ? InstalledOn | sort InstalledOn -desc | select -first 1
         elif fp <= disk_warn_pct:
             flag("Disco", "Atenção", f"{dk['DeviceID']} com {fg} GB livres ({fp}%)")
     flag("Serviços", "OK")
-    failed = [s for s in _lst(d.get("StoppedAuto")) if s.get("ExitCode") not in (0, None)]
+    svc = _service_facts(_lst(d.get("StoppedAuto")))
+    failed = [x for x in svc["services"] if x["failed_exit_code"] or x["transitional_state"]]
     if failed:
-        flag("Serviços", "Atenção", "automáticos parados com erro: " +
-             ", ".join(f"{s['Name']} (exit {s['ExitCode']})" for s in failed[:10]))
+        flag("Serviços", "Atenção", "automáticos parados com código de saída de falha ou em estado transitório: " +
+             ", ".join(f"{x['Name']} ({x['State']}, exit {x['ExitCode']})" for x in failed[:10]))
     flag("Patches", "OK")
     dp = d.get("DaysSincePatch")
     if dp is None:
@@ -2603,7 +2635,7 @@ $last = Get-HotFix | ? InstalledOn | sort InstalledOn -desc | select -first 1
         "metrics": {k: d.get(k) for k in ("CpuPct", "MemUsedPct", "MemCommitPct", "UptimeDays", "LastBoot",
                                           "DaysSincePatch", "LastHotfix", "Critical24h", "Error24h", "Unexpected7d")},
         "disks": _lst(d.get("Disks")),
-        "stopped_auto_services": _lst(d.get("StoppedAuto")),
+        "stopped_auto_services": svc["services"], "stopped_auto_signals": svc["signals"],
         "next_steps": "Aprofunde áreas não-OK: validate_cbs, get_event_summary, get_top_processes, "
                       "get_disk_usage_tree, get_service_failures.",
     }
