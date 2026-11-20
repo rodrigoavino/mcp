@@ -211,6 +211,40 @@ def _count(term: str, low: str) -> int:
     return low.count(_stem(term))
 
 
+MAX_SPAN = 250  # caracteres: os termos principais de um trecho têm de aparecer JUNTOS (mesma frase ou frases vizinhas)
+
+
+def _positions(term: str, low: str) -> list[int]:
+    if len(term) < 5:
+        return [m.start() for m in re.finditer(r"(?<![a-z0-9])" + re.escape(term) + r"(?![a-z0-9])", low)]
+    st, out, i = _stem(term), [], 0
+    while (i := low.find(st, i)) != -1:
+        out.append(i)
+        i += 1
+    return out
+
+
+def near(found: list[str], low: str, max_span: int = MAX_SPAN) -> bool:
+    """Os termos (já encontrados no trecho) aparecem dentro de uma janela de 'max_span' caracteres? Evita aceitar um
+    trecho em que 'page' e 'file' estão em frases sem relação ('32k database page size' ... 'file'). Com menos de
+    2 termos não há o que aproximar."""
+    if len(found) < 2:
+        return True
+    pts = sorted((pos, t) for t in found for pos in _positions(t, low))
+    need, have, lo = len(set(found)), {}, 0
+    for hi, (pos, t) in enumerate(pts):
+        have[t] = have.get(t, 0) + 1
+        while len(have) == need:
+            if pos - pts[lo][0] <= max_span:
+                return True
+            lt = pts[lo][1]
+            have[lt] -= 1
+            if not have[lt]:
+                del have[lt]
+            lo += 1
+    return False
+
+
 # ---------- Fase 1: domínios, BM25 e limites ----------
 # Princípio: o mínimo necessário para responder com evidência. A pergunta é classificada em domínios e só páginas do
 # Learn cujo CAMINHO pertence a esses domínios são lidas primeiro; se nenhuma servir, amplia e AVISA (scope_widened).
@@ -533,12 +567,13 @@ def score_blocks(doc: dict, tlist: list[str]) -> list[dict]:
         hits = [t for t in tlist if _has(t, low)]
         if hits:
             out.append({"i": i, "section": head, "text": text, "terms_found": hits,
-                        "coverage": len(hits) / len(tlist), "strong_coverage": sum(1 for t in st if t in hits) / len(st)})
+                        "coverage": len(hits) / len(tlist), "strong_coverage": sum(1 for t in st if t in hits) / len(st),
+                        "near": near([t for t in st if t in hits], low)})
     return out
 
 
 def passes(p: dict, min_coverage: float, min_strong: float) -> bool:
-    return p["coverage"] >= min_coverage and p["strong_coverage"] >= min_strong
+    return p["coverage"] >= min_coverage and p["strong_coverage"] >= min_strong and p.get("near", True)
 
 
 def _cite(doc: dict) -> dict:
