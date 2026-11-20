@@ -158,7 +158,7 @@ Todas recebem `host` (nome ou FQDN do servidor alvo).
 | Tool | O que faz |
 |---|---|
 | `get_services` | Lista com filtros (nome/wildcard, estado, tipo de início) |
-| `get_stopped_auto_services` | Serviços automáticos parados |
+| `get_stopped_auto_services` | Serviços automáticos parados, **separados em suspeitos e esperados**. Esperado = tem gatilho (o Windows liga sob demanda) ou é de início atrasado com boot recente. Suspeito = travado em estado transitório, saiu com erro (`Severity='erro'`) ou automático sem atraso e sem gatilho (`'revisar'`). `include_expected=True` detalha os esperados |
 | `get_service_failures` | Falhas do Service Control Manager (eventos 70xx) |
 | `get_server_roles` | **Roles instaladas em hierarquia** (role → role services), features e estado dos serviços das roles principais (AD DS, DNS, DHCP, IIS, Hyper-V, Cluster, DFS, RDS, WSUS, AD CS…) |
 | `get_roles_and_features` | Lista plana de roles e features (inclui as não instaladas com `only_installed=false`) |

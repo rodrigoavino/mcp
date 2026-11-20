@@ -71,7 +71,7 @@ uv run python teste.py get_health_summary host=fastmcp.familia.local  # uma tool
 - Novas mudanças: usar um branch de feature, para o `/code-review ultra` funcionar sem argumentos.
 
 ## Pendências (retomar)
-- [ ] **Melhorar `get_stopped_auto_services`**: classificar cada serviço parado como "esperado" ou "suspeito" e mostrar só os suspeitos por padrão. Critérios (lidos de `HKLM\SYSTEM\CurrentControlSet\Services\<nome>`): `DelayedAutostart` (atraso), subchave `TriggerInfo` (gatilho) e `ExitCode`. Esperado = tem gatilho, ou atraso e uptime curto. Suspeito = automático sem atraso e sem gatilho, ou `ExitCode` diferente de 0. No lab: `GoogleUpdaterService*` e `GoogleUpdaterInternalService*` seriam suspeitos; `AppXSvc`, `edgeupdate`, `RemoteRegistry` e `sppsvc` esperados; `InventorySvc` esperado só nas primeiras horas após o boot. Reaproveitar a mesma classificação no `get_health_summary` (hoje ele lista todos os parados).
+- [x] `get_stopped_auto_services` classifica suspeitos x esperados (branch `feat/servicos-suspeitos`, aguardando PR).
 - [ ] Reiniciar o Claude Code para carregar as 49 tools; commit, push e PR do branch `feat/cbs-busca-otimizada`.
 - [ ] Limpar os branches `baseline` e `fix/ultrareview-pr1`, fechar o PR 1.
 - [ ] Lab: remover o DNS 10.10.0.1 do servidor; conferir os SIDs de domínio não resolvidos em Administradores/Users (`get_local_groups`).

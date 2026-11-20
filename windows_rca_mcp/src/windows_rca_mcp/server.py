@@ -440,13 +440,69 @@ Get-WinEvent -FilterHashtable @{{LogName='System';StartTime=(Get-Date).AddDays(-
 """)
 
 
+# Coleta dos serviços automáticos parados, com os 3 sinais que separam "parado por desenho" de "suspeito":
+# início atrasado (DelayedAutostart), gatilho (subchave TriggerInfo) e código de saída.
+PS_STOPPED_AUTO = r"""@(Get-CimInstance Win32_Service -Filter "StartMode='Auto' AND State<>'Running'" | % {
+  $k = "HKLM:\SYSTEM\CurrentControlSet\Services\$($_.Name)"; $rp = Get-ItemProperty -LiteralPath $k -ErrorAction SilentlyContinue
+  [pscustomobject]@{ Name=$_.Name; DisplayName=$_.DisplayName; State="$($_.State)"; ExitCode=$_.ExitCode
+    SvcExitCode=$_.ServiceSpecificExitCode; StartName=$_.StartName; Delayed=[bool]$rp.DelayedAutostart
+    Trigger=(Test-Path -LiteralPath "$k\TriggerInfo") } })"""
+SVC_NEVER_STARTED = 1077   # ERROR_SERVICE_NEVER_STARTED: "não iniciou desde o boot"; não é falha
+SVC_BOOT_GRACE_H = 0.5     # serviços de início atrasado têm até 30 min após o boot para subir
+
+
+def _classify_services(svcs: list, uptime_hours: float) -> dict:
+    """Separa serviços automáticos parados em 'suspeito' (merece atenção) e 'esperado' (parado por desenho).
+    Esperado: tem gatilho (o Windows liga sob demanda) ou é de início atrasado com boot recente.
+    Suspeito: travado em estado transitório, saiu com erro, ou automático sem atraso e sem gatilho."""
+    suspicious, expected = [], []
+    for sv in svcs:
+        code, state = sv.get("ExitCode"), sv.get("State")
+        if state not in (None, "Stopped"):
+            kind, why, sev = "suspeito", f"travado em '{state}'", "erro"
+        elif code not in (0, None, SVC_NEVER_STARTED):
+            extra = f" (código específico {sv.get('SvcExitCode')})" if code == 1066 else ""
+            kind, why, sev = "suspeito", f"saiu com erro {code}{extra}", "erro"
+        elif sv.get("Trigger"):
+            kind, why, sev = "esperado", "início por gatilho: o Windows liga sob demanda", None
+        elif sv.get("Delayed") and uptime_hours < SVC_BOOT_GRACE_H:
+            kind, why, sev = "esperado", "início atrasado e o boot é recente", None
+        elif sv.get("Delayed"):
+            kind, why, sev = ("suspeito", f"início atrasado, parado {uptime_hours:.1f} h após o boot e sem gatilho "
+                              "(pode ter concluído a tarefa e encerrado)", "revisar")
+        else:
+            kind, why, sev = "suspeito", "automático sem atraso e sem gatilho: deveria estar rodando", "revisar"
+        item = {**sv, "Classification": kind, "Reason": why}
+        if sev:
+            item["Severity"] = sev
+        (suspicious if kind == "suspeito" else expected).append(item)
+    suspicious.sort(key=lambda x: (x["Severity"] != "erro", x["Name"].lower()))
+    return {"suspicious": suspicious, "expected": expected}
+
+
 @mcp.tool
-def get_stopped_auto_services(host: str):
-    """Serviços com início automático que não estão em execução."""
-    return _ps(host, r"""
-Get-CimInstance Win32_Service | ? { $_.StartMode -eq 'Auto' -and $_.State -ne 'Running' } |
-  select Name,DisplayName,State,ExitCode,StartName | ConvertTo-Json -Compress
-""")
+def get_stopped_auto_services(host: str, include_expected: bool = False):
+    """Serviços com início AUTOMÁTICO que não estão em execução, separados em SUSPEITOS e ESPERADOS.
+    Esperado = parado por desenho (tem gatilho e o Windows liga sob demanda, ou é de início atrasado e o boot é
+    recente). Suspeito = travado em estado transitório, saiu com erro, ou automático sem atraso e sem gatilho.
+    Cada item traz Classification, Reason e, nos suspeitos, Severity ('erro' ou 'revisar'). Por padrão lista só
+    os suspeitos; include_expected=True detalha também os esperados."""
+    res = _ps(host, r"""
+$up = [math]::Round(((Get-Date) - (Get-CimInstance Win32_OperatingSystem).LastBootUpTime).TotalHours, 1)
+[pscustomobject]@{ Host=$env:COMPUTERNAME; UptimeHours=$up; Services=__SVC__ } | ConvertTo-Json -Depth 4 -Compress
+""".replace("__SVC__", PS_STOPPED_AUTO))
+    if not isinstance(res, dict) or "Services" not in res:
+        return res
+    c = _classify_services(_lst(res.get("Services")), res.get("UptimeHours") or 0)
+    out = {"host": res.get("Host") or host, "uptime_hours": res.get("UptimeHours"),
+           "total_stopped_auto": len(c["suspicious"]) + len(c["expected"]),
+           "suspicious_count": len(c["suspicious"]), "expected_count": len(c["expected"]),
+           "suspicious": c["suspicious"] or "Nenhum serviço automático parado de forma suspeita."}
+    if include_expected:
+        out["expected"] = c["expected"]
+    else:
+        out["expected_names"] = [x["Name"] for x in c["expected"]]
+    return out
 
 
 @mcp.tool
@@ -1999,13 +2055,14 @@ $last = Get-HotFix | ? InstalledOn | sort InstalledOn -desc | select -first 1
 [pscustomobject]@{
   Host=$env:COMPUTERNAME; OS=$os.Caption; LastBoot=$os.LastBootUpTime
   UptimeDays=[math]::Round(((Get-Date)-$os.LastBootUpTime).TotalDays,1)
+  UptimeHours=[math]::Round(((Get-Date)-$os.LastBootUpTime).TotalHours,1)
   CpuPct=$cpuPct
   MemUsedPct=[math]::Round(100-100*$os.FreePhysicalMemory/$os.TotalVisibleMemorySize,1)
   MemCommitPct=$mem.PercentCommittedBytesInUse
   Disks=@(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ? Size | select DeviceID,
     @{n='SizeGB';e={[math]::Round($_.Size/1GB,1)}},@{n='FreeGB';e={[math]::Round($_.FreeSpace/1GB,1)}},
     @{n='FreePct';e={[math]::Round(100*$_.FreeSpace/$_.Size,1)}})
-  StoppedAuto=@(Get-CimInstance Win32_Service -Filter "StartMode='Auto' AND State<>'Running'" | select Name,DisplayName,ExitCode)
+  StoppedAuto=__SVC__
   RebootCBS=(Test-Path "$k\Component Based Servicing\RebootPending")
   RebootWU=(Test-Path "$k\WindowsUpdate\Auto Update\RebootRequired")
   PendingXml=(Test-Path "$env:SystemRoot\WinSxS\pending.xml")
@@ -2014,7 +2071,7 @@ $last = Get-HotFix | ? InstalledOn | sort InstalledOn -desc | select -first 1
   Error24h=(@(Ev 'System' '__XE__' 5000).Count + @(Ev 'Application' '__XE__' 5000).Count)
   Unexpected7d=@(Ev 'System' '__XU__' | ? { $_.Id -eq 6008 -or $_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' }).Count
 } | ConvertTo-Json -Depth 3 -Compress
-""".replace("__XC__", _xpath(levels=[1], days=1)).replace("__XE__", _xpath(levels=[2], days=1))
+""".replace("__SVC__", PS_STOPPED_AUTO).replace("__XC__", _xpath(levels=[1], days=1)).replace("__XE__", _xpath(levels=[2], days=1))
        .replace("__XU__", _xpath(ids=[41, 6008], days=7)), timeout=120)
     if not isinstance(d, dict) or "Host" not in d:
         return d
@@ -2042,10 +2099,15 @@ $last = Get-HotFix | ? InstalledOn | sort InstalledOn -desc | select -first 1
         elif fp <= disk_warn_pct:
             flag("Disco", "Atenção", f"{dk['DeviceID']} com {fg} GB livres ({fp}%)")
     flag("Serviços", "OK")
-    failed = [s for s in _lst(d.get("StoppedAuto")) if s.get("ExitCode") not in (0, None)]
-    if failed:
-        flag("Serviços", "Atenção", "automáticos parados com erro: " +
-             ", ".join(f"{s['Name']} (exit {s['ExitCode']})" for s in failed[:10]))
+    svc = _classify_services(_lst(d.get("StoppedAuto")), d.get("UptimeHours") or 0)
+    erro = [x for x in svc["suspicious"] if x.get("Severity") == "erro"]
+    revisar = [x for x in svc["suspicious"] if x.get("Severity") != "erro"]
+    if erro:
+        flag("Serviços", "Atenção", "automáticos parados com erro/travados: " +
+             ", ".join(f"{x['Name']} ({x['Reason']})" for x in erro[:10]))
+    if revisar:  # informativo: não muda o status da área
+        findings.append("[Info] Serviços: automáticos parados sem gatilho, para revisar: " +
+                        ", ".join(x["Name"] for x in revisar[:10]) + " (detalhes em get_stopped_auto_services)")
     flag("Patches", "OK")
     dp = d.get("DaysSincePatch")
     if dp is None:
@@ -2074,7 +2136,8 @@ $last = Get-HotFix | ? InstalledOn | sort InstalledOn -desc | select -first 1
         "metrics": {k: d.get(k) for k in ("CpuPct", "MemUsedPct", "MemCommitPct", "UptimeDays", "LastBoot",
                                           "DaysSincePatch", "LastHotfix", "Critical24h", "Error24h", "Unexpected7d")},
         "disks": _lst(d.get("Disks")),
-        "stopped_auto_services": _lst(d.get("StoppedAuto")),
+        "stopped_auto_services": {"suspicious": svc["suspicious"],
+                                  "expected_names": [x["Name"] for x in svc["expected"]]},
         "next_steps": "Aprofunde áreas não-OK: validate_cbs, get_event_summary, get_top_processes, "
                       "get_disk_usage_tree, get_service_failures.",
     }

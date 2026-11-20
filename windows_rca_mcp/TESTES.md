@@ -44,7 +44,7 @@
 | 8 | get_event_summary | ✅ | 1,4 s | *Corrigido* (erro de parser no original) |
 | 9 | get_reboot_and_crash_history | ✅ | 1,8 s | |
 | 10 | get_services | ✅ | 1,2 s | |
-| 11 | get_stopped_auto_services | ✅ | 1,0 s | 5 serviços (todos com ExitCode 0, ou seja, normal) |
+| 11 | get_stopped_auto_services | ✅ | 2,8 s | Revisão 5: classifica em suspeitos e esperados. No lab: 4 esperados por gatilho (`AppXSvc`, `edgeupdate`, `RemoteRegistry`, `sppsvc`) e 2 a revisar (`GoogleUpdaterService*`, `GoogleUpdaterInternalService*`: automáticos sem atraso e sem gatilho, ExitCode 0). Classificador também validado com casos sintéticos (erro 1066, travado em StartPending, 1077, atraso com boot recente) |
 | 12 | get_service_failures | ✅ | 1,2 s | |
 | 13 | get_server_roles | ✅ | 2,8 s | Hierarquia role → role services |
 | 14 | get_roles_and_features | ✅ | 2,5 s | |
@@ -221,7 +221,14 @@ Nova tool **`get_local_groups`** (49 tools): 27 grupos locais, membros com SID, 
 
 **Regressão completa:** 58 chamadas, 55 aprovadas e os 3 casos negativos rejeitados corretamente (host inválido, caminho com aspas, host fora da allowlist). A bateria rodou antes do `get_local_groups` existir; ele foi testado à parte.
 
-## 9. Limitações dos testes
+## 9. Serviços parados: suspeitos x esperados (revisão 5)
+`get_stopped_auto_services` deixou de listar tudo e passou a classificar com três sinais lidos do registro (`DelayedAutostart`, subchave `TriggerInfo`) e do `Win32_Service` (`ExitCode`, `State`). O código 1077 ("não iniciou desde o boot") não conta como falha. O `get_health_summary` usa a mesma classificação: só erro ou travamento muda o status da área Serviços; os "a revisar" aparecem como `[Info]`.
+
+Resultado no lab (uptime 0,2 h): 6 parados, 2 suspeitos e 4 esperados. O `InventorySvc`, que ontem aparecia parado, subiu sozinho depois do boot e saiu da lista, o que confirma que era só atraso de inicialização. Os dois do Google Updater continuam, como "automático sem atraso e sem gatilho". Eles têm ExitCode 0, então o mais provável é terem concluído a tarefa e encerrado, mas isso é uma hipótese, não foi verificado.
+
+**Mudança de contrato:** a tool agora devolve um objeto (`suspicious`, `expected_names`, contagens) em vez de uma lista. `stopped_auto_services` do `get_health_summary` também mudou de formato.
+
+## 10. Limitações dos testes
 
 - **Cluster e NIC Teaming** foram validados só no caminho "não existe", porque o servidor não tem essas configurações. Os caminhos positivos foram implementados pelos cmdlets oficiais, mas **não foram exercitados**.
 - Os testes foram feitos **contra o próprio servidor** (loopback). Um teste contra um segundo servidor validará firewall, certificado e NTLM entre máquinas.
