@@ -17,7 +17,7 @@ import fnmatch
 import json
 import os
 import re
-import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -47,6 +47,41 @@ $ProgressPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch {}
 function Msg($m, $n) { if (-not $m) { return $null }; $t = ($m -replace '\s+', ' ').Trim(); $t.Substring(0, [math]::Min($n, $t.Length)) }
 """
+
+# Leitor RÁPIDO de eventos (injetado só nas tools que leem muitos eventos). Get-WinEvent renderiza a mensagem de
+# TODO evento (medido no lab: 7,7 s para 319 eventos do TaskScheduler); EventLogReader devolve o registro cru
+# (28 ms) e a mensagem só é montada sob demanda, com Desc, para as amostras.
+# Ev: mais recentes primeiro, no máximo $m registros. Log inexistente lança exceção: use try/catch.
+PS_EV = r"""
+function Ev($l, $x, $m = 20000) {
+  $q = New-Object Diagnostics.Eventing.Reader.EventLogQuery($l, 'LogName', $x); $q.ReverseDirection = $true
+  $r = New-Object Diagnostics.Eventing.Reader.EventLogReader($q); $n = 0
+  while ($n -lt $m -and ($e = $r.ReadEvent())) { $n++; $e }
+}
+function Desc($e, $n = 300) {
+  $d = try { $e.FormatDescription() } catch { $null }
+  if (-not $d) { $d = '(sem descrição do provedor) ' + ((@($e.Properties) | % { "$($_.Value)" }) -join ' | ') }
+  Msg $d $n
+}
+"""
+
+
+def _xpath(levels=None, ids=None, provider: str | None = None, days: int | None = None) -> str:
+    """Filtro XPath do Event Log (avaliado no serviço de log). Level 4 inclui 0 (LogAlways), como o Get-WinEvent."""
+    c = []
+    if levels:
+        lv = sorted({int(x) for x in levels} | ({0} if 4 in {int(x) for x in levels} else set()))
+        c.append("(" + " or ".join(f"Level={x}" for x in lv) + ")")
+    if ids:
+        c.append("(" + " or ".join(f"EventID={int(i)}" for i in ids) + ")")
+    if provider:
+        if not NAME_RE.match(provider):
+            raise ValueError("provider inválido")
+        c.append(f"Provider[@Name='{provider}']")
+    if days:
+        c.append(f"TimeCreated[timediff(@SystemTime) <= {int(days) * 86400000}]")
+    return "*[System[" + " and ".join(c) + "]]" if c else "*"
+
 
 # Só para as tools de DISM (não é injetado em todo script, para não inflar o tamanho dos comandos).
 PS_DISM = r"""
@@ -95,19 +130,32 @@ class RemoteTimeout(Exception):
     pass
 
 
-def _run_ps(host: str, script: str, timeout: int) -> tuple[int, bytes, bytes]:
+# Script grande: o corpo vai pelo STDIN do powershell.exe (sem limite de ~8 KB da linha de comando e sem arquivo
+# temporário) e este stub curto, passado em -EncodedCommand, lê, decodifica e executa no mesmo processo.
+_STDIN_STUB = ("$ErrorActionPreference='Stop';"
+               "$c=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd().Trim()));"
+               "Invoke-Expression $c")
+_STDIN_BLOCK = 32000
+
+
+def _run_ps(host: str, script: str, timeout: int, via_stdin: bool = False) -> tuple[int, bytes, bytes]:
     """Executa PowerShell com PRAZO TOTAL real. O run_ps do pywinrm fica consultando a saída indefinidamente;
     aqui, se o prazo estourar, o shell remoto é fechado, o que encerra o powershell.exe e seus processos filhos
-    no servidor (nada fica órfão)."""
+    no servidor (nada fica órfão). via_stdin=True envia o script pelo stdin (scripts grandes, 1 só processo)."""
     import time
     from winrm.exceptions import WinRMOperationTimeoutError
 
     proto = _session(host, timeout).protocol
-    enc = base64.b64encode(script.encode("utf_16_le")).decode("ascii")
+    enc = base64.b64encode((_STDIN_STUB if via_stdin else script).encode("utf_16_le")).decode("ascii")
     shell = proto.open_shell()
     cmd = None
     try:
         cmd = proto.run_command(shell, "powershell", ["-NoProfile", "-NonInteractive", "-EncodedCommand", enc])
+        if via_stdin:
+            payload = base64.b64encode(script.encode("utf-8")).decode("ascii")
+            blocks = [payload[i:i + _STDIN_BLOCK] for i in range(0, len(payload), _STDIN_BLOCK)] or [""]
+            for i, blk in enumerate(blocks):
+                proto.send_command_input(shell, cmd, blk, end=i == len(blocks) - 1)
         deadline = time.monotonic() + int(timeout)
         out, err, code, done = [], [], 0, False
         while not done:
@@ -169,11 +217,13 @@ def _ps(host: str, script: str, timeout: int = 60):
     O 'exit 0' final evita falso erro: o powershell.exe sai com 1 quando o último comando teve um erro
     suprimido (-ErrorAction SilentlyContinue). Erros reais (terminating) interrompem antes e saem com 1."""
     full = "$ErrorActionPreference='Stop'\n" + PS_HELPERS + script + "\nexit 0"
-    # Linha de comando do cmd.exe aceita ~8 KB; base64 de UTF-16 infla ~2,7x. Acima do limite, envia em blocos.
-    if len(full) * 8 // 3 > 7500 and not script.lstrip().startswith("$f = \"$env:TEMP\\mcp_"):
-        return _ps_long(host, script, timeout)
+    # Linha de comando aceita ~8 KB e base64 de UTF-16 infla ~2,7x: acima disso o script vai pelo stdin.
+    return _exec(host, full, timeout, via_stdin=len(full) * 8 // 3 > 7500)
+
+
+def _exec(host: str, full: str, timeout: int, via_stdin: bool):
     try:
-        code, so, se = _run_ps(host, full, timeout)
+        code, so, se = _run_ps(host, full, timeout, via_stdin)
     except ValueError:
         raise
     except Exception as e:  # prazo excedido, timeout, autenticação, SSL, rede
@@ -192,30 +242,10 @@ def _ps(host: str, script: str, timeout: int = 60):
 
 
 def _ps_long(host: str, script: str, timeout: int = 300):
-    """Para scripts grandes: a linha de comando do WinRM aceita ~8 KB, então o script é enviado em pedaços
-    para um arquivo temporário em %TEMP%, executado e apagado em seguida (nada mais é alterado no servidor)."""
-    s = _session(host, 60)
-    f = rf"$env:TEMP\mcp_{uuid.uuid4().hex[:12]}.b64"
-    b64 = base64.b64encode(script.encode("utf-8")).decode()
-    try:
-        for i in range(0, len(b64), 2400):
-            try:
-                r = s.run_ps(f"Add-Content -LiteralPath \"{f}\" -Value '{b64[i:i + 2400]}' -NoNewline -Encoding ASCII")
-            except Exception as e:
-                return _conn_error(host, e)
-            if r.status_code != 0:
-                return {"error": r.std_err.decode(errors="replace")[:2000], "host": host}
-        return _ps(host, rf"""
-$f = "{f}"
-try {{ $code = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([IO.File]::ReadAllText($f))) }}
-finally {{ Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }}
-Invoke-Expression $code
-""", timeout)
-    finally:
-        try:
-            s.run_ps(f'Remove-Item -LiteralPath "{f}" -Force -ErrorAction SilentlyContinue')
-        except Exception:
-            pass
+    """Scripts grandes (ex.: scanner C# do get_disk_usage_tree): sempre via stdin, em UM processo e sem gravar
+    nada no servidor. Mesmo tratamento de erro/JSON do _ps."""
+    full = "$ErrorActionPreference='Stop'\n" + PS_HELPERS + script + "\nexit 0"
+    return _exec(host, full, timeout, via_stdin=True)
 
 
 def _ints(values) -> str:
@@ -346,23 +376,35 @@ def get_event_summary(
             raise ValueError(f"log inválido: {lg}")
     if not levels or any(int(lv) not in (1, 2, 3, 4, 5) for lv in levels):
         raise ValueError("levels deve conter valores entre 1 e 5")
-    res = _ps(host, r"""
-$since = (Get-Date).AddDays(-__D__)
-$logs = @(__LOGS__)
-$totals = @(); $groups = @(); $capped = @()
+    res = _ps(host, PS_EV + r"""
+$logs = @(__LOGS__); $xp = "__XP__"
+$lvName = @{0='Information';1='Critical';2='Error';3='Warning';4='Information';5='Verbose'}
+$totals = @(); $groups = @(); $capped = @(); $skipped = @()
+# Rápido: filtro XPath avaliado no serviço de log + EventLogReader em streaming (sem renderizar mensagens);
+# agregação em hashtable só com propriedades baratas (Level numérico, Id, ProviderName, TimeCreated).
+# A mensagem é montada (Desc) só para a amostra (evento mais recente) de cada grupo devolvido.
 foreach ($l in $logs) {
-  if (-not (Get-WinEvent -ListLog $l -ErrorAction SilentlyContinue)) { continue }
-  $ev = @(Get-WinEvent -FilterHashtable @{LogName=$l;StartTime=$since;Level=__LV__} -MaxEvents __CAP__ -ErrorAction SilentlyContinue)
-  if (-not $ev.Count) { continue }
-  if ($ev.Count -ge __CAP__) { $capped += [pscustomobject]@{ Log=$l; CappedAt=__CAP__; OldestRead=$ev[-1].TimeCreated } }
-  $totals += @($ev | group LevelDisplayName | % { [pscustomobject]@{ Log=$l; Level=$_.Name; Count=$_.Count } })
-  $groups += @($ev | group ProviderName,Id,LevelDisplayName | sort Count -desc | select -first __T__ | % {
-      $g = $_.Group | sort TimeCreated
-      [pscustomobject]@{ Log=$l; Level=$g[0].LevelDisplayName; Provider=$g[0].ProviderName; Id=$g[0].Id; Count=$_.Count
-        First=$g[0].TimeCreated; Last=$g[-1].TimeCreated; Sample=(Msg $g[-1].Message 300) } })
+  try { $q = New-Object Diagnostics.Eventing.Reader.EventLogQuery($l, 'LogName', $xp); $q.ReverseDirection = $true
+        $rd = New-Object Diagnostics.Eventing.Reader.EventLogReader($q) }
+  catch { $skipped += $l; continue }   # log inexistente/desabilitado neste servidor
+  $h = @{}; $byLv = @{}; $n = 0; $oldest = $null
+  while ($n -lt __CAP__ -and ($e = $rd.ReadEvent())) {
+    $n++; $lv = [int]$e.Level; $byLv[$lv] = 1 + [int]$byLv[$lv]; $t = $e.TimeCreated; $oldest = $t
+    $k = "$($e.ProviderName)|$($e.Id)|$lv"; $g = $h[$k]
+    # Leitura em ordem reversa: o 1o evento de cada grupo é o mais recente (amostra); os demais são liberados.
+    if (-not $g) { $h[$k] = @{ C=1; F=$t; L=$t; R=$e; P=$e.ProviderName; I=$e.Id; V=$lv } }
+    else { $g.C++; $g.F = $t; $e.Dispose() }
+  }
+  $rd.Dispose()
+  if (-not $n) { continue }
+  if ($n -ge __CAP__) { $capped += [pscustomobject]@{ Log=$l; CappedAt=__CAP__; OldestRead=$oldest } }
+  $totals += @($byLv.GetEnumerator() | % { [pscustomobject]@{ Log=$l; Level=$lvName[[int]$_.Key]; Count=$_.Value } })
+  $groups += @($h.Values | sort { $_.C } -desc | select -first __T__ | % {
+      [pscustomobject]@{ Log=$l; Level=$lvName[$_.V]; Provider=$_.P; Id=$_.I; Count=$_.C
+        First=$_.F; Last=$_.L; Sample=(Desc $_.R 300) } })
 }
-[pscustomobject]@{ Totals=$totals; Groups=$groups; Capped=$capped } | ConvertTo-Json -Depth 3 -Compress
-""".replace("__D__", str(_days(days))).replace("__LV__", _ints(levels))
+[pscustomobject]@{ Totals=$totals; Groups=$groups; Capped=$capped; Skipped=$skipped } | ConvertTo-Json -Depth 3 -Compress
+""".replace("__XP__", _xpath(levels=levels, days=_days(days)))
        .replace("__T__", str(max(1, min(int(top), 100))))
        .replace("__LOGS__", ",".join(f"'{lg}'" for lg in logs))
        .replace("__CAP__", str(EVENT_CAP)), timeout=180)
@@ -376,6 +418,8 @@ foreach ($l in $logs) {
            "truncated": bool(capped),
            "totals_by_log_level": totals,
            "groups": groups or "Nenhum evento de problema no período."}
+    if _lst(res.get("Skipped")):
+        out["skipped_logs"] = _lst(res.get("Skipped"))  # não existem/estão desabilitados neste servidor
     if capped:
         out["capped_logs"] = capped
         out["note"] = (f"Logs com mais de {EVENT_CAP} eventos no período foram cortados nos mais recentes: os totais "
@@ -655,95 +699,185 @@ SERVICING_HINTS = {
 }
 
 
+# Busca nos logs CBS/DISM em 2 estágios:
+#  1) PRÉ-FILTRO: palavras-chave procuradas com String.IndexOf ordinal em blocos de 16 MB (centenas de MB/s);
+#     só as linhas que contêm alguma palavra são montadas; o resto do arquivo nunca vira string por linha.
+#  2) CLASSIFICAÇÃO precisa (regex) só nessas linhas candidatas, descartando ruído conhecido (medido no lab):
+#     'Error' solto casa com o pacote IIS-HttpErrors; 'Corrupt' com componentes CorruptedFileRepair;
+#     'Missing' com linhas 'Appl: DetectUpdate'; 'CSI' com toda linha CSI (falha de CSI é marcada com '(F)').
+# Modo 'rapida' = só sinais de ERRO, últimos 128 MB de cada arquivo, até 20 s.
+# Modo 'detalhada' = também Warning/Failed/Missing/0x800..., período inteiro, até 300 s.
+_CBS_NEEDLES_FAST = [", Error ", "HRESULT = 0x8", "Cannot repair", "(F)", "Fatal", "orrupt"]
+CBS_SCAN_MODES = {
+    "rapida": {
+        "seconds": 20, "mb": 128, "needles": _CBS_NEEDLES_FAST,
+        "sev": r"HRESULT = 0x8|\(F\)|Cannot repair|Fatal|[Cc]orrupt",
+        "scope": "Só sinais de ERRO (nível Error, HRESULT 0x8..., Cannot repair, (F) do CSI, Fatal, corrupt).",
+    },
+    "detalhada": {
+        "seconds": 300, "mb": 4096,
+        "needles": _CBS_NEEDLES_FAST + [", Warning ", "0x800", "Failed", "failed", "Cannot ", "Missing", "MISSING"],
+        "sev": (r"HRESULT = 0x8|\(F\)|Cannot |Fatal|[Cc]orrupt|0x800|[Ff]ailed|STATUS_\w*MISSING"
+                r"|(?<![\w-])[Mm]issing(?![\w-])"),
+        "scope": "Erros + avisos (nível Warning, Failed, Missing, 0x800..., Cannot ...).",
+    },
+}
+_CBS_MODE_ALIASES = {"rapida": "rapida", "rápida": "rapida", "rapido": "rapida", "rápido": "rapida",
+                     "quick": "rapida", "fast": "rapida", "detalhada": "detalhada", "detalhado": "detalhada",
+                     "completa": "detalhada", "completo": "detalhada", "full": "detalhada", "deep": "detalhada"}
+# Ruído: linhas Info que contêm a palavra-chave mas não são falha.
+_CBS_NOISE = (r"[Nn]o (component store )?corruption|Microsoft-Windows-[\w.-]*Corrupt|Staging component"
+              r"|^Appl: |Warning: Component architecture")
+
+
+def _cbs_mode(mode: str) -> str:
+    m = _CBS_MODE_ALIASES.get(str(mode).strip().lower())
+    if not m:
+        raise ValueError("mode deve ser 'rapida' ou 'detalhada'")
+    return m
+
+
 @mcp.tool
 def get_cbs_log_errors(
     host: str,
     days: int = 1,
+    mode: str = "rapida",
     include_dism: bool = True,
     top: int = 25,
-    max_seconds: int = 120,
-    max_mb_per_file: int = 256,
+    max_seconds: int | None = None,
+    max_mb_per_file: int | None = None,
 ):
     """Problemas nos logs de servicing (CBS.log + CbsPersist_*.log e, se include_dism, dism.log) do ÚLTIMO DIA
-    (days ampliável até 90 se pedido). Considera só linhas Error/Warning e Info com HRESULT de falha (0x8...),
-    'Cannot repair' e 'corrupt'. Para otimizar a análise, AGRUPA mensagens repetidas (números normalizados),
-    conta por fonte/nível, lista os HRESULTs mais frequentes com dica e devolve só os 'top' grupos.
-    Leitura LIMITADA: de cada arquivo lê no máximo os últimos 'max_mb_per_file' MB, em blocos, e para ao atingir
-    'max_seconds', devolvendo resultado PARCIAL (Partial=true, com os arquivos/trechos não lidos) em vez de falhar.
-    Arquivos .cab compactados são ignorados."""
-    budget = max(15, min(int(max_seconds), 600))
+    (days ampliável até 90 se pedido). Busca otimizada: pré-filtro por palavras-chave (IndexOf, sem processar o
+    arquivo linha a linha), salto direto para o início do período (busca binária por data) e classificação só
+    das linhas candidatas, descartando ruído conhecido. Agrupa mensagens repetidas, conta por fonte/nível e lista
+    os HRESULTs mais frequentes com dica.
+    mode='rapida' (padrão): só sinais de ERRO, últimos 128 MB de cada arquivo, até 20 s; responde em segundos.
+    mode='detalhada': também warnings/Failed/Missing/0x800, período inteiro (até 4 GB/arquivo), até 300 s.
+    max_seconds / max_mb_per_file sobrepõem os limites do modo. Se a leitura não cobrir tudo, devolve
+    Coverage='parcial' + Recommendation com o tempo estimado da busca detalhada. Arquivos .cab são ignorados."""
+    m = _cbs_mode(mode)
+    cfg = CBS_SCAN_MODES[m]
+    budget = max(5, min(int(max_seconds if max_seconds is not None else cfg["seconds"]), 600))
+    max_mb = max(8, min(int(max_mb_per_file if max_mb_per_file is not None else cfg["mb"]), 4096))
+    needles = ",".join("'" + n + "'" for n in cfg["needles"])
     res = _ps(host, timeout=budget + 90, script=r"""
 $cutDate = (Get-Date).AddDays(-__D__); $cut = $cutDate.ToString('yyyy-MM-dd HH:mm:ss')
-$budget = __B__; $maxBytes = [int64]__MB__ * 1MB
+$budget = __B__; $maxBytes = [int64]__MB__ * 1MB; $O = [StringComparison]::Ordinal
+$needles = @(__NEEDLES__); $sev = '__SEV__'; $noise = '__NOISE__'
 $cbsDir = "$env:SystemRoot\Logs\CBS"
 $files = @(Get-ChildItem $cbsDir -Filter 'CBS.log' -File -ErrorAction SilentlyContinue)
 $files += @(Get-ChildItem $cbsDir -Filter 'CbsPersist_*.log' -File -ErrorAction SilentlyContinue | ? { $_.LastWriteTime -ge $cutDate } | sort LastWriteTime -desc)
 if (__DISM__) { $files += @(Get-ChildItem "$env:SystemRoot\Logs\DISM" -Filter 'dism*.log' -File -ErrorAction SilentlyContinue | ? { $_.LastWriteTime -ge $cutDate }) }
 $cabs = @(Get-ChildItem $cbsDir -Filter 'CbsPersist_*.cab' -File -ErrorAction SilentlyContinue | ? { $_.LastWriteTime -ge $cutDate }).Count
-$hit = '^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d, (Error|Warning) |HRESULT = 0x8|Cannot repair|[Cc]orrupt'
 $pat = '^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d), (\w+)\s+(\S+)\s+(.*)$'
-$groups = @{}; $byLevel = @{}; $hr = @{}; $stats = @(); $cr = 0; $co = 0; $total = 0; $partial = $false; $notRead = @()
+$tsRx = [regex]'(?m)^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),'
+# Timestamp da 1a linha datada a partir de $pos (lê só 64 KB).
+function TsAt($fs, [int64]$pos) {
+  [void]$fs.Seek($pos, 'Begin'); $b = New-Object byte[] 65536; $k = $fs.Read($b, 0, $b.Length)
+  $mm = $tsRx.Match([Text.Encoding]::UTF8.GetString($b, 0, $k)); if ($mm.Success) { $mm.Groups[1].Value } else { $null }
+}
+# Offset aproximado da 1a linha >= $cut (busca binária; log é cronológico). Sem data no trecho => conservador.
+function CutOffset($fs) {
+  $first = TsAt $fs 0; if (-not $first -or $first -ge $cut) { return [int64]0 }
+  $lo = [int64]0; $hi = [int64]$fs.Length
+  while ($hi - $lo -gt 1MB) { $mid = [int64][math]::Floor(($lo + $hi) / 2); $t = TsAt $fs $mid
+    if ($t -and $t -lt $cut) { $lo = $mid } else { $hi = $mid } }
+  return $lo
+}
+$groups = @{}; $byLevel = @{}; $hr = @{}; $stats = @(); $cr = 0; $co = 0; $total = 0; $cand = 0
+$partial = $false; $notRead = @(); $notReadMB = 0
 $sw = [Diagnostics.Stopwatch]::StartNew()
-$buf = New-Object char[] (4MB)
+$buf = New-Object char[] (16MB)
 foreach ($f in $files) {
-  if ($sw.Elapsed.TotalSeconds -ge $budget) { $partial = $true; $notRead += $f.Name; continue }
+  if ($sw.Elapsed.TotalSeconds -ge $budget) { $partial = $true; $notRead += $f.Name; $notReadMB += $f.Length / 1MB; continue }
   $src = if ($f.Name -like 'dism*') { 'DISM' } else { 'CBS' }; $n = 0; $stopped = $false
   $fs = [IO.File]::Open($f.FullName, 'Open', 'Read', 'ReadWrite, Delete')
-  $start = [math]::Max([int64]0, $fs.Length - $maxBytes); $tailOnly = $start -gt 0
-  [void]$fs.Seek($start, 'Begin'); $sr = New-Object IO.StreamReader($fs); $carry = ''
-  if ($tailOnly) { [void]$sr.ReadLine() }
+  $len = $fs.Length; $dateStart = CutOffset $fs
+  $start = [math]::Max($dateStart, $len - $maxBytes); $tailOnly = $start -gt $dateStart
+  [void]$fs.Seek($start, 'Begin'); $sr = New-Object IO.StreamReader($fs); $carry = ''; $readChars = [int64]0
+  if ($start -gt 0) { [void]$sr.ReadLine() }
   while ($true) {
     $read = $sr.Read($buf, 0, $buf.Length)
-    if ($read -le 0) { $lines = @($carry) ; $carry = '' }
-    else { $parts = ($carry + [string]::new($buf, 0, $read)).Split("`n"); $carry = $parts[-1]
-           $lines = if ($parts.Length -gt 1) { @($parts[0..($parts.Length - 2)]) } else { @() } }
-    $lines = @($lines)
-    foreach ($l in ($lines -match $hit)) {
-    $l = $l.TrimEnd("`r")
-    if ($l.Length -lt 19 -or $l.Substring(0,19) -lt $cut) { continue }
-    if ($l -notmatch $pat) { continue }
-    $ts = $matches[1]; $lv = $matches[2]; $comp = $matches[3]; $msg = $matches[4].Trim()
-    if ($lv -eq 'Info' -and $msg -notmatch 'HRESULT = 0x8|Cannot repair|[Cc]orrupt') { continue }
-    if ($lv -eq 'Info') { $lv = 'Info(falha)' }
-    $n++
-    if ($msg -match 'Cannot repair') { $cr++ }
-    if ($msg -match '[Cc]orrupt' -and $msg -notmatch '[Nn]o (component store )?corruption') { $co++ }
-    if ($msg -match 'HRESULT = (0x[0-9A-Fa-f]{8})(?: - (\w+))?') { $c = $matches[1].ToLower(); if (-not $hr[$c]) { $hr[$c] = @(0, $matches[2]) }; $hr[$c][0]++ }
-    $bk = "$src|$lv"; $byLevel[$bk] = 1 + [int]$byLevel[$bk]
-    $norm = ($msg -replace '\{[0-9A-Fa-f-]{36}\}', '{GUID}' -replace '(?<!0x[0-9A-Fa-f]{0,7})\d+', '#')
-    $key = "$src|$lv|" + $norm.Substring(0, [math]::Min(250, $norm.Length))
-    $g = $groups[$key]
-    if (-not $g) { $g = [pscustomobject]@{ Source=$src; Level=$lv; Component=$comp; Count=0; First=$ts; Last=$ts
-        Sample=$msg.Substring(0,[math]::Min(300,$msg.Length)) }; $groups[$key] = $g }
-    $g.Count++; if ($ts -lt $g.First) { $g.First = $ts }
-    if ($ts -gt $g.Last) { $g.Last = $ts; $g.Sample = $msg.Substring(0,[math]::Min(300,$msg.Length)) }
+    if ($read -le 0) { $s = $carry; $carry = '' }
+    else { $readChars += $read; $s = $carry + [string]::new($buf, 0, $read); $e = $s.LastIndexOf("`n")
+      if ($e -lt 0) { $carry = $s; continue }; $carry = $s.Substring($e + 1); $s = $s.Substring(0, $e + 1) }
+    # Estágio 1: pré-filtro por palavra-chave (só monta as linhas que casam).
+    $seen = New-Object 'Collections.Generic.HashSet[int]'; $lines = New-Object 'Collections.Generic.List[string]'
+    foreach ($nd in $needles) { $p = $s.IndexOf($nd, $O)
+      while ($p -ge 0) { $ls = $s.LastIndexOf("`n", $p) + 1
+        if ($seen.Add($ls)) { $le = $s.IndexOf("`n", $p); if ($le -lt 0) { $le = $s.Length }; $lines.Add($s.Substring($ls, $le - $ls)) }
+        $p = $s.IndexOf($nd, $p + 1, $O) } }
+    $cand += $lines.Count
+    # Estágio 2: classificação precisa só das candidatas.
+    foreach ($l in $lines) {
+      $l = $l.TrimEnd("`r")
+      if ($l.Length -lt 19 -or $l.Substring(0,19) -lt $cut) { continue }
+      if ($l -notmatch $pat) { continue }
+      $ts = $matches[1]; $lv = $matches[2]; $comp = $matches[3]; $msg = $matches[4].Trim()
+      if ($lv -ne 'Error' -and $lv -ne 'Warning') {
+        if ($msg -notmatch $sev -or $msg -match $noise) { continue }
+        if ($lv -eq 'Info') { $lv = 'Info(falha)' } }
+      $n++
+      if ($msg -match 'Cannot repair') { $cr++ }
+      if ($msg -match '[Cc]orrupt' -and $msg -notmatch $noise) { $co++ }
+      if ($msg -match 'HRESULT = (0x[0-9A-Fa-f]{8})(?: - (\w+))?') { $c = $matches[1].ToLower(); if (-not $hr[$c]) { $hr[$c] = @(0, $matches[2]) }; $hr[$c][0]++ }
+      $bk = "$src|$lv"; $byLevel[$bk] = 1 + [int]$byLevel[$bk]
+      $norm = ($msg -replace '\{[0-9A-Fa-f-]{36}\}', '{GUID}' -replace '(?<!0x[0-9A-Fa-f]{0,7})\d+', '#')
+      $key = "$src|$lv|" + $norm.Substring(0, [math]::Min(250, $norm.Length))
+      $g = $groups[$key]
+      if (-not $g) { $g = [pscustomobject]@{ Source=$src; Level=$lv; Component=$comp; Count=0; First=$ts; Last=$ts
+          Sample=$msg.Substring(0,[math]::Min(300,$msg.Length)) }; $groups[$key] = $g }
+      $g.Count++; if ($ts -lt $g.First) { $g.First = $ts }
+      if ($ts -gt $g.Last) { $g.Last = $ts; $g.Sample = $msg.Substring(0,[math]::Min(300,$msg.Length)) }
     }
     if ($read -le 0) { break }
     if ($sw.Elapsed.TotalSeconds -ge $budget) { $partial = $true; $stopped = $true; break }
   }
   $sr.Close()
-  $stats += [pscustomobject]@{ File=$f.Name; SizeMB=[math]::Round($f.Length/1MB,1); ProblemLines=$n
-    ReadMB=[math]::Round([math]::Min($f.Length, $maxBytes)/1MB,1); TailOnly=$tailOnly; StoppedByTime=$stopped }
+  $stats += [pscustomobject]@{ File=$f.Name; SizeMB=[math]::Round($len/1MB,1)
+    InWindowMB=[math]::Round(($len - $dateStart)/1MB,1); DateSkippedMB=[math]::Round($dateStart/1MB,1)
+    ReadMB=[math]::Round([math]::Min($len - $start, $readChars)/1MB,1)
+    ProblemLines=$n; TailOnly=$tailOnly; StoppedByTime=$stopped }
   $total += $n
 }
 [pscustomobject]@{
-  PeriodDays=__D__; Since=$cut; ScanSeconds=[math]::Round($sw.Elapsed.TotalSeconds,1)
-  Partial=$partial; FilesNotRead=$notRead; TimeBudgetSeconds=$budget; MaxMBPerFile=__MB__
-  FilesScanned=$stats; CompressedCabsSkipped=$cabs
+  Mode='__MODE__'; PeriodDays=__D__; Since=$cut; ScanSeconds=[math]::Round($sw.Elapsed.TotalSeconds,1)
+  Partial=$partial; FilesNotRead=$notRead; NotReadMB=[math]::Round($notReadMB,1); TimeBudgetSeconds=$budget; MaxMBPerFile=__MB__
+  FilesScanned=$stats; CompressedCabsSkipped=$cabs; CandidateLines=$cand
   TotalProblemLines=$total; DistinctProblems=$groups.Count; CannotRepairCount=$cr; CorruptCount=$co
   ByLevel=@($byLevel.GetEnumerator() | sort Value -desc | % { [pscustomobject]@{ Source=$_.Key.Split('|')[0]; Level=$_.Key.Split('|')[1]; Count=$_.Value } })
   TopHResults=@($hr.GetEnumerator() | sort { $_.Value[0] } -desc | select -first 15 | % { [pscustomobject]@{ Code=$_.Key; Name=$_.Value[1]; Count=$_.Value[0] } })
   TopProblems=@($groups.Values | sort Count -desc | select -first __T__)
 } | ConvertTo-Json -Depth 4 -Compress
-""".replace("__D__", str(_days(days))).replace("__DISM__", "$true" if include_dism else "$false")
+""".replace("__NEEDLES__", needles).replace("__SEV__", cfg["sev"]).replace("__NOISE__", _CBS_NOISE)
+       .replace("__MODE__", m).replace("__D__", str(_days(days)))
+       .replace("__DISM__", "$true" if include_dism else "$false")
        .replace("__T__", str(max(1, min(int(top), 100)))).replace("__B__", str(budget))
-       .replace("__MB__", str(max(8, min(int(max_mb_per_file), 4096)))))
-    if isinstance(res, dict):
+       .replace("__MB__", str(max_mb)))
+    if isinstance(res, dict) and "FilesScanned" in res:
         for h in _lst(res.get("TopHResults")):
             h["Hint"] = SERVICING_HINTS.get(h["Code"]) or WU_HINTS.get(h["Code"]) or ""
-        if res.get("Partial") or any(f.get("TailOnly") for f in _lst(res.get("FilesScanned"))):
-            res["Note"] = ("Leitura parcial: contagens são um limite inferior. Aumente max_seconds/max_mb_per_file "
-                           "se precisar de cobertura total.")
+        res["Scope"] = cfg["scope"]
+        files = _lst(res.get("FilesScanned"))
+        read_mb = sum(f.get("ReadMB") or 0 for f in files)
+        pending_mb = sum(max(0, (f.get("InWindowMB") or 0) - (f.get("ReadMB") or 0)) for f in files) \
+            + (res.get("NotReadMB") or 0)
+        if res.get("Partial") or pending_mb > 1:
+            secs = res.get("ScanSeconds") or 0
+            thr = read_mb / secs if secs > 0.5 and read_mb > 0 else 50.0  # MB/s medido nesta execução
+            est = int(round(pending_mb / thr + secs)) + 5
+            res["Coverage"] = "parcial"
+            res["Note"] = (f"Leitura parcial: {round(pending_mb, 1)} MB do período não foram lidos; "
+                           "contagens são um limite inferior.")
+            res["Recommendation"] = (f"Para cobertura total rode get_cbs_log_errors(mode='detalhada'"
+                                     f"{', days=' + str(_days(days)) if _days(days) != 1 else ''}) "
+                                     f"(estimativa ~{est} s; limite de 300 s).")
+        else:
+            res["Coverage"] = "completa"
+            if m == "rapida":
+                res["Recommendation"] = ("Busca rápida cobriu todo o período, mas só sinais de erro; "
+                                         "mode='detalhada' inclui warnings/Failed/Missing.")
     return res
 
 
@@ -977,16 +1111,20 @@ def _worst(*st: str) -> str:
 
 
 @mcp.tool
-def validate_cbs(host: str, days: int = 1):
+def validate_cbs(host: str, days: int = 1, log_mode: str = "rapida"):
     """Veredito 'o CBS está quebrado?': combina DISM /CheckHealth, flags de pending/reboot, contagens de
     'Cannot repair'/'corrupt' nos logs CBS/DISM e falhas de update com códigos típicos de corrupção.
-    Período dos logs: último dia por padrão (days ampliável até 90 se pedido).
+    As três coletas rodam EM PARALELO. Período dos logs: último dia por padrão (days ampliável até 90 se pedido).
+    log_mode='rapida' (padrão, segundos) ou 'detalhada' (cobertura total dos logs, pode levar minutos).
     Retorna status OK/Atenção/Crítico, evidências e ações recomendadas."""
-    health = get_cbs_health(host)
+    lm = _cbs_mode(log_mode)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        f_health = pool.submit(get_cbs_health, host)
+        f_log = pool.submit(get_cbs_log_errors, host, days=days, mode=lm, top=10)
+        f_upd = pool.submit(get_update_error_analysis, host, days=days)
+        health, log, upd = f_health.result(), f_log.result(), f_upd.result()
     if not isinstance(health, dict) or "error" in health:
         return {"status": "Desconhecido", "error": health}
-    log = get_cbs_log_errors(host, days=days, top=10)
-    upd = get_update_error_analysis(host, days=days)
 
     status, evid, actions = "OK", [], []
     dism = health.get("DismCheckHealth") or ""
@@ -1031,6 +1169,12 @@ def validate_cbs(host: str, days: int = 1):
             evid.append(f"CBS.log: {log['CorruptCount']} menção(ões) a 'corrupt'.")
         if log.get("Partial"):
             incomplete.append("leitura dos logs CBS/DISM foi parcial (limite de tempo); contagens são mínimas")
+        elif log.get("Coverage") == "parcial":
+            # Limite de tamanho do modo rápido: sinaliza sem rebaixar o status (não é falha de verificação).
+            evid.append(f"Logs CBS: busca {log.get('Mode')} leu o trecho mais recente; {log.get('Note')}")
+            if log.get("Recommendation"):
+                actions.append(log["Recommendation"].replace("get_cbs_log_errors(mode='detalhada'",
+                                                             "validate_cbs(log_mode='detalhada'"))
     else:
         incomplete.append(f"não foi possível ler os logs CBS/DISM: {log.get('error') if isinstance(log, dict) else log}")
 
@@ -1674,6 +1818,107 @@ try {
 """)
 
 
+PRIV_GROUPS = {  # SID -> motivo de merecer revisão quando tem membros além do padrão
+    "S-1-5-32-544": "Administradores: controle total do servidor",
+    "S-1-5-32-551": "Backup Operators: lê qualquer arquivo e ignora ACLs",
+    "S-1-5-32-549": "Server Operators: administra serviços e compartilhamentos",
+    "S-1-5-32-548": "Account Operators: gerencia contas",
+    "S-1-5-32-550": "Print Operators: carrega drivers no servidor",
+    "S-1-5-32-578": "Hyper-V Administrators: controle total do Hyper-V",
+    "S-1-5-32-580": "Remote Management Users: acesso remoto via WinRM",
+    "S-1-5-32-555": "Remote Desktop Users: logon via RDP",
+    "S-1-5-32-562": "Distributed COM Users: ativação remota de DCOM",
+    "S-1-5-32-547": "Power Users: grupo legado com privilégios elevados",
+    "S-1-5-32-552": "Replicator",
+}
+DOMAIN_RIDS = {"500": "Administrator (domínio)", "502": "krbtgt", "512": "Domain Admins", "513": "Domain Users",
+               "514": "Domain Guests", "515": "Domain Computers", "516": "Domain Controllers", "518": "Schema Admins",
+               "519": "Enterprise Admins", "520": "Group Policy Creator Owners", "525": "Protected Users"}
+
+
+@mcp.tool
+def get_local_groups(host: str, group: str | None = None, include_users: bool = True):
+    """TODOS os grupos locais e seus membros (independe do idioma: usa SID). Para cada grupo: nome, SID, descrição,
+    se é grupo interno, e membros com tipo (usuário/grupo), origem (local/domínio/AzureAD), SID, e, para contas
+    locais, estado (habilitada, último logon, senha alterada em, senha nunca expira). Resolve SIDs de domínio
+    mesmo com o DC inacessível (Get-LocalGroupMember falha com erro 1789 nesse caso) e rotula os RIDs conhecidos
+    (Domain Admins etc.). Inclui 'findings': membros em grupos privilegiados (Administradores, Backup Operators,
+    RDP, WinRM...), SIDs órfãos/não resolvidos, contas desabilitadas ou sem expiração de senha em grupos
+    privilegiados. 'group' filtra por nome; include_users=False omite a lista de contas locais.
+    Em controlador de domínio não há grupos locais (use as ferramentas de AD)."""
+    if group is not None and not NAME_RE.match(group):
+        raise ValueError("group inválido")
+    res = _ps(host, r"""
+$ErrorActionPreference = 'Continue'
+if ((Get-CimInstance Win32_ComputerSystem).DomainRole -ge 4) { [pscustomobject]@{ IsDomainController=$true } | ConvertTo-Json -Compress; return }
+$flt = '__G__'
+$lu = @{}; foreach ($u in @(Get-LocalUser -ErrorAction SilentlyContinue)) { $lu["$($u.SID)"] = $u }
+function Rs($sid) { try { (New-Object Security.Principal.SecurityIdentifier($sid)).Translate([Security.Principal.NTAccount]).Value } catch { $null } }
+$groups = foreach ($g in @(Get-LocalGroup -ErrorAction SilentlyContinue | ? { -not $flt -or $_.Name -eq $flt })) {
+  $ads = [ADSI]"WinNT://./$($g.Name),group"
+  $mem = foreach ($o in @(try { $ads.Invoke('Members') } catch {})) {
+    $t = $o.GetType(); $sid = $null
+    try { $sid = (New-Object Security.Principal.SecurityIdentifier($t.InvokeMember('objectSid','GetProperty',$null,$o,$null), 0)).Value } catch {}
+    $path = "$($t.InvokeMember('ADsPath','GetProperty',$null,$o,$null))" -replace '^WinNT://', ''
+    $cls = "$($t.InvokeMember('Class','GetProperty',$null,$o,$null))"
+    $name = if ($sid) { Rs $sid } else { $null }; if (-not $name) { $name = $path -replace '/', '\' }
+    $u = if ($sid) { $lu[$sid] } else { $null }
+    $local = [bool]$u -or ($sid -and $sid -match '^S-1-5-32-') -or ($path -like "$env:COMPUTERNAME/*")
+    $unres = [bool]($sid -and -not (Rs $sid))
+    [pscustomobject]@{ Name=$name; SID=$sid; Class=$cls; Local=$local; Unresolved=$unres
+      Enabled=$(if ($u) { $u.Enabled }); LastLogon=$(if ($u) { $u.LastLogon }); PasswordLastSet=$(if ($u) { $u.PasswordLastSet })
+      PasswordNeverExpires=$(if ($u) { [bool]($u.PasswordNeverExpires -or -not $u.PasswordExpires) }) }
+  }
+  [pscustomobject]@{ Name=$g.Name; SID="$($g.SID)"; Description=$g.Description; BuiltIn=("$($g.SID)" -like 'S-1-5-32-*')
+    Members=@($mem) }
+}
+$users = if (__U__) { @($lu.Values | sort Name | % { [pscustomobject]@{ Name=$_.Name; SID="$($_.SID)"; Enabled=$_.Enabled
+  LastLogon=$_.LastLogon; PasswordLastSet=$_.PasswordLastSet; PasswordExpires=$_.PasswordExpires
+  PasswordNeverExpires=[bool](-not $_.PasswordExpires); AccountExpires=$_.AccountExpires; Description=$_.Description } }) } else { @() }
+[pscustomobject]@{ Computer=$env:COMPUTERNAME; Groups=@($groups); Users=$users } | ConvertTo-Json -Depth 5 -Compress
+""".replace("__G__", group or "").replace("__U__", "$true" if include_users else "$false"), timeout=120)
+    if not isinstance(res, dict) or "Groups" not in res:
+        if isinstance(res, dict) and res.get("IsDomainController"):
+            return {"host": host, "error": "Controlador de domínio: não há grupos locais. Use ferramentas de AD."}
+        return res
+    groups = _lst(res.get("Groups"))
+    findings, empty = [], []
+    for g in groups:
+        members = _lst(g.get("Members"))
+        g["Members"] = members
+        g["MemberCount"] = len(members)
+        for m in members:
+            sid = m.get("SID") or ""
+            rid = sid.rsplit("-", 1)[-1] if sid.startswith("S-1-5-21-") else None
+            if rid in DOMAIN_RIDS and (m.get("Unresolved") or "\\" not in (m.get("Name") or "")):
+                m["WellKnown"] = DOMAIN_RIDS[rid]
+            m["Source"] = ("Local" if m.get("Local") else "Domínio/Externo")
+        if not members:
+            empty.append(g["Name"])
+        why = PRIV_GROUPS.get(g.get("SID"))
+        for m in members:
+            tag = f"{g['Name']}: {m.get('Name')}"
+            if m.get("Unresolved"):
+                findings.append({"severity": "Atenção", "group": g["Name"], "member": m.get("Name"),
+                                 "issue": "SID não resolvido (conta removida ou DC inacessível)"
+                                          + (f"; RID de {m['WellKnown']}" if m.get("WellKnown") else "")})
+            if why and g["SID"] == "S-1-5-32-544" and m.get("Local") is False:
+                findings.append({"severity": "Info", "group": g["Name"], "member": m.get("Name"),
+                                 "issue": "Principal de domínio com administração local" + (f" ({m['WellKnown']})" if m.get("WellKnown") else "")})
+            if why and m.get("Enabled") is True and m.get("PasswordNeverExpires") and g["SID"] in ("S-1-5-32-544", "S-1-5-32-551", "S-1-5-32-549"):
+                findings.append({"severity": "Atenção", "group": g["Name"], "member": m.get("Name"),
+                                 "issue": "Conta local privilegiada com senha que nunca expira"})
+            if why and m.get("Enabled") is False:
+                findings.append({"severity": "Info", "group": g["Name"], "member": m.get("Name"),
+                                 "issue": "Conta desabilitada dentro de grupo privilegiado"})
+        if why and members and g["SID"] != "S-1-5-32-544":
+            findings.append({"severity": "Info", "group": g["Name"], "issue": f"{len(members)} membro(s) em grupo privilegiado ({why})"})
+    return {"host": host, "computer": res.get("Computer"), "group_count": len(groups),
+            "groups": [g for g in groups if g["Members"] or group],
+            "empty_groups": empty, "local_users": _lst(res.get("Users")),
+            "findings": findings or ["Nenhum achado relevante."]}
+
+
 LOGON_SUBSTATUS = {
     "0xc000006a": "Senha incorreta",
     "0xc0000064": "Usuário não existe",
@@ -1699,12 +1944,14 @@ def get_failed_logons(host: str, days: int = 1, top: int = 25):
     """Logons com falha (evento 4625 do log Security) agrupados por conta + IP de origem, com tipo de logon e
     motivo (SubStatus traduzido). Detecta força bruta, contas de serviço com senha antiga e bloqueios.
     Requer permissão de leitura no log Security (admin local ou equivalente)."""
-    res = _ps(host, r"""
-$ev = @(Get-WinEvent -FilterHashtable @{LogName='Security';Id=4625;StartTime=(Get-Date).AddDays(-__H__)} -MaxEvents __CAP__ -ErrorAction SilentlyContinue)
+    res = _ps(host, PS_EV + r"""
+$ev = @(Ev 'Security' '__XP__' __CAP__)
+# Campos do 4625 por posição (schema fixo): 5=TargetUserName 6=TargetDomainName 7=Status 9=SubStatus
+# 10=LogonType 13=WorkstationName 18=ProcessName 19=IpAddress. Bem mais rápido que ToXml() por evento.
 $rows = foreach ($e in $ev) {
-  $d = @{}; ([xml]$e.ToXml()).Event.EventData.Data | % { $d[$_.Name] = $_.'#text' }
-  [pscustomobject]@{ Time=$e.TimeCreated; Account="$($d.TargetDomainName)\$($d.TargetUserName)"; SourceIp=$d.IpAddress
-    Workstation=$d.WorkstationName; LogonType=$d.LogonType; SubStatus=$(if ("$($d.SubStatus)" -match "^0x0+$") { "$($d.Status)".ToLower() } else { "$($d.SubStatus)".ToLower() }); Process=$d.ProcessName }
+  $p = $e.Properties; $st = '0x{0:x}' -f $p[7].Value; $ss = '0x{0:x}' -f $p[9].Value
+  [pscustomobject]@{ Time=$e.TimeCreated; Account="$($p[6].Value)\$($p[5].Value)"; SourceIp="$($p[19].Value)"
+    Workstation="$($p[13].Value)"; LogonType="$($p[10].Value)"; SubStatus=$(if ($ss -eq '0x0') { $st } else { $ss }); Process="$($p[18].Value)" }
 }
 [pscustomobject]@{
   TotalEvents=$ev.Count; Truncated=($ev.Count -ge __CAP__); OldestRead=$(if ($ev.Count) { $ev[-1].TimeCreated })
@@ -1714,7 +1961,7 @@ $rows = foreach ($e in $ev) {
       LogonTypes=(@($g.LogonType | select -unique) -join ','); SubStatus=@($g.SubStatus | select -unique)
       Process=$g[-1].Process; First=$g[0].Time; Last=$g[-1].Time } })
 } | ConvertTo-Json -Depth 4 -Compress
-""".replace("__H__", str(_days(days))).replace("__T__", str(max(1, min(int(top), 100))))
+""".replace("__XP__", _xpath(ids=[4625], days=_days(days))).replace("__T__", str(max(1, min(int(top), 100))))
        .replace("__CAP__", str(LOGON_CAP)), timeout=180)
     if isinstance(res, dict):
         for g in _lst(res.get("Groups")):
@@ -1740,16 +1987,19 @@ def get_health_summary(
     """Painel de saúde em UMA chamada: CPU, memória, discos, serviços automáticos parados, reboot pendente,
     uptime, dias sem patch, flags do CBS, eventos críticos (24h) e desligamentos inesperados (7d).
     Devolve status OK/Atenção/Crítico por área, status geral e achados. Comece a triagem por aqui."""
-    d = _ps(host, r"""
+    d = _ps(host, PS_EV + r"""
 $os = Get-CimInstance Win32_OperatingSystem
-$cpu = @(1..3 | % { (Get-CimInstance Win32_Processor | measure LoadPercentage -Average).Average; Start-Sleep -Milliseconds 700 })
+$c0 = Get-CimInstance Win32_PerfRawData_PerfOS_Processor -Filter "Name='_Total'"; Start-Sleep -Milliseconds 1000
+$c1 = Get-CimInstance Win32_PerfRawData_PerfOS_Processor -Filter "Name='_Total'"
+# CPU real no intervalo de 1 s (contador bruto: ocioso/tempo), independente do idioma; antes 3x Win32_Processor = 5 s.
+$cpuPct = [math]::Max(0, [math]::Round(100 * (1 - ($c1.PercentProcessorTime - $c0.PercentProcessorTime) / [double]([math]::Max(1, $c1.Timestamp_Sys100NS - $c0.Timestamp_Sys100NS))), 0))
 $mem = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory
 $k = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion'
 $last = Get-HotFix | ? InstalledOn | sort InstalledOn -desc | select -first 1
 [pscustomobject]@{
   Host=$env:COMPUTERNAME; OS=$os.Caption; LastBoot=$os.LastBootUpTime
   UptimeDays=[math]::Round(((Get-Date)-$os.LastBootUpTime).TotalDays,1)
-  CpuPct=[math]::Round(($cpu | measure -Average).Average,0)
+  CpuPct=$cpuPct
   MemUsedPct=[math]::Round(100-100*$os.FreePhysicalMemory/$os.TotalVisibleMemorySize,1)
   MemCommitPct=$mem.PercentCommittedBytesInUse
   Disks=@(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ? Size | select DeviceID,
@@ -1760,11 +2010,12 @@ $last = Get-HotFix | ? InstalledOn | sort InstalledOn -desc | select -first 1
   RebootWU=(Test-Path "$k\WindowsUpdate\Auto Update\RebootRequired")
   PendingXml=(Test-Path "$env:SystemRoot\WinSxS\pending.xml")
   LastHotfix=$last.HotFixID; DaysSincePatch=if ($last) { [int]((Get-Date)-$last.InstalledOn).TotalDays } else { $null }
-  Critical24h=@(Get-WinEvent -FilterHashtable @{LogName='System','Application';Level=1;StartTime=(Get-Date).AddDays(-1)} -ErrorAction SilentlyContinue).Count
-  Error24h=@(Get-WinEvent -FilterHashtable @{LogName='System','Application';Level=2;StartTime=(Get-Date).AddDays(-1)} -MaxEvents 5000 -ErrorAction SilentlyContinue).Count
-  Unexpected7d=@(Get-WinEvent -FilterHashtable @{LogName='System';Id=41,6008;StartTime=(Get-Date).AddDays(-7)} -ErrorAction SilentlyContinue | ? { $_.Id -eq 6008 -or $_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' }).Count
+  Critical24h=(@(Ev 'System' '__XC__').Count + @(Ev 'Application' '__XC__').Count)
+  Error24h=(@(Ev 'System' '__XE__' 5000).Count + @(Ev 'Application' '__XE__' 5000).Count)
+  Unexpected7d=@(Ev 'System' '__XU__' | ? { $_.Id -eq 6008 -or $_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' }).Count
 } | ConvertTo-Json -Depth 3 -Compress
-""", timeout=120)
+""".replace("__XC__", _xpath(levels=[1], days=1)).replace("__XE__", _xpath(levels=[2], days=1))
+       .replace("__XU__", _xpath(ids=[41, 6008], days=7)), timeout=120)
     if not isinstance(d, dict) or "Host" not in d:
         return d
 

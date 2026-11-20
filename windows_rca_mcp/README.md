@@ -116,7 +116,7 @@ Depois é só pedir em linguagem natural, por exemplo: *"faça um health check d
 4. Registre no cliente, enviando o token:
    `claude mcp add --transport http windows-ops https://<host>/mcp --header "Authorization: Bearer <token>"`.
 
-## Catálogo de tools (48)
+## Catálogo de tools (49)
 
 Todas recebem `host` (nome ou FQDN do servidor alvo).
 
@@ -124,7 +124,12 @@ Todas recebem `host` (nome ou FQDN do servidor alvo).
 - **Event Viewer:** só **Crítico (1), Erro (2) e Aviso (3)**. Informativos ficam de fora, a não ser que `levels=[4]` seja pedido explicitamente.
 - **Período padrão: `days=1`** (último dia) em todas as tools de log: `get_events`, `get_event_summary`, `get_reboot_and_crash_history`, `get_service_failures`, `get_windows_update_history`, `get_update_error_analysis`, `get_cbs_log_errors`, `validate_cbs`, `get_applied_gpos`, `get_failed_logons` e `get_cluster_health`. Para analisar mais dias, informe `days` (máximo 90).
 - **Logs de servicing** (CBS.log, CbsPersist_*.log, dism.log): mesma regra. São lidas só as linhas Error/Warning e as Info com HRESULT de falha, "Cannot repair" ou "corrupt", dentro do período. Mensagens repetidas são **agrupadas** (números normalizados) e os HRESULTs mais frequentes vêm com dica. Arquivos `.cab` compactados são ignorados.
-- **Leitura limitada.** O `get_cbs_log_errors` lê no máximo os últimos `max_mb_per_file` MB de cada arquivo (padrão 256) e para em `max_seconds` (padrão 120). Nesse caso devolve **resultado parcial** (`Partial=true`, `FilesNotRead`), em vez de falhar.
+- **Dois modos de busca nos logs de texto (CBS/DISM).** `get_cbs_log_errors` e `validate_cbs` aceitam `mode`/`log_mode`:
+  - `rapida` (padrão): só sinais de erro (nível Error, HRESULT 0x8..., Cannot repair, corrupt, `(F)`), últimos 128 MB de cada arquivo, até 20 s. Responde em poucos segundos.
+  - `detalhada`: também Warning, Failed, Missing, 0x800..., período inteiro, até 300 s.
+  - Como é rápido: pré-filtro por palavra-chave com `IndexOf` (sem processar linha a linha), salto direto ao início do período por busca binária de data e classificação precisa só das linhas candidatas, descartando ruído conhecido.
+  - Se a leitura não cobrir tudo, a resposta traz `Coverage='parcial'`, `Note` e uma `Recommendation` com o comando e o tempo estimado da busca detalhada.
+- **Event Viewer lido direto do log** (`EventLogReader` + filtro XPath, sem renderizar mensagens): a mensagem só é montada para a amostra de cada grupo. Logs que não existem no servidor são ignorados e listados em `skipped_logs`.
 - **Limites sinalizados.** O `get_event_summary` lê até 20.000 eventos por log e o `get_failed_logons` até 5.000. Se o limite for atingido, a resposta traz `truncated`/`Truncated=true`, informando que os totais são um limite inferior.
 - O `get_event_summary` cobre System, Application e Setup. Com `include_operational=true`, inclui também GroupPolicy, WindowsUpdateClient, TaskScheduler, RDS, SMBClient, Time-Service, FailoverClustering e DNS-Client.
 
@@ -206,6 +211,7 @@ Todas recebem `host` (nome ou FQDN do servidor alvo).
 | `get_scheduled_tasks` | Tarefas (fora de `\Microsoft\`) com último resultado em hex. `only_failed=True` por padrão |
 | `get_user_sessions` | Sessões logadas (console/RDP), estado e tempo ocioso |
 | `get_local_admins` | Membros do grupo Administradores local (pelo SID, independe do idioma) |
+| `get_local_groups` | **Todos os grupos locais e seus membros**: SID, descrição, tipo e origem de cada membro, estado das contas locais (habilitada, último logon, senha) e achados (grupos privilegiados, SIDs não resolvidos, senha que nunca expira). Funciona mesmo com o DC inacessível. Filtro por `group` |
 | `get_failed_logons` | Eventos 4625 agrupados por conta + IP, com o motivo traduzido |
 | `get_security_posture` | Defender, firewall, RDP |
 | `get_time_config` | **Configuração NTP completa**: tipo (NT5DS/NTP), servidores, intervalos, fonte, stratum, último sync, peers, papel no domínio, VMICTimeProvider e **offset medido**, com status OK/Atenção/Crítico |
@@ -217,7 +223,7 @@ Todas recebem `host` (nome ou FQDN do servidor alvo).
 
 ## Segurança
 
-- **Somente leitura.** Única exceção: quando o script passa do limite de cerca de 8 KB da linha de comando do WinRM (por exemplo `get_disk_usage_tree`, `get_cluster_health`, `get_cbs_log_errors`), ele é enviado em pedaços para um arquivo temporário `%TEMP%\mcp_*.b64` no alvo, executado e apagado.
+- **Somente leitura.** Única exceção: quando o script passa do limite de cerca de 8 KB da linha de comando do WinRM (por exemplo `get_disk_usage_tree`, `get_cluster_health`, `get_cbs_log_errors`), ele é enviado pelo **stdin** do `powershell.exe`, em um único processo e **sem gravar nada no servidor**.
 - **Validação de entradas**: hostname, nomes, filtros e caminhos passam por regex que bloqueia aspas, `;`, `|`, `$` etc. Números são forçados para `int` e limitados.
 - **Allowlist obrigatória (fail-closed).** A credencial só é enviada a hosts que estejam em `WINRM_ALLOWED_HOSTS`. Isso impede que texto malicioso em eventos, logs ou linhas de comando induza o modelo a autenticar num host do atacante.
 - **Modo HTTP autenticado.** O servidor não inicia em `http` sem `MCP_AUTH_TOKEN` (a não ser em loopback com opt-in explícito). Requisições sem o token Bearer correto recebem `401`.
