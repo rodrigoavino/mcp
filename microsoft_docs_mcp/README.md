@@ -63,6 +63,22 @@ Prompt: `microsoft_grounded_answer(question)` traz a regra de governança.
 - **Recomendação literal.** O valor sai de uma frase da página com verbo de exigência/recomendação/proibição, ou imperativa em seção de boas práticas. Valores entre parênteses ou em cláusula "default" não contam como recomendação (saem em `also_mentioned`).
 - Verificação **lexical**: termos presentes não provam o sentido. A resposta traz a frase para conferência.
 
+## O mínimo necessário (Fase 1)
+
+O objetivo não é achar mais conteúdo, e sim o mínimo que responde com evidência:
+
+```
+Pergunta → classificação em domínios → busca (25 por consulta) → filtro por caminho do domínio
+         → leitura das páginas → portão (termos principais + contexto) → ranking BM25
+         → no máximo 3 documentos e 5 trechos → resposta com fonte
+```
+
+- **Domínios** (`storage`, `sql-server`, `hyper-v`, `cluster`, `active-directory`, `dns`, `dhcp`, `networking`, `time-service`, `servicing`, `intune-m365`): a pergunta é classificada por palavras-chave e só páginas do Learn **cujo caminho pertence ao domínio** são lidas primeiro. Se nenhuma servir, o RAG **amplia e avisa** (`scope_widened: true`). O servidor de busca do Learn não tem filtro (testado: `scope`, `category` e `$filter` são ignorados), então o filtro é local. `domains` força a lista (vazia = sem restrição).
+- **BM25** sobre os trechos das páginas lidas, com IDF calculado nesse conjunto: termos que aparecem em quase todo trecho pesam pouco. Ele **ordena**; quem aceita ou rejeita continua sendo o portão (cobertura de termos, termos principais, contexto obrigatório).
+- **Limites:** `TOP_DOCS = 3`, `TOP_CHUNKS = 5`; um trecho só entra se tiver pelo menos 35% da nota do melhor (`REL_CUT`).
+- **Não foi adotado um corte fixo de 0,70:** notas de BM25, cobertura de termos e (no futuro) embeddings não são comparáveis. Os cortes aqui foram calibrados com 9 casos reais e **não** foram validados em escala.
+- **Não implementado (Fase 2):** embeddings e índice local persistente.
+
 ## Fontes permitidas (ordem de confiança)
 
 1. `learn.microsoft.com` 2. `support.microsoft.com` 3. `techcommunity.microsoft.com` 4. `github.com/microsoft` (só sob `/microsoft/`). `aka.ms` só como redirecionador: o destino final precisa ser uma das anteriores. Só HTTPS, sem usuário/porta na URL, cada redirecionamento revalidado, 3 MB por página, cache de 15 min.
@@ -90,9 +106,13 @@ claude mcp add microsoft-docs --scope user -- uv --directory C:\mcp\microsoft_do
 | Consulta com IP, e-mail, FQDN, UNC | recusadas; nome de módulo `Microsoft.PowerShell.Management` aceito |
 | Redirecionamento (`dns-top` → `dns-overview`) | seguido e revalidado |
 | `example.com` | recusado |
-| Cinco temas de disco (limite de 2 TB do MBR, GUID do LDM, DNS client, BitLocker, "disco dinâmico obsoleto") | os quatro primeiros acharam a página certa. O último ("disco dinâmico obsoleto") deu `sem evidência`, mas isso foi um **falso negativo de recuperação**: a página existe (*Convert a disk to Dynamic or Basic*, que diz que discos dinâmicos estão obsoletos e não são recomendados para novas implantações) e a busca ampla do Learn não a trazia. A Fase 1 (domínios) a recupera |
+| Cinco temas de disco (limite de 2 TB do MBR, GUID do LDM, DNS client, BitLocker, "disco dinâmico obsoleto") | **antes da Fase 1:** os quatro primeiros acharam a página certa; "disco dinâmico obsoleto" deu `sem evidência` por **falso negativo de recuperação** (a página *Convert a disk to Dynamic or Basic* existe e diz que discos dinâmicos estão obsoletos e não são recomendados para novas implantações; a busca ampla não a trazia). **Com a Fase 1:** os cinco acham a página certa |
 | SQL Server + cluster 4096, com `search_hints` | recomenda 64 KB, `matches_observed=false`, frase e fonte citadas |
-| O mesmo **sem** `search_hints` | `sem evidência` (a busca do Learn não traz a página sem termos específicos) |
+| O mesmo **sem** `search_hints` | **antes da Fase 1:** `sem evidência`. **Com a Fase 1:** acha a mesma página e recomenda 64 KB (domínios `storage` e `sql-server`, 25 candidatos por consulta); `search_hints` virou opcional |
+| Limites (6 temas) | no máximo 3 documentos e 5 trechos em todos |
+| Ampliação de escopo: BitLocker com domínio errado de propósito (`dns`) | 0 páginas no domínio; amplia (12 páginas) e acha, com `scope_widened: true` |
+| Domínio inválido; consulta sem sentido | erro claro com os domínios válidos; `sem evidência` |
+| BM25 sintético | bloco com termo raro (3,03) pesa mais que blocos só com termos comuns (0,92 a 1,02) |
 | Contexto obrigatório: página do comando `format` (fala de unidade de alocação, não de SQL Server) | rejeitada |
 | `verify_claim`: "sempre usar 8.8.8.8 como DNS alternativo" | `sem suporte` (`8.8.8.8` ausente da página) |
 
@@ -106,6 +126,8 @@ Defeitos achados e corrigidos nos testes:
 
 ## Limitações
 
-- Só o Microsoft Learn tem busca; a busca é fraca e às vezes exige `search_hints` com termos específicos. **`sem evidência` pode ser falso negativo de recuperação**: significa que não achei, não que a documentação não existe.
+- Só o Microsoft Learn tem busca; a busca é fraca e às vezes exige `search_hints` com termos específicos. **`sem evidência` pode ser falso negativo de recuperação**: significa que não achei, não que a documentação não existe (já aconteceu: o caso do disco dinâmico).
+- O catálogo de domínios é curadoria: se a página estiver fora dos caminhos previstos, o RAG só a acha na etapa ampliada (e avisa). A lista de termos genéricos (`GENERIC`) continua no portão; o BM25 só ordena.
+- Os cortes (`0,6` de cobertura, `0,75` de termos principais, `REL_CUT 0,35`) foram calibrados com poucos casos.
 - A extração de recomendação cobre **tamanhos** (KB, MB, GB, TB, bytes). Outros tipos de valor (portas, tempos, nomes de parâmetro) ainda não têm extrator: nesses casos a ferramenta devolve o trecho e diz que não há valor explícito.
 - A recomendação do exemplo vem de um documento do Azure: escopo precisa ser confirmado.

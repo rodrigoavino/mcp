@@ -12,6 +12,7 @@ Princípios (decididos pelo usuário):
 """
 from __future__ import annotations
 
+import math
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -108,11 +109,115 @@ def strong(tlist: list[str]) -> list[str]:
     return s_ or tlist
 
 
+def _stem(term: str) -> str:
+    return term[:-1] if term.endswith("s") and len(term) > 5 and not re.search(r"[\\/:\-_.\d]", term) else term
+
+
 def _has(term: str, low: str) -> bool:
     if len(term) < 5:
         return re.search(r"(?<![a-z0-9])" + re.escape(term) + r"(?![a-z0-9])", low) is not None
-    stem = term[:-1] if term.endswith("s") and len(term) > 5 and not re.search(r"[\\/:\-_.\d]", term) else term
-    return stem in low
+    return _stem(term) in low
+
+
+def _count(term: str, low: str) -> int:
+    """Ocorrências do termo (palavra inteira se curto; tronco como subcadeia se longo): a frequência do BM25."""
+    if len(term) < 5:
+        return len(re.findall(r"(?<![a-z0-9])" + re.escape(term) + r"(?![a-z0-9])", low))
+    return low.count(_stem(term))
+
+
+# ---------- Fase 1: domínios, BM25 e limites ----------
+# Princípio: o mínimo necessário para responder com evidência. A pergunta é classificada em domínios e só páginas do
+# Learn cujo CAMINHO pertence a esses domínios são lidas primeiro; se nenhuma servir, amplia e AVISA (scope_widened).
+# O servidor de busca do Learn NÃO oferece filtro (testado: scope, category e $filter são ignorados), então o filtro é local.
+DOMAINS = {
+    "storage": {
+        "keywords": r"ntfs|refs|storage|disks?|volumes?|cluster size|allocation unit|partitions?|gpt|mbr|\w*bitlocker\w*|diskpart|"
+                    r"iscsi|mpio|deduplication|storage spaces|fsutil|raid|ssd|nvme|sector|format",
+        "paths": ["/windows-server/storage/", "/windows-server/administration/windows-commands/", "/troubleshoot/windows-server/backup-and-storage/",
+                  "/windows/security/operating-system-security/data-protection/", "/powershell/module/storage/", "/powershell/module/bitlocker/",
+                  "/windows/deployment/", "/windows-hardware/manufacture/desktop/", "/windows-server/failover-clustering/"]},
+    "sql-server": {
+        "keywords": r"sql server|sql|mssql|database engine|availability groups?|always on",
+        "paths": ["/sql/", "/azure/azure-sql/", "/troubleshoot/sql/"]},
+    "hyper-v": {
+        "keywords": r"hyper-v|hypervisor|virtual machines?|vhdx?|vmms|live migration",
+        "paths": ["/windows-server/virtualization/", "/virtualization/", "/powershell/module/hyper-v/", "/troubleshoot/windows-server/virtualization/"]},
+    "cluster": {
+        "keywords": r"failover cluster\w*|cluster|quorum|csv|cluster shared volumes?|witness",
+        "paths": ["/windows-server/failover-clustering/", "/troubleshoot/windows-server/high-availability/", "/powershell/module/failoverclusters/"]},
+    "active-directory": {
+        "keywords": r"active directory|domain controllers?|ad ds|kerberos|gpo|group policy|sysvol|replication|ldap|netlogon",
+        "paths": ["/windows-server/identity/", "/troubleshoot/windows-server/active-directory/", "/troubleshoot/windows-server/identity/",
+                  "/powershell/module/activedirectory/", "/previous-versions/windows/it-pro/windows-server-2012-r2-and-2012/"]},
+    "dns": {
+        "keywords": r"dns|name resolution|forwarders?|resolver|nslookup",
+        "paths": ["/windows-server/networking/dns/", "/troubleshoot/windows-server/networking/", "/powershell/module/dnsserver/",
+                  "/powershell/module/dnsclient/", "/windows-server/identity/"]},
+    "dhcp": {
+        "keywords": r"dhcp|lease|scope",
+        "paths": ["/windows-server/networking/technologies/dhcp/", "/powershell/module/dhcpserver/", "/troubleshoot/windows-server/networking/"]},
+    "networking": {
+        "keywords": r"network|nic|teaming|routing|firewall|tcp|smb|ports?",
+        "paths": ["/windows-server/networking/", "/troubleshoot/windows-server/networking/", "/windows/security/operating-system-security/network-security/"]},
+    "time-service": {
+        "keywords": r"ntp|w32time|time service|time synchronization|clock",
+        "paths": ["/windows-server/networking/windows-time-service/", "/troubleshoot/windows-server/identity/"]},
+    "servicing": {
+        "keywords": r"cbs|dism|windows update|servicing|component store|hotfix|patch|kb\d+",
+        "paths": ["/troubleshoot/windows-server/deployment/", "/windows-hardware/manufacture/desktop/", "/windows/deployment/update/",
+                  "/windows-server/get-started/", "/troubleshoot/windows-client/deployment/"]},
+    "intune-m365": {
+        "keywords": r"intune|microsoft 365|m365|entra|exchange online|autopilot|conditional access",
+        "paths": ["/intune/", "/mem/", "/microsoft-365/", "/entra/", "/exchange/"]},
+}
+TOP_DOCS = 3        # documentos devolvidos
+TOP_CHUNKS = 5      # trechos devolvidos (somando todos os documentos)
+REL_CUT = 0.35      # um trecho só entra se tiver pelo menos 35% da nota BM25 do melhor
+
+
+def classify_domains(text: str, limit: int = 2) -> list[str]:
+    """Domínios mais prováveis (até 'limit') pelas palavras-chave da pergunta e do contexto. Vazio = sem restrição."""
+    low = (text or "").lower()
+    scored = []
+    for i, (name, d) in enumerate(DOMAINS.items()):
+        hits = {m.group(0) for m in re.finditer(r"(?<![a-z0-9])(?:" + d["keywords"] + r")(?![a-z0-9])", low)}
+        if hits:
+            scored.append((-len(hits), i, name))
+    return [n for _, _, n in sorted(scored)[:limit]]
+
+
+def domain_prefixes(domains: list[str]) -> list[str]:
+    return list(dict.fromkeys(p for d in domains for p in DOMAINS[d]["paths"]))
+
+
+def in_domain(url: str, prefixes: list[str]) -> bool:
+    m = re.match(r"^/[a-z]{2}-[a-z]{2}(/.*)$", urlparse(url).path.lower())
+    path = m.group(1) if m else urlparse(url).path.lower()
+    return any(path.startswith(p) for p in prefixes)
+
+
+def bm25_blocks(docs: list[dict], tlist: list[str], k1: float = 1.5, b: float = 0.75) -> dict[tuple[int, int], float]:
+    """BM25 de cada bloco (cabeçalho da seção + texto) sobre o conjunto de páginas lidas. O IDF vem desse conjunto:
+    termos que aparecem em quase todos os blocos pesam pouco, sem lista manual de palavras."""
+    items = [((di, bi), (head + " " + text).lower()) for di, d in enumerate(docs) for bi, (head, text) in enumerate(d["blocks"])]
+    n = len(items)
+    if not n:
+        return {}
+    lens = [max(1, len(low.split())) for _, low in items]
+    avg = sum(lens) / n
+    df = {t: sum(1 for _, low in items if _has(t, low)) for t in tlist}
+    idf = {t: math.log(1 + (n - df[t] + 0.5) / (df[t] + 0.5)) for t in tlist}
+    out = {}
+    for (key, low), ln in zip(items, lens):
+        sc = 0.0
+        for t in tlist:
+            tf = _count(t, low)
+            if tf:
+                sc += idf[t] * tf * (k1 + 1) / (tf + k1 * (1 - b + b * ln / avg))
+        if sc:
+            out[key] = sc
+    return out
 
 
 # ---------- HTTP com validação a cada salto ----------
@@ -272,6 +377,19 @@ def best_passages(doc: dict, tlist: list[str], top: int = 3, max_chars: int = 70
     return out
 
 
+def score_blocks(doc: dict, tlist: list[str]) -> list[dict]:
+    """Cobertura de termos de cada bloco da página (com o índice do bloco), para o portão de aceitação."""
+    st = strong(tlist)
+    out = []
+    for i, (head, text) in enumerate(doc["blocks"]):
+        low = (head + " " + text).lower()
+        hits = [t for t in tlist if _has(t, low)]
+        if hits:
+            out.append({"i": i, "section": head, "text": text, "terms_found": hits,
+                        "coverage": len(hits) / len(tlist), "strong_coverage": sum(1 for t in st if t in hits) / len(st)})
+    return out
+
+
 def passes(p: dict, min_coverage: float, min_strong: float) -> bool:
     return p["coverage"] >= min_coverage and p["strong_coverage"] >= min_strong
 
@@ -291,7 +409,7 @@ def search_learn(query: str, top: int = 8, locale: str = "en-us") -> list[dict]:
     if not re.fullmatch(r"[a-z]{2}-[a-z]{2}", locale):
         raise ValueError("locale inválido (ex.: en-us, pt-br)")
     r = requests.get(LEARN_SEARCH, timeout=15.0, headers={"User-Agent": UA},
-                     params={"search": q, "locale": locale, "$top": max(1, min(int(top), 10))})
+                     params={"search": q, "locale": locale, "$top": max(1, min(int(top), 25))})  # a API aceita até 25
     r.raise_for_status()
     data = r.json()
     out = []
@@ -303,12 +421,56 @@ def search_learn(query: str, top: int = 8, locale: str = "en-us") -> list[dict]:
     return out
 
 
+def _evaluate(docs: list[dict], tlist: list[str], req: list[str], min_coverage: float, min_strong: float,
+              top_docs_out: int, top_chunks: int) -> tuple[list[dict], list[dict]]:
+    """Portão (cobertura, termos principais, contexto obrigatório) + ranking BM25 + limites (TOP_DOCS/TOP_CHUNKS).
+    Devolve (evidências, rejeitadas)."""
+    bm = bm25_blocks(docs, tlist)
+    cands, rejected = [], []
+    for di, doc in enumerate(docs):
+        title_low = (doc["title"] or "").lower()
+        blocks = score_blocks(doc, tlist)
+        # termos OBRIGATÓRIOS (contexto da pergunta, ex.: SQL Server): precisam estar no próprio trecho ou no título
+        good = [x for x in blocks if passes(x, min_coverage, min_strong)
+                and all(t in x["terms_found"] or _has(t, title_low) for t in req)]
+        if good:
+            cands += [(bm.get((di, x["i"]), 0.0), di, x) for x in good]
+        else:
+            top = max(blocks, key=lambda x: (x["strong_coverage"], x["coverage"]), default=None)
+            rejected.append({"title": doc["title"], "url": doc["url"],
+                             "best_coverage": round(top["coverage"], 2) if top else 0.0,
+                             "best_strong_coverage": round(top["strong_coverage"], 2) if top else 0.0,
+                             "reason": "nenhum trecho contém os termos principais da pergunta"})
+    if not cands:
+        return [], rejected
+    cands.sort(key=lambda c: -c[0])
+    best = cands[0][0]
+    keep = [c for c in cands if c[0] >= REL_CUT * best][:top_chunks]
+    keep_docs = list(dict.fromkeys(c[1] for c in keep))[:top_docs_out]
+    for c in keep:
+        if c[1] not in keep_docs:
+            rejected.append({"title": docs[c[1]]["title"], "url": docs[c[1]]["url"], "reason": f"fora do limite de {top_docs_out} documentos"})
+    evidence = []
+    for di in keep_docs:
+        mine = [c for c in keep if c[1] == di]
+        evidence.append({**_cite(docs[di]), "best_bm25": round(mine[0][0], 2),
+                         "best_coverage": round(mine[0][2]["coverage"], 2), "best_strong_coverage": round(mine[0][2]["strong_coverage"], 2),
+                         "passages": [{"section": x["section"], "bm25": round(sc, 2), "coverage": round(x["coverage"], 2),
+                                       "strong_coverage": round(x["strong_coverage"], 2), "terms_found": x["terms_found"],
+                                       "terms_missing": [t for t in tlist if t not in x["terms_found"]],
+                                       "text": x["text"][:700] + ("…" if len(x["text"]) > 700 else "")} for sc, _, x in mine]})
+    return evidence, rejected
+
+
 def ground(queries: list[str], locale: str = "en-us", top_docs: int = 6, min_coverage: float = 0.6,
            min_strong: float = 0.75, budget_s: float = 40.0,
            max_queries: int = 3, match_query: str | None = None, required: list[str] | None = None,
-           max_docs: int | None = None) -> dict:
-    """Busca no Learn (uma ou mais consultas), LÊ as páginas e só devolve as que têm um trecho com a maior parte
-    dos termos. Sem nenhuma: evidence_found=False e NO_EVIDENCE.
+           max_docs: int | None = None, domains: list[str] | None = None, search_top: int = 25,
+           top_docs_out: int = TOP_DOCS, top_chunks: int = TOP_CHUNKS) -> dict:
+    """Busca no Learn (uma ou mais consultas), LÊ as páginas e só devolve o mínimo necessário: até TOP_DOCS documentos e
+    TOP_CHUNKS trechos, ordenados por BM25, que passaram no portão (termos principais e contexto obrigatório).
+    Domínios: a pergunta é classificada (ou use 'domains') e só páginas com caminho do domínio são lidas primeiro; se
+    nenhuma servir, amplia e avisa (scope_widened=true). Sem evidência: evidence_found=False e NO_EVIDENCE.
     As consultas servem só para ACHAR páginas; a conferência usa os termos de 'match_query' (por padrão, todas as
     consultas juntas). Variações de busca não devem diluir os termos da pergunta real."""
     t0 = time.monotonic()
@@ -317,15 +479,26 @@ def ground(queries: list[str], locale: str = "en-us", top_docs: int = 6, min_cov
         raise ValueError("informe de 1 a 3 consultas")
     tlist = terms(match_query if match_query else " ".join(qs))
     req = [t for t in (required or []) if t in tlist]
+    if domains is None:
+        domains = classify_domains(" ".join(qs) + " " + (match_query or ""))
+    bad = [d for d in domains if d not in DOMAINS]
+    if bad:
+        raise ValueError(f"domínio inválido: {bad}. Válidos: {', '.join(DOMAINS)}")
+    prefixes = domain_prefixes(domains)
     # Resultados de cada consulta INTERCALADOS (1o de cada, depois 2o de cada...) antes de cortar: senão as
     # primeiras consultas ocupam todas as vagas e a página que só a última consulta acha nunca é lida.
-    per_query = [[it["url"].split("#")[0] for it in search_learn(q, top=top_docs, locale=locale)] for q in qs]
+    per_query = [[it["url"].split("#")[0] for it in search_learn(q, top=search_top, locale=locale)] for q in qs]
     urls: list[str] = []
     for rank in range(max((len(x) for x in per_query), default=0)):
         for lst in per_query:
             if rank < len(lst) and lst[rank] not in urls:
                 urls.append(lst[rank])
-    urls = urls[: max_docs or max(1, min(int(top_docs), 10)) * 2]
+    cap = max_docs or max(1, min(int(top_docs), 10)) * 2
+    if prefixes:
+        inside = [u for u in urls if in_domain(u, prefixes)]
+        stages = [("domínio", inside[:cap]), ("ampliado", [u for u in urls if u not in inside][:cap])]
+    else:
+        stages = [("sem domínio", urls[:cap])]
 
     def work(u):
         try:
@@ -333,29 +506,30 @@ def ground(queries: list[str], locale: str = "en-us", top_docs: int = 6, min_cov
         except Exception as e:  # rede, HTTP, URL fora da lista
             return u, None, f"{type(e).__name__}: {str(e)[:120]}"
 
-    evidence, rejected = [], []
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        for u, doc, err in ex.map(work, urls):
-            if time.monotonic() - t0 > budget_s:
-                break
-            if err:
-                rejected.append({"url": u, "reason": f"não foi possível ler ({err})"})
-                continue
-            ps = best_passages(doc, tlist)
-            title_low = (doc["title"] or "").lower()
-            # termos OBRIGATÓRIOS (contexto da pergunta, ex.: SQL Server): precisam estar no próprio trecho ou no título
-            good = [x for x in ps if passes(x, min_coverage, min_strong)
-                    and all(t in x["terms_found"] or _has(t, title_low) for t in req)]
-            best = ps[0]["coverage"] if ps else 0.0
-            if good:
-                evidence.append({**_cite(doc), "best_coverage": good[0]["coverage"],
-                                 "best_strong_coverage": good[0]["strong_coverage"], "passages": good})
-            else:
-                rejected.append({"title": doc["title"], "url": doc["url"], "best_coverage": best,
-                                 "best_strong_coverage": ps[0]["strong_coverage"] if ps else 0.0,
-                                 "reason": "nenhum trecho contém os termos principais da pergunta"})
-    evidence.sort(key=lambda e: (e["trust_rank"] or 9, -e["best_coverage"]))
+    evidence, rejected, tried = [], [], []
+    for label, stage_urls in stages:
+        if not stage_urls:
+            tried.append({"stage": label, "pages": 0})
+            continue
+        docs = []
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            for u, doc, err in ex.map(work, stage_urls):
+                if time.monotonic() - t0 > budget_s:
+                    break
+                if err:
+                    rejected.append({"url": u, "reason": f"não foi possível ler ({err})"})
+                else:
+                    docs.append(doc)
+        ev, rej = _evaluate(docs, tlist, req, min_coverage, min_strong, top_docs_out, top_chunks)
+        rejected += rej
+        tried.append({"stage": label, "pages": len(docs)})
+        if ev:
+            evidence = ev
+            break
+    evidence.sort(key=lambda e: (-e["best_bm25"], e["trust_rank"] or 9))
     out = {"evidence_found": bool(evidence), "terms": tlist, "strong_terms": strong(tlist), "required_terms": req,
+           "domains": domains, "scope_widened": bool(evidence) and tried[-1]["stage"] == "ampliado",
+           "stages": tried, "ranking": "bm25", "limits": {"top_docs": top_docs_out, "top_chunks": top_chunks, "rel_cut": REL_CUT},
            "min_coverage": min_coverage, "min_strong": min_strong,
            "locale": locale, "seconds": round(time.monotonic() - t0, 1),
            "evidence": evidence, "rejected": rejected[:8], "notice": UNTRUSTED}
@@ -468,7 +642,8 @@ def extract_recommendations(text: str, head: str = "", title: str = "") -> list[
 
 
 def validate_configuration(question: str, observed: dict | None = None, context: list[str] | None = None,
-                           search_hints: list[str] | None = None, locale: str = "en-us", min_coverage: float = 0.6, min_strong: float = 0.75) -> dict:
+                           search_hints: list[str] | None = None, domains: list[str] | None = None, locale: str = "en-us",
+                           min_coverage: float = 0.6, min_strong: float = 0.75) -> dict:
     """Interface do RAG: recebe uma pergunta genérica (ex.: 'NTFS allocation unit size SQL Server'), o valor
     observado (opcional, só local) e tags de contexto. Devolve supported, recommendation (literal do texto oficial),
     matches_observed e a fonte. Sem evidência: supported=False e NO_EVIDENCE."""
@@ -479,10 +654,11 @@ def validate_configuration(question: str, observed: dict | None = None, context:
     variants += [check_query(h) for h in (search_hints or [])][:2]
     g = ground([check_query(v) for v in variants], locale=locale, top_docs=8, min_coverage=min_coverage,
                min_strong=min_strong, max_queries=5, match_query=f"{q} {cx}".strip(),
-               required=[t for t in terms(cx) if t not in GENERIC], max_docs=24)
+               required=[t for t in terms(cx) if t not in GENERIC], max_docs=24, domains=domains)
     out = {"supported": bool(g["evidence_found"]), "observed": observed or None, "context": ctx,
            "recommendation": None, "recommendation_strength": None, "matches_observed": None,
-           "source": None, "other_sources": [], "quote": None, "notice": UNTRUSTED}
+           "source": None, "other_sources": [], "quote": None, "notice": UNTRUSTED,
+           "domains": g["domains"], "scope_widened": g["scope_widened"], "limits": g["limits"]}
     if not g["evidence_found"]:
         out["message"] = NO_EVIDENCE
         out["rejected_candidates"] = g["rejected"][:4]
@@ -501,7 +677,9 @@ def validate_configuration(question: str, observed: dict | None = None, context:
     out["scope_note"] = ("Confirme se o escopo do documento (produto, versão e ambiente, veja título e URL) "
                          "corresponde ao servidor avaliado." +
                          (" Este é um documento do Azure: a recomendação pode ser específica de VMs no Azure."
-                          if "/azure" in e["url"].lower() else ""))
+                          if "/azure" in e["url"].lower() else "") +
+                         (" A busca precisou ser ampliada para fora dos domínios previstos para esta pergunta."
+                          if g["scope_widened"] else ""))
     out["other_sources"] = [{k: x[k] for k in ("title", "url", "source", "updated_at")} for x in g["evidence"] if x is not e][:4]
     if chosen:
         recs = chosen[1]
