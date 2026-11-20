@@ -130,4 +130,4 @@ Pergunte ao Claude, em português, e confira o formato da resposta (curta, só o
 
 ## Como reportar problema
 
-Anote a pergunta feita, o servidor, o horário (UTC) e a resposta recebida; se for da consulta externa, o campo `network` da resposta. Isso permite reproduzir com os mesmos testes.
+Anote a pergunta feita, o servidor, o horário (GMT-3) e a resposta recebida; se for da consulta externa, o campo `network` da resposta. Isso permite reproduzir com os mesmos testes.

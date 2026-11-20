@@ -235,3 +235,34 @@ class TestRegrasDoProjeto:
 
     def test_resposta_do_wmi_para_json_e_ida_e_volta(self):
         assert json.loads(json.dumps(S._service_facts([])))["signals"]["failedExitCode"] == []
+
+
+# ---------- fuso padrão GMT-3 ----------
+class TestFuso:
+    def test_converte_data_iso_utc(self):
+        from windows_rca_mcp.envelope import to_local
+        assert to_local("2026-11-21T02:19:30Z") == "2026-11-20T23:19:30-03:00"
+
+    def test_virada_de_dia(self):
+        from windows_rca_mcp.envelope import to_local
+        assert to_local("2026-11-20T01:00:00Z") == "2026-11-19T22:00:00-03:00"
+
+    def test_sentinela_e_texto_livre_ficam_como_estao(self):
+        from windows_rca_mcp.envelope import to_local
+        assert to_local("0001-01-01T00:00:00Z") == "0001-01-01T00:00:00Z"
+        assert to_local("Falha em 2026-11-21T02:19:30Z no serviço") == "Falha em 2026-11-21T02:19:30Z no serviço"
+        assert to_local("abc") == "abc"
+
+    def test_envelope_converte_o_data_e_listas_aninhadas(self):
+        e = build_envelope("h", {"a": {"t": "2026-11-21T02:00:00Z"}, "l": [{"t": "2026-11-21T03:00:00Z"}], "n": 5, "m": "texto"}, "x")
+        assert e["data"] == {"a": {"t": "2026-11-20T23:00:00-03:00"}, "l": [{"t": "2026-11-21T00:00:00-03:00"}], "n": 5, "m": "texto"}
+
+    def test_timestamp_padrao_sai_em_gmt_menos_3(self):
+        assert build_envelope("h", {})["timestamp"].endswith("-03:00")
+
+    def test_fuso_ajustavel_por_variavel(self, monkeypatch):
+        from windows_rca_mcp.envelope import to_local
+        monkeypatch.setenv("MCP_TZ_OFFSET_HOURS", "0")
+        assert to_local("2026-11-21T02:00:00Z") == "2026-11-21T02:00:00+00:00"
+        monkeypatch.setenv("MCP_TZ_OFFSET_HOURS", "lixo")
+        assert to_local("2026-11-21T02:00:00Z") == "2026-11-20T23:00:00-03:00"
