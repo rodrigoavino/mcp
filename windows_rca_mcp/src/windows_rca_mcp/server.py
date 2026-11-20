@@ -195,6 +195,15 @@ def _run_ps(host: str, script: str, timeout: int, via_stdin: bool = False) -> tu
 DATE_RE = re.compile(r"\\/Date\((-?\d+)(?:[+-]\d+)?\)\\/")
 
 
+def _fmt_date(ms: int) -> str:
+    """/Date(ms)/ do PowerShell -> ISO UTC. Datas fora do intervalo do Windows (ex.: 1600-12-31 de 'sem data') não derrubam
+    a resposta: viram null e o campo fica ausente de significado."""
+    try:
+        return datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (OSError, OverflowError, ValueError):
+        return "0001-01-01T00:00:00Z"
+
+
 def _conn_error(host: str, e: Exception) -> dict:
     return {"error": f"{type(e).__name__}: {str(e)[:1000]}", "host": host}
 
@@ -243,8 +252,7 @@ def _exec(host: str, full: str, timeout: int, via_stdin: bool):
     if code != 0:
         return {"error": _clean_err(se) or f"exit code {code}", "host": host}
     out = so.decode(errors="replace").strip()
-    out = DATE_RE.sub(
-        lambda m: datetime.fromtimestamp(int(m.group(1)) / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), out)
+    out = DATE_RE.sub(lambda m: _fmt_date(int(m.group(1))), out)
     if not out:
         return []
     try:
@@ -747,6 +755,81 @@ if ($need.Count) {
             out["dateUnknown"] = unknown   # só aparece se houver itens sem data: afeta a confiança da resposta
     out["more_available"] = _more("inventário completo, editora e local de instalação, patches do período, reinicializações, eventos de erro")
     return out
+
+
+# ---------- licenciamento do Windows (só fatos) ----------
+# Fatos do SoftwareLicensingProduct/Service e eventos do Security-SPP e do wlms. O significado do LicenseStatus, dos HRESULTs
+# e do período de carência é interpretação: fica no RAG (microsoft-docs), com fonte. Aqui só há números, textos e contagens.
+SPP_EVENT_IDS = [1014, 8198, 8200, 16398]
+
+
+def _real_date(v):
+    """Datas sentinela do Windows (ano < 1700, ex.: 1600-12-31) significam 'sem data': viram None."""
+    return None if not v or str(v)[:4] < "1700" else v
+
+
+@mcp.tool
+def get_license_status(host: str, days: int = 1):
+    """Licenciamento do Windows (ativação), só fatos: produto, canal da chave (ex.: Volume:GVLK, Retail, OEM), LicenseStatus
+    (número da enumeração do WMI), HRESULT do motivo, carência restante (minutos), fim de avaliação (null se não há),
+    contagens de rearme, servidor KMS configurado e descoberto, e, no período (days, padrão 1), as contagens dos eventos
+    Security-SPP 1014/8198/8200/16398 e os desligamentos iniciados pelo wlms.exe (evento 1074). Não interpreta o status,
+    não diz se a licença é válida e não recomenda: o significado dos códigos é do RAG (microsoft-docs)."""
+    res = _ps(host, PS_EV + r"""
+$ErrorActionPreference = 'Continue'
+$p = @(Get-CimInstance SoftwareLicensingProduct -Filter "ApplicationId='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL" |
+  select Name,Description,LicenseFamily,ProductKeyChannel,LicenseStatus,LicenseStatusReason,GracePeriodRemaining,
+    @{n='EvalEnd';e={ if ($_.EvaluationEndDate -and $_.EvaluationEndDate.Year -gt 1700) { $_.EvaluationEndDate.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null } }},
+    RemainingAppReArmCount,RemainingSkuReArmCount,KeyManagementServiceMachine,KeyManagementServicePort,
+    DiscoveredKeyManagementServiceMachineName,DiscoveredKeyManagementServiceMachinePort,VLActivationType)
+$s = Get-CimInstance SoftwareLicensingService | select Version,RemainingWindowsReArmCount,IsKeyManagementServiceMachine
+$os = Get-CimInstance Win32_OperatingSystem
+$spp = @(Ev 'Application' '__XS__' 3000)
+$w = @(Ev 'System' '__XW__' 500 | ? { "$($_.Properties[0].Value)" -like '*wlms.exe*' })  # 1074: Properties[0] = processo que iniciou o desligamento
+$wl = Get-Service wlms -ErrorAction SilentlyContinue
+[pscustomobject]@{
+  Products=$p; Service=$s
+  OsInstall=$os.InstallDate.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  WlmsService=$(if ($wl) { [pscustomobject]@{ Status="$($wl.Status)"; StartType="$($wl.StartType)" } } else { $null })
+  SppEvents=@($spp | group Id | % { [pscustomobject]@{ Id=$_.Name; Count=$_.Count
+    Last=($_.Group | sort TimeCreated -desc | select -first 1).TimeCreated.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } })
+  WlmsShutdowns=@($w | sort TimeCreated -desc | select -first 10 | % { [pscustomobject]@{
+    Time=$_.TimeCreated.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'); Message=(Desc $_ 300) } })
+  WlmsShutdownCount=$w.Count
+} | ConvertTo-Json -Depth 5 -Compress
+""".replace("__XS__", _xpath(ids=SPP_EVENT_IDS, provider="Microsoft-Windows-Security-SPP", days=_days(days)).replace("'", "''"))
+       .replace("__XW__", _xpath(ids=[1074], days=_days(days)).replace("'", "''")), timeout=120)
+    if not isinstance(res, dict) or "Products" not in res:
+        return res
+    prods = []
+    for x in _lst(res.get("Products")):
+        reason = x.get("LicenseStatusReason")
+        kms_cfg = (x.get("KeyManagementServiceMachine") or "").strip()
+        kms_disc = (x.get("DiscoveredKeyManagementServiceMachineName") or "").strip()
+        prods.append({
+            "name": x.get("Name"), "description": x.get("Description"), "license_family": x.get("LicenseFamily"),
+            "product_key_channel": x.get("ProductKeyChannel"),
+            "license_status": x.get("LicenseStatus"),
+            "license_status_reason": ("0x%08X" % (int(reason) & 0xFFFFFFFF)) if reason is not None else None,
+            "grace_period_remaining_min": x.get("GracePeriodRemaining"),
+            "evaluation_end": _real_date(x.get("EvalEnd")),
+            "rearm_remaining": {"app": x.get("RemainingAppReArmCount"), "sku": x.get("RemainingSkuReArmCount")},
+            "kms": {"configured_host": kms_cfg or None, "configured_port": x.get("KeyManagementServicePort"),
+                    "discovered_host": kms_disc or None, "discovered_port": x.get("DiscoveredKeyManagementServiceMachinePort") or None},
+            "signals": {"gracePeriodRemainingIsZero": x.get("GracePeriodRemaining") == 0,
+                        "kmsHostConfigured": bool(kms_cfg), "kmsHostDiscovered": bool(kms_disc),
+                        "evaluationEndDatePresent": bool(_real_date(x.get("EvalEnd")))}})
+    spp = {str(e.get("Id")): {"count": e.get("Count"), "last": e.get("Last")} for e in _lst(res.get("SppEvents"))}
+    wl = _lst(res.get("WlmsShutdowns"))
+    return {"host": host, "period_days": _days(days), "products": prods,
+            "os_install_date": res.get("OsInstall"),
+            "licensing_service": {"version": (res.get("Service") or {}).get("Version"),
+                                  "windows_rearm_remaining": (res.get("Service") or {}).get("RemainingWindowsReArmCount"),
+                                  "is_kms_host": bool((res.get("Service") or {}).get("IsKeyManagementServiceMachine"))},
+            "wlms_service": res.get("WlmsService"),
+            "events": {"security_spp": spp,
+                       "wlms_shutdowns": {"count": res.get("WlmsShutdownCount") or 0, "recent": wl}},
+            "more_available": _more("eventos de licenciamento de mais dias, logs de ativação, estado do serviço de licença")}
 
 
 # ---------- camada de armazenamento (discos, partições, volumes, BitLocker) ----------
