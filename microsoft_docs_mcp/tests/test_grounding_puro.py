@@ -201,3 +201,16 @@ class TestProximidade:
         doc = {"blocks": [("", "Recommended page file size is 1.5 times the RAM.")]}
         b = g.score_blocks(doc, ["page", "file"])[0]
         assert b["near"] and g.passes(b, 0.6, 0.75)
+
+
+# ---------- regra de resposta sem evidência (decidida pelo usuário) ----------
+class TestRegraSemEvidencia:
+    def test_instrucoes_mantem_frase_fixa_e_secao_rotulada(self):
+        from microsoft_docs_mcp import server
+        assert g.NO_EVIDENCE in server.INSTRUCTIONS
+        assert "Sem fonte oficial (conhecimento do modelo, não verificado)" in server.INSTRUCTIONS
+        assert "conhecimento do modelo" in server.INSTRUCTIONS
+
+    def test_instrucoes_nao_liberam_o_conhecimento_como_recomendacao_oficial(self):
+        from microsoft_docs_mcp import server
+        assert "nunca como recomendação da Microsoft" in server.INSTRUCTIONS
