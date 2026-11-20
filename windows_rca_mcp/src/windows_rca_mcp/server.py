@@ -2151,20 +2151,23 @@ $last = Get-WinEvent -FilterHashtable @{LogName=$log;Id=8000,8001,8002,8003,8004
 
 
 @mcp.tool
-def get_top_resource_consumers(host: str, sample_seconds: int = 5, top: int = 10):
+def get_top_resource_consumers(host: str, sample_seconds: int = 5, top: int = 10, by: str = "both"):
     """Processos que mais consomem CPU e memória, MEDIDOS por amostragem (delta de tempo de CPU em
     'sample_seconds', normalizado pelo nº de CPUs lógicas: mais preciso que leitura instantânea).
     Para cada processo: CPU%, memória privada, working set, handles, threads, dono, início, serviços hospedados
-    e linha de comando. Inclui o total de CPU e memória do servidor."""
+    e linha de comando. Inclui o total de CPU e memória do servidor. O processo do próprio PowerShell da coleta é
+    excluído das listas. 'by': cpu | memory | both (padrão). Pergunta só de CPU ou só de memória: passe 'cpu' ou 'memory'."""
+    if by not in ("cpu", "memory", "both"):
+        raise ValueError("by deve ser cpu, memory ou both")
     secs = max(1, min(int(sample_seconds), 30))
-    return _ps(host, r"""
+    res = _ps(host, r"""
 $n = __N__; $secs = __S__
 $cores = [Environment]::ProcessorCount
 $t1 = @{}; Get-Process | % { try { $t1[$_.Id] = $_.TotalProcessorTime.TotalMilliseconds } catch {} }
 $sw = [Diagnostics.Stopwatch]::StartNew(); Start-Sleep -Seconds $secs; $el = $sw.Elapsed.TotalMilliseconds
 $wp = @{}; Get-CimInstance Win32_Process | % { $wp[[int]$_.ProcessId] = $_ }
 $svc = @{}; Get-CimInstance Win32_Service | ? { $_.ProcessId } | % { $k=[int]$_.ProcessId; $svc[$k] = @($svc[$k]) + $_.Name }
-$rows = @(Get-Process | ? { $_.Id -ne 0 } | % {
+$rows = @(Get-Process | ? { $_.Id -ne 0 -and $_.Id -ne $PID } | % {
   $cpu = 0; try { if ($t1.ContainsKey($_.Id)) { $cpu = [math]::Round(100*($_.TotalProcessorTime.TotalMilliseconds - $t1[$_.Id])/($el*$cores),1) } } catch {}
   [pscustomobject]@{ Name=$_.ProcessName; PID=$_.Id; CpuPct=$cpu
     PrivateMB=[math]::Round($_.PrivateMemorySize64/1MB,1); WorkingSetMB=[math]::Round($_.WorkingSet64/1MB,1)
@@ -2180,10 +2183,15 @@ $os = Get-CimInstance Win32_OperatingSystem
   MemTotalGB=[math]::Round($os.TotalVisibleMemorySize/1MB,1)
   MemUsedPct=[math]::Round(100-100*$os.FreePhysicalMemory/$os.TotalVisibleMemorySize,1)
   ProcessCount=$rows.Count
-  TopCpu=@($rows | sort CpuPct -desc | select -first $n | % { Enrich $_ })
-  TopMemory=@($rows | sort PrivateMB -desc | select -first $n | % { Enrich $_ })
+  TopCpu=$(if ('__B__' -ne 'memory') { @($rows | sort CpuPct -desc | select -first $n | % { Enrich $_ }) } else { $null })
+  TopMemory=$(if ('__B__' -ne 'cpu') { @($rows | sort PrivateMB -desc | select -first $n | % { Enrich $_ }) } else { $null })
 } | ConvertTo-Json -Depth 4 -Compress
-""".replace("__N__", str(max(1, min(int(top), 30)))).replace("__S__", str(secs)), timeout=secs + 120)
+""".replace("__N__", str(max(1, min(int(top), 30)))).replace("__S__", str(secs)).replace("__B__", by), timeout=secs + 120)
+    if isinstance(res, dict):
+        for k in ("TopCpu", "TopMemory"):
+            if res.get(k) is None:
+                res.pop(k, None)   # lista não pedida: não aparece
+    return res
 
 
 @mcp.tool

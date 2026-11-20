@@ -53,8 +53,10 @@ def build_envelope(host: str | None, raw, now: str | None = None) -> dict:
                 env["os"] = data.pop(k)
                 break
         status = data.get("overall", data.get("status"))
-        if isinstance(data.get("findings"), list) and isinstance(status, str):
-            env["summary"] = {"status": status, "findings": len(data["findings"])}
+        items = data.get("findings") if isinstance(data.get("findings"), list) else data.get("evidence")
+        if isinstance(items, list) and isinstance(status, str):
+            # a frase 'Nenhum sinal encontrado.' é o texto de "sem achados", não um achado
+            env["summary"] = {"status": status, "findings": sum(1 for x in items if x != "Nenhum sinal encontrado.")}
         hint = data.pop("more_available", None)
         if isinstance(hint, str):
             env["moreAvailable"] = hint
