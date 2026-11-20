@@ -90,14 +90,22 @@ Pergunte ao Claude, em português, e confira o formato da resposta (curta, só o
 ## Limitações conhecidas (não esconder nos testes)
 
 - **Tools antigas do coletor ainda julgam ou recomendam**: `get_health_summary` e `validate_cbs` (OK/Atenção/Crítico e ações), `get_time_config` ("o recomendado é NT5DS"), `get_cluster_health` ("configure ... witness"), `get_disk_allocation_analysis` ("candidato a reclamação") e as dicas de HRESULT. Contrariam a regra 1 e devem migrar para fatos + sinais (registrado em `CLAUDE.md`).
-- **RAG:** a busca do Learn é fraca; "sem evidência" pode ser falso negativo de recuperação (já aconteceu). Tabelas viram células soltas e perdem a ligação linha/coluna (códigos de erro, RIDs). A extração de valor cobre só tamanhos (KB, MB, GB, TB). A verificação é lexical, não semântica.
+- **RAG:** a busca do Learn é fraca; "sem evidência" pode ser falso negativo de recuperação (já aconteceu). Teto de 12 páginas novas por consulta (era até 54) e versão do SO ("Windows Server 2025") não entra mais na conferência dos termos; "allocation unit size" e "cluster size" são tratados como sinônimos. Tabelas viram células soltas e perdem a ligação linha/coluna (códigos de erro, RIDs). A extração de valor cobre só tamanhos (KB, MB, GB, TB). A verificação é lexical, não semântica.
 - **Não exercitado em ambiente real:** consulta ao serviço de metadados de AWS, Azure e GCP (o laboratório é KVM; só o caminho de erro); disco dinâmico real e BitLocker instalado (só dados sintéticos); caminho de eventos MsiInstaller (itens simulados). A etiqueta de ativo do chassi do Azure foi deixada de fora por falta de confirmação.
 - **Data de instalação:** o 7-Zip sai com confiança `low` (data da pasta do produto) porque a chave dele não tem `InstallDate`; hives de usuários não carregados não são lidos.
 - **Respostas grandes** (18 das 63) foram truncadas no log da regressão, então a conformidade do envelope foi conferida nas 45 legíveis; o middleware é o mesmo para todas.
 - Lentidão esperada: `get_largest_folders` e `get_largest_files` (~100 s), `get_component_store_analysis` (~60 s).
 - Laboratório com um único servidor (KVM); nada foi testado contra servidores físicos, cluster ou controlador de domínio.
 
-## Ordem de merge dos PRs
+## Ajustes pós-MVP (achados nos 9 cenários de teste)
+
+| Achado | Correção |
+|---|---|
+| RAG abriu 32 e 16 páginas para respostas vazias | Teto de 12 páginas novas por consulta (`MAX_PAGES_TOTAL`); páginas em cache não contam |
+| "NTFS allocation unit size" voltava sem evidência (falso negativo) | O termo de versão do SO saiu da conferência e entrou a variante sinônima "cluster size"; agora acha a página do `format` (sem recomendação literal, só a citação). SQL Server + 4 KB segue devolvendo 64 KB |
+| `get_local_groups(group=...)` devolvia também as contas locais | Com `group` informado, `include_users` passa a `False` por padrão (a listagem completa continua trazendo) |
+
+## Ordem de merge dos PRs (histórico, já mesclados na tag `v0.1.0-mvp`)
 
 `main` ← **#4** (RAG) ← **#6** (RAG Fase 1, consulta mínima, porta de entrada) e, em paralelo, `main` ← **#5** (carga, plataforma, armazenamento) ← **#7** (serviços e grupos só com fatos) ← **#8** (envelope e coleta objetiva, este documento). Use **merge commit** (não squash), para os PRs empilhados não duplicarem commits. Depois do merge do #4 e do #5, retargetar o #6 e o #7 para `main` se o GitHub não o fizer.
 

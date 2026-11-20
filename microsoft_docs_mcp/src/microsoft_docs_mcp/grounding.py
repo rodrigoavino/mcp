@@ -51,6 +51,7 @@ PAGE_TTL_S = int(os.getenv("MS_DOCS_PAGE_TTL_DAYS", "7")) * 86400
 SEARCH_TTL_S = int(os.getenv("MS_DOCS_SEARCH_TTL_DAYS", "1")) * 86400
 OFFLINE = os.getenv("MS_DOCS_OFFLINE", "").strip().lower() == "true"
 CACHE_MAX_FILES = 400
+MAX_PAGES_TOTAL = 12  # teto de páginas NOVAS baixadas por consulta, somando todas as passadas
 FIRST_PASS_DOCS = 6   # páginas lidas na 1a passada (1 consulta); só amplia se não houver evidência
 
 
@@ -642,6 +643,12 @@ def _ground(net, queries, locale, top_docs, min_coverage, min_strong, budget_s, 
         if prefixes:
             urls = [u for u in urls if in_domain(u, prefixes) == inside_only]
         stage_urls = urls[:limit]
+        # teto total: páginas já lidas (cache) não contam; só as novas competem pelo orçamento
+        room = max(0, MAX_PAGES_TOTAL - len(seen))
+        new = [u for u in stage_urls if u not in seen]
+        if len(new) > room:
+            keep = set(new[:room])
+            stage_urls = [u for u in stage_urls if u in seen or u in keep]
         if not stage_urls or set(stage_urls) <= seen:
             tried.append({"stage": label, "pages": 0})
             continue
@@ -798,12 +805,27 @@ def validate_configuration(question: str, observed: dict | None = None, context:
     q = check_query(question)
     cx = " ".join(ctx)
     variants = ([f"{cx} {q}", f"{cx} {q} best practices", q] if ctx else [q, f"{q} best practices"])
+    # sinônimos oficiais: a documentação trata "allocation unit size" como "cluster size" e vice-versa
+    alt_q = None
+    for a, b in (("allocation unit size", "cluster size"), ("cluster size", "allocation unit size")):
+        if a in q.lower():
+            alt_q = re.sub(a, b, q, flags=re.I)
+            variants.append(alt_q)
+            break
     variants += [check_query(h) for h in (search_hints or [])][:2]
-    g = ground([check_query(v) for v in variants], locale=locale, top_docs=8, min_coverage=min_coverage,
-               min_strong=min_strong, max_queries=5, match_query=f"{q} {cx}".strip(),
-               required=[t for t in terms(cx) if t not in GENERIC], max_docs=24, domains=domains, net=net,
-               sufficient=lambda ev: any(extract_recommendations(pz["text"], pz["section"], e["title"])
-                                         for e in ev for pz in e["passages"]))
+    # versão/edição do SO ("Windows Server 2025") ajuda a BUSCAR, mas não é termo de conferência: as páginas raramente a repetem
+    cx_match = " ".join(t for t in terms(cx) if not re.fullmatch(r"(19|20)\d\d|r2|windows|server", t))
+
+    def run(match_q: str) -> dict:
+        return ground([check_query(v) for v in variants], locale=locale, top_docs=8, min_coverage=min_coverage,
+                      min_strong=min_strong, max_queries=5, match_query=f"{match_q} {cx_match}".strip(),
+                      required=[t for t in terms(cx_match) if t not in GENERIC], max_docs=MAX_PAGES_TOTAL, domains=domains,
+                      net=net,
+                      sufficient=lambda ev: any(extract_recommendations(pz["text"], pz["section"], e["title"])
+                                                for e in ev for pz in e["passages"]))
+    g = run(q)
+    if not g.get("evidence_found") and not g.get("needs_network") and alt_q:
+        g = run(alt_q)  # mesma pergunta com o termo sinônimo; as páginas já estão no cache (0 requisição nova)
     if g.get("needs_network"):
         return {"supported": False, "needs_network": True, "observed": observed or None, "context": ctx,
                 "network": g["network"], "message": g["message"]}

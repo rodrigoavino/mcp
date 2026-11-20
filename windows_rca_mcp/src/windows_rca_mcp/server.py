@@ -2531,7 +2531,7 @@ def _member_source(sid: str, is_local: bool) -> str:
 
 
 @mcp.tool
-def get_local_groups(host: str, group: str | None = None, include_users: bool = True):
+def get_local_groups(host: str, group: str | None = None, include_users: bool | None = None):
     """TODOS os grupos locais e seus membros (independe do idioma: usa SID). Para cada grupo: nome, SID, descrição,
     se é grupo interno, e membros com tipo (usuário/grupo), origem (local/domínio/AzureAD), SID, e, para contas
     locais, estado (habilitada, último logon, senha alterada em, senha nunca expira). Resolve SIDs de domínio
@@ -2539,10 +2539,13 @@ def get_local_groups(host: str, group: str | None = None, include_users: bool = 
     de domínio (o significado do RID é do RAG). Inclui 'signals' (só fatos): SIDs não resolvidos, principais de domínio/Azure AD no grupo
     Administradores, contas locais habilitadas com senha que nunca expira, contas desabilitadas como membros e
     quantidade de grupos vazios. Não classifica nada como 'privilegiado' nem recomenda: isso é do RAG (microsoft-docs).
-    'group' filtra por nome; include_users=False omite a lista de contas locais.
+    'group' filtra por nome; include_users omite/inclui a lista de contas locais (padrão: omitida quando 'group' é
+    informado, incluída na listagem de todos os grupos).
     Em controlador de domínio não há grupos locais (use as ferramentas de AD)."""
     if group is not None and not NAME_RE.match(group):
         raise ValueError("group inválido")
+    if include_users is None:
+        include_users = group is None
     res = _ps(host, r"""
 $ErrorActionPreference = 'Continue'
 if ((Get-CimInstance Win32_ComputerSystem).DomainRole -ge 4) { [pscustomobject]@{ IsDomainController=$true } | ConvertTo-Json -Compress; return }
