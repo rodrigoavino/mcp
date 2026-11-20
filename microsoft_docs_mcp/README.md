@@ -90,7 +90,7 @@ claude mcp add microsoft-docs --scope user -- uv --directory C:\mcp\microsoft_do
 | Consulta com IP, e-mail, FQDN, UNC | recusadas; nome de módulo `Microsoft.PowerShell.Management` aceito |
 | Redirecionamento (`dns-top` → `dns-overview`) | seguido e revalidado |
 | `example.com` | recusado |
-| Cinco temas de disco (limite de 2 TB do MBR, GUID do LDM, DNS client, BitLocker, "disco dinâmico obsoleto") | os quatro com documentação acharam a página certa; o último, **sem página que o sustente, deu `sem evidência`** |
+| Cinco temas de disco (limite de 2 TB do MBR, GUID do LDM, DNS client, BitLocker, "disco dinâmico obsoleto") | os quatro primeiros acharam a página certa. O último ("disco dinâmico obsoleto") deu `sem evidência`, mas isso foi um **falso negativo de recuperação**: a página existe (*Convert a disk to Dynamic or Basic*, que diz que discos dinâmicos estão obsoletos e não são recomendados para novas implantações) e a busca ampla do Learn não a trazia. A Fase 1 (domínios) a recupera |
 | SQL Server + cluster 4096, com `search_hints` | recomenda 64 KB, `matches_observed=false`, frase e fonte citadas |
 | O mesmo **sem** `search_hints` | `sem evidência` (a busca do Learn não traz a página sem termos específicos) |
 | Contexto obrigatório: página do comando `format` (fala de unidade de alocação, não de SQL Server) | rejeitada |
@@ -106,6 +106,6 @@ Defeitos achados e corrigidos nos testes:
 
 ## Limitações
 
-- Só o Microsoft Learn tem busca; a busca é fraca e às vezes exige `search_hints` com termos específicos.
+- Só o Microsoft Learn tem busca; a busca é fraca e às vezes exige `search_hints` com termos específicos. **`sem evidência` pode ser falso negativo de recuperação**: significa que não achei, não que a documentação não existe.
 - A extração de recomendação cobre **tamanhos** (KB, MB, GB, TB, bytes). Outros tipos de valor (portas, tempos, nomes de parâmetro) ainda não têm extrator: nesses casos a ferramenta devolve o trecho e diz que não há valor explícito.
 - A recomendação do exemplo vem de um documento do Azure: escopo precisa ser confirmado.
