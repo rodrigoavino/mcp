@@ -6,8 +6,8 @@ MCP (FastMCP) de **OPS para Windows Server**. Serve para o Claude triar incident
 - **Somente leitura.** Nenhuma tool executa comando arbitrário nem altera o servidor alvo. Única exceção: nenhuma. O `_ps_long` envia o script pelo stdin, sem arquivo temporário no alvo.
 - **Logs com foco em problema.** No Event Viewer, só Crítico(1), Erro(2) e Aviso(3).
 - **Período padrão `days=1`** em toda tool que lê log (Event Viewer, CBS/CbsPersist/dism.log, GPO, logons, cluster). Só amplie se o usuário pedir; `_days()` limita a 90.
-- Logs grandes (CBS) são **agrupados** (mensagens normalizadas + top HRESULTs com dica), nunca devolvidos crus.
-- Toda resposta de saúde usa status **OK / Atenção / Crítico**, com achados e ação recomendada.
+- Logs grandes (CBS) são **agrupados** (mensagens normalizadas + top HRESULTs, sem dica: o significado do código é do RAG), nunca devolvidos crus.
+- Toda análise usa status neutros **sem_sinais / sinais_presentes / verificacao_incompleta**, com achados que mostram o limiar do projeto. Nada de severidade (OK/Atenção/Crítico), ação recomendada ou dica: isso é do RAG.
 - **Segurança (definida na revisão do PR 1):**
   - `WINRM_ALLOWED_HOSTS` é obrigatória (fail-closed, aceita curingas) e nunca deve voltar a ser opcional;
   - o modo `http` exige `MCP_AUTH_TOKEN`;
@@ -21,7 +21,7 @@ MCP (FastMCP) de **OPS para Windows Server**. Serve para o Claude triar incident
   - **Carga do servidor só com evidência:** nunca presumir que o servidor é SQL Server, IIS etc. Use `get_workload_evidence`; sem evidência identificadora vale só o SO e a versão. Cliente (SSMS, ODBC) não identifica servidor. O `context` enviado ao RAG vem só de `docs_context`.
   - **Plataforma:** `get_platform_info` diz se é físico, virtual ou nuvem, só por assinatura com a evidência à vista; `indeterminate` quando nada casa. Serial, UUID, asset tag e id de instância são sensíveis: ficam em `identifiers` e nunca vão ao RAG (só `docs_context`).
   - Nada que saia deste MCP para a internet: nenhuma chamada externa aqui. A única exceção é o serviço de metadados da própria instância (`169.254.169.254`, link-local, executado no servidor alvo e só em campos de lista fixa).
-  - Já migradas para fatos + sinais: `get_stopped_auto_services` e `get_local_groups`. Dívida conhecida: ainda trazem julgamento ou recomendação `get_health_summary` e `validate_cbs` (OK/Atenção/Crítico, ações), `get_time_config` ("o recomendado é NT5DS"), `get_cluster_health` ("configure ... witness"), `get_disk_allocation_analysis` ("candidato a reclamação") e as dicas de HRESULT. Devem migrar. Tool nova já nasce sem julgamento.
+  - Migradas para fatos + sinais: `get_stopped_auto_services`, `get_local_groups`, `get_health_summary`, `validate_cbs`, `get_time_config`, `get_cluster_health`, `get_disk_allocation_analysis`, conexões, teaming e as dicas de HRESULT (removidas). Tool nova já nasce sem julgamento.
 
 ## Arquitetura
 - `src/windows_rca_mcp/server.py`: todas as tools (53) e os prompts (`ops_health_check`, `root_cause_analysis`).

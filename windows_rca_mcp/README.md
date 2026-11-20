@@ -166,7 +166,7 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 ### Triagem rápida
 | Tool | O que faz |
 |---|---|
-| `get_health_summary` | **Comece por aqui.** Faz uma única chamada e devolve OK/Atenção/Crítico para CPU, memória, disco, serviços, patches, disponibilidade e eventos. Os limiares são parametrizáveis. |
+| `get_health_summary` | **Comece por aqui.** Faz uma única chamada e devolve `sem_sinais` / `sinais_presentes` / `verificacao_incompleta` para CPU, memória, disco, serviços, patches, disponibilidade e eventos, com o limiar do projeto à vista (parametrizável). Sem severidade nem recomendação. |
 | `get_uptime` | Último boot, uptime, último shutdown planejado (quem/por quê, evento 1074), se o último boot foi inesperado e desligamentos inesperados em 30 dias |
 | `get_system_overview` | SO, build, domínio, CPU/RAM, uptime |
 
@@ -207,7 +207,7 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 | `get_pending_updates` | Updates pendentes (API do agente de Windows Update) |
 | `get_windows_update_history` | Sucessos, falhas e reboots exigidos (eventos 19/20/21) |
 | `get_update_error_analysis` | Falhas agrupadas por HRESULT, com causa provável |
-| `validate_cbs` | **Veredito "o CBS está quebrado?"** (OK/Atenção/Crítico), com evidências e ações recomendadas |
+| `validate_cbs` | **Verificação objetiva do CBS** (`sem_sinais` / `sinais_presentes` / `verificacao_incompleta`), com as evidências coletadas. Não recomenda ação |
 | `get_cbs_health` | DISM /CheckHealth, pending.xml, flags de reboot, TrustedInstaller |
 | `get_cbs_log_errors` | Problemas no CBS.log, CbsPersist e dism.log do período, **agrupados**, com contagem por nível e top HRESULTs com dica |
 | `get_component_store_analysis` | DISM /AnalyzeComponentStore (1 a 3 min) |
@@ -236,7 +236,7 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 ### Failover Cluster
 | Tool | O que faz |
 |---|---|
-| `get_cluster_health` | Se o servidor for nó de cluster: configuração (nível funcional, S2D, thresholds), quorum/witness, nós (estado, voto), roles (dono, nós preferidos), recursos com falha, redes e interfaces, CSVs (espaço, I/O redirecionado), pool S2D e erros recentes, com status OK/Atenção/Crítico. Fora de cluster, responde `Clustered=false` com o motivo. |
+| `get_cluster_health` | Se o servidor for nó de cluster: configuração (nível funcional, S2D, thresholds), quorum/witness, nós (estado, voto), roles (dono, nós preferidos), recursos com falha, redes e interfaces, CSVs (espaço, I/O redirecionado), pool S2D e erros recentes, com sinais objetivos (sem severidade). Fora de cluster, responde `Clustered=false` com o motivo. |
 
 ### Tarefas agendadas, GPO, sessões e segurança
 | Tool | O que faz |
@@ -248,7 +248,7 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 | `get_local_groups` | **Todos os grupos locais e seus membros**: SID, descrição, tipo e origem de cada membro (`Local`, `Interno (BUILTIN)`, `Sistema (NT AUTHORITY)`, `Domínio`, `Azure AD`, `Externo`), estado das contas locais (habilitada, último logon, senha) e **sinais** (só fatos): SIDs não resolvidos, principais de domínio/Azure AD no Administrators, contas locais habilitadas com senha que nunca expira, contas desabilitadas como membros, grupos vazios. Funciona mesmo com o DC inacessível. Não classifica nada como "privilegiado". Filtro por `group` |
 | `get_failed_logons` | Eventos 4625 agrupados por conta + IP, com o motivo traduzido |
 | `get_security_posture` | Defender, firewall, RDP |
-| `get_time_config` | **Configuração NTP completa**: tipo (NT5DS/NTP), servidores, intervalos, fonte, stratum, último sync, peers, papel no domínio, VMICTimeProvider e **offset medido**, com status OK/Atenção/Crítico |
+| `get_time_config` | **Configuração NTP completa**: tipo (NT5DS/NTP), servidores, intervalos, fonte, stratum, último sync, peers, papel no domínio, VMICTimeProvider e **offset medido**, com sinais objetivos (sem severidade nem recomendação) |
 | `get_expiring_certificates` | Certificados vencidos ou próximos do vencimento |
 
 ### Coleta × interpretação
