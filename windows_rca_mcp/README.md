@@ -116,7 +116,7 @@ Depois é só pedir em linguagem natural, por exemplo: *"faça um health check d
 4. Registre no cliente, enviando o token:
    `claude mcp add --transport http windows-ops https://<host>/mcp --header "Authorization: Bearer <token>"`.
 
-## Catálogo de tools (49)
+## Catálogo de tools (53)
 
 Todas recebem `host` (nome ou FQDN do servidor alvo).
 
@@ -163,6 +163,10 @@ Todas recebem `host` (nome ou FQDN do servidor alvo).
 | `get_server_roles` | **Roles instaladas em hierarquia** (role → role services), features e estado dos serviços das roles principais (AD DS, DNS, DHCP, IIS, Hyper-V, Cluster, DFS, RDS, WSUS, AD CS…) |
 | `get_roles_and_features` | Lista plana de roles e features (inclui as não instaladas com `only_installed=false`) |
 | `get_installed_software` | Software instalado (64 e 32 bits) |
+| `get_storage_overview` | **Discos**, só fatos: quantidade, modelo, tamanho, barramento (NVMe/SAS/SATA/SCSI/iSCSI/Virtual) e tipo de mídia (SSD/HDD/SCM) em campos **separados** (`Unspecified` quando o sistema não informa, ex.: disco virtual), GPT/MBR, básico/dinâmico (com a base da detecção), online/offline (+ motivo), somente leitura, saúde, bytes por setor lógico/físico (512n/512e/4Kn). Sinais: `diskOffline`, `diskReadOnly`, `diskNotHealthy`, `dynamicDiskPresent`, `mbrDiskAbove2TiB` (limiar do projeto). Serial e GUID do disco em `identifiers` |
+| `get_volumes` | **Partições e volumes** ligados ao disco: letra e pontos de montagem, GUID do volume, rótulo, sistema de arquivos, tamanho do cluster (bytes), tamanho do volume e da partição, espaço livre (bytes e %), saúde, disco/partição/offset, tipo, somente leitura/oculta/ativa e BitLocker (proteção, estado, bloqueio, % criptografado, método, **tipos** de protetor; nunca senha nem chave de recuperação). BitLocker indisponível = `indeterminate`, nunca "desligado". Sinais: `freeSpaceBelowBaseline` (`low_free_pct`, padrão 15, limiar do projeto), `notHealthy`, `readOnly`, `bitLockerIndeterminate` |
+| `get_platform_info` | **Plataforma**: físico, virtual (VMware, Hyper-V, KVM/QEMU, Xen, VirtualBox) ou nuvem (AWS, Azure, GCP), com a evidência usada (cadeias SMBIOS, agentes de guest, metadados). Físico: fabricante, modelo, BIOS, placa, chassi, CPU, sockets, núcleos e memória. `indeterminate` quando nada casa. O serviço de metadados da instância só é consultado se o SMBIOS indicar nuvem possível (`probe_cloud`), em campos de lista fixa, nunca credenciais nem user-data. `docs_context` traz rótulos genéricos para o RAG; `identifiers` (serial, UUID, id da instância) são sensíveis e não vão ao RAG |
+| `get_workload_evidence` | **Evidência do que o servidor executa**, sem presumir função: SO e versão, e por carga (SQL Server, IIS, Hyper-V, AD DS, DNS, DHCP, Failover Cluster) o serviço, processo, recurso do Windows, instância do SQL Server no registro (edição, versão, patch) ou software de servidor que a identifica. Cliente do SQL Server (SSMS, ODBC) não conta. `docs_context` lista só cargas com evidência e é o `context` aceitável para o RAG; sem evidência, vale só SO e versão |
 
 ### Patches, CBS e Windows Update
 | Tool | O que faz |
@@ -216,6 +220,28 @@ Todas recebem `host` (nome ou FQDN do servidor alvo).
 | `get_security_posture` | Defender, firewall, RDP |
 | `get_time_config` | **Configuração NTP completa**: tipo (NT5DS/NTP), servidores, intervalos, fonte, stratum, último sync, peers, papel no domínio, VMICTimeProvider e **offset medido**, com status OK/Atenção/Crítico |
 | `get_expiring_certificates` | Certificados vencidos ou próximos do vencimento |
+
+### Coleta × interpretação
+Este MCP **só coleta**: fatos observáveis, normalização, sinais objetivos e comparação com baseline do projeto. Boas práticas, recomendação, severidade e fontes documentais ficam no **`microsoft-docs-mcp`** (`C:\mcp\microsoft_docs_mcp`), outro servidor MCP e o único com acesso à internet. O Claude chama o coletor, depois o RAG, e junta fato e evidência citando a fonte. Veja a tabela do que cada um pode afirmar no README do `microsoft-docs-mcp`.
+
+### Armazenamento: onde está cada campo
+| Campo | Tool e campo |
+|---|---|
+| Quantidade de discos | `get_storage_overview.disk_count` |
+| Tipo do disco (SSD/NVMe/SAS/SATA) | `bus_type` (NVMe/SAS/SATA/SCSI...) e `media_type` (SSD/HDD/SCM), separados; `type_text` só junta quando os dois são conhecidos |
+| GPT ou MBR | `partition_style` |
+| Básico ou dinâmico | `volume_kind` e `dynamic_basis` (MBR tipo 0x42, GUIDs LDM do GPT, ou Logical Disk Manager no WMI) |
+| Tamanho do disco | `size_bytes` / `size_gb` |
+| Tamanho da partição | `get_volumes.partition_size_bytes` |
+| Sistema de arquivos | `get_volumes.filesystem` |
+| Cluster size (Allocation Unit Size) | `get_volumes.cluster_size_bytes` |
+| Bytes por setor | `logical_sector_bytes`, `physical_sector_bytes`, `sector_format` |
+| Mount point ou letra | `drive_letter`, `mount_folders` |
+| Espaço livre | `free_bytes`, `free_gb`, `free_percent` |
+| Volume GUID | `volume_guid`, `volume_path` |
+| Online/offline | disco: `online` e `offline_reason`; volume: `health_status`, `operational_status` |
+| ReadOnly | disco: `read_only`; partição: `partition_read_only` |
+| BitLocker | `get_volumes.bitlocker` |
 
 ### Prompts
 - `ops_health_check(host)`: roteiro completo de health check, com relatório por área.
