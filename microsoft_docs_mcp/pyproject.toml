@@ -1,0 +1,17 @@
+[project]
+name = "microsoft-docs-mcp"
+version = "0.1.0"
+description = "MCP (FastMCP) RAG de documentacao oficial Microsoft: busca, le e valida evidencia para interpretar as coletas do windows-rca-mcp. Sem acesso a servidores, sem credenciais."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp>=4.2.2",
+    "requests>=2.31",
+]
+
+[project.scripts]
+microsoft-docs-mcp = "microsoft_docs_mcp:main"
+
+[build-system]
+requires = ["uv_build>=0.13.9,<0.14.0"]
+build-backend = "uv_build"
