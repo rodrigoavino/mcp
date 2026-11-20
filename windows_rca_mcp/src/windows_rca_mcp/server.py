@@ -18,18 +18,30 @@ import json
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import winrm
 from dotenv import find_dotenv, load_dotenv
 from fastmcp import FastMCP
 
+from .envelope import EnvelopeMiddleware
+
 # O .env é procurado a partir do DIRETÓRIO DE TRABALHO (usecwd=True), e não da pasta do pacote, para funcionar
 # também quando instalado via wheel em site-packages.
 load_dotenv(os.getenv("WINRM_ENV_FILE") or find_dotenv(usecwd=True))
 
-mcp = FastMCP("windows-server-ops")
+# Padrão de resposta decidido pelo usuário; o texto abaixo é entregue ao Claude quando ele conecta neste MCP.
+INSTRUCTIONS = """windows-ops: COLETA somente leitura de servidores Windows. Padrão de resposta (decidido pelo usuário):
+1. Responda SÓ o que foi perguntado, de forma enxuta (tabela curta). Em uma linha, SUGIRA o que mais pode ser obtido; só colete mais se o usuário autorizar. Não chame tools extras "por precaução" nem traga boot, uptime, disco, CPU, memória, serviços, usuários, eventos, volumes ou adaptadores se não foram pedidos, não são necessários à resposta e não são erro/diagnóstico relacionado.
+2. Use a tool e o filtro mais estreitos (ex.: installed_since_days para "o que foi instalado hoje").
+3. Toda tool responde {computerName, timestamp, success, data}. Análises completas acrescentam os e summary {status, findings}. moreAvailable é só uma sugestão.
+4. Este MCP afirma só FATOS e sinais objetivos (existe, online, acima de X, diverge da baseline, falhou, corrompido). Nunca melhor prática, recomendação, "inadequado", "deve ser alterado" ou classificação de serviço: isso é do microsoft-docs, e só para pergunta de recomendação, suporte, compatibilidade ou boa prática. Inventário, configuração, serviços, usuários, grupos, discos, eventos, SIDs, RIDs e status nunca disparam consulta externa.
+5. Nunca presuma a função do servidor (ex.: SQL Server) sem evidência (get_workload_evidence); sem evidência vale só o SO e a versão.
+6. Data de instalação de software é fato LOCAL: registro, instalação por usuário, eventos MsiInstaller, Package Management, sistema de arquivos, com a confiança informada. Nunca internet.
+7. Nada inventado: o que não foi coletado não é afirmado."""
+mcp = FastMCP("windows-server-ops", instructions=INSTRUCTIONS)
+mcp.add_middleware(EnvelopeMiddleware())
 
 ALLOWED = [h.strip().lower() for h in os.getenv("WINRM_ALLOWED_HOSTS", "").split(",") if h.strip()]
 HOST_RE = re.compile(r"^[A-Za-z0-9._-]{1,253}$")
@@ -616,17 +628,110 @@ Get-WindowsFeature {flt} | select Name,DisplayName,FeatureType,InstallState,Inst
 """)
 
 
+def _more(what: str) -> str:
+    """Resposta objetiva: o coletor responde só o perguntado e apenas SUGERE o que mais existe; nada é coletado sem pedido."""
+    return f"Há mais dados disponíveis sob pedido ({what}). Nada além do perguntado foi coletado."
+
+
+def _since_label(n: int) -> str:
+    return "hoje" if n == 0 else f"hoje e os {n} dia(s) anteriores (dias de calendário do servidor)"
+
+
+# Data de instalação = fato LOCAL do host. NUNCA se consulta internet, Microsoft Learn ou documentação para determiná-la.
+# Ordem de evidências (regra do projeto): 1) registro Uninstall (InstallDate), 2) instalação por usuário (HKCU e HKEY_USERS
+# carregados), 3) eventos MsiInstaller (1033 com status 0, 11707), 4) Package Management (só se o provedor expuser data),
+# 5) sistema de arquivos (CreationTime da pasta do produto, senão do executável). O evento 11724 NÃO é usado: não confirmado
+# localmente como instalação (pelo que se sabe, é remoção).
+INSTALL_CONFIDENCE = {"Registry": "high", "MsiInstaller": "medium", "PackageManagement": "medium", "FileSystem": "low"}
+
+
 @mcp.tool
-def get_installed_software(host: str, name_filter: str = "*"):
-    """Software instalado (registro de Uninstall, 64 e 32 bits)."""
+def get_installed_software(host: str, name_filter: str = "*", installed_since_days: int | None = None):
+    """Software instalado, como o 'Adicionar ou remover programas' (registro de Uninstall 64/32 bits e instalações por
+    usuário; sem componentes de sistema, entradas sem nome e atualizações). Cada item: name, version, installDate (data de
+    calendário do servidor), confidence (high | medium | low) e source (Registry | MsiInstaller | PackageManagement |
+    FileSystem). A data vem SÓ de evidência local, em ordem: InstallDate do registro (high), eventos MsiInstaller 1033/11707
+    (medium), Package Management (medium), CreationTime da pasta/executável (low). installed_since_days filtra por dias de
+    calendário do servidor (0 = hoje, 1 = hoje e ontem...): com ele devolve SÓ os programas do período. Sem ele, o inventário.
+    Não traz nada além do perguntado; só sugere o que mais pode ser obtido."""
     if not SVC_RE.match(name_filter):
         raise ValueError("name_filter inválido")
-    return _ps(host, rf"""
-$p='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-   'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
-Get-ItemProperty $p -ErrorAction SilentlyContinue | ? {{ $_.DisplayName -like '{name_filter}' }} |
-  sort DisplayName | select DisplayName,DisplayVersion,Publisher,InstallDate | ConvertTo-Json -Compress
-""")
+    since = -1 if installed_since_days is None else max(0, min(int(installed_since_days), 3650))
+    res = _ps(host, PS_EV + r"""
+$today = (Get-Date).Date
+$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$roots = @(
+  @{ P='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'; S=$null },
+  @{ P='HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'; S=$null },
+  @{ P='HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'; S="user:$sid" })
+foreach ($h in @(Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue | ? { $_.PSChildName -match '^S-1-5-21-[\d-]+$' })) {
+  $roots += @{ P="Registry::HKEY_USERS\$($h.PSChildName)\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"; S="user:$($h.PSChildName)" } }
+$seen = @{}; $items = @()
+foreach ($r in $roots) { foreach ($sub in @(Get-ChildItem $r.P -ErrorAction SilentlyContinue)) {
+  $p = Get-ItemProperty $sub.PSPath -ErrorAction SilentlyContinue
+  if (-not $p.DisplayName -or $p.SystemComponent -eq 1 -or $p.ParentKeyName -or $p.DisplayName -notlike '__F__') { continue }
+  $k = "$($p.DisplayName)|$($p.DisplayVersion)|$($r.S)"; if ($seen[$k]) { continue }; $seen[$k] = 1
+  $items += [pscustomobject]@{ Name=$p.DisplayName; Version=$p.DisplayVersion; ID="$($p.InstallDate)"; Loc=$p.InstallLocation
+    Icon=$p.DisplayIcon; Uninst=$p.UninstallString; Scope=$r.S; Date=$null; Source=$null } } }
+function D($d) { $d.ToString('yyyy-MM-dd') }
+# 1 e 2) InstallDate no registro (HKLM, HKCU e HKEY_USERS carregados)
+foreach ($i in $items) { if ($i.ID -match '^\d{8}$') { try { $i.Date = D ([datetime]::ParseExact($i.ID, 'yyyyMMdd', $null)); $i.Source = 'Registry' } catch {} } }
+# 3) eventos MsiInstaller (1033 com status 0; 11707): só se ainda houver item sem data
+$need = @($items | ? { -not $_.Date })
+if ($need.Count) {
+  $msi = @{}
+  try { foreach ($e in @(Ev 'Application' '__XP__' 4000)) { $n = $null
+      if ($e.Id -eq 1033 -and "$($e.Properties[3].Value)" -eq '0') { $n = "$($e.Properties[0].Value)" }
+      elseif ($e.Id -eq 11707 -and "$($e.Properties[0].Value)" -match '^Product: (.+?) -- Installation completed successfully') { $n = $Matches[1] }
+      if ($n) { $k = $n.ToLower(); if (-not $msi.ContainsKey($k)) { $msi[$k] = $e.TimeCreated } } } } catch {}
+  foreach ($i in $need) { $n = $i.Name.ToLower(); $t = $msi[$n]
+    # só igualdade, ignorando sufixo de arquitetura e de versão no FIM do nome; nada de prefixo (Git não pode herdar a data do GitHub CLI)
+    if (-not $t) { $nn = $n -replace '\s*\((x64|x86|64-bit|32-bit)\)\s*$', '' -replace '\s+v?\d+(\.\d+)+\s*$', ''
+      $key = $msi.Keys | ? { ($_ -replace '\s*\((x64|x86|64-bit|32-bit)\)\s*$', '' -replace '\s+v?\d+(\.\d+)+\s*$', '') -eq $nn } | select -first 1
+      if ($key) { $t = $msi[$key] } }
+    if ($t) { $i.Date = D $t; $i.Source = 'MsiInstaller' } }
+  $need = @($items | ? { -not $_.Date })
+}
+# 4) Package Management: só vale se o provedor expuser uma chave de data
+if ($need.Count) {
+  try { $pk = @(Get-Package -ProviderName Programs -ErrorAction Stop)
+    foreach ($i in $need) { $m = $pk | ? { $_.Name -eq $i.Name } | select -first 1
+      if ($m) { $dk = @($m.Metadata.Keys | ? { $_ -match '^(InstallDate|InstalledOn|InstallationDate)$' })[0]
+        if ($dk -and "$($m.Metadata[$dk])" -match '(\d{4})-?(\d{2})-?(\d{2})') { $i.Date = "$($Matches[1])-$($Matches[2])-$($Matches[3])"; $i.Source = 'PackageManagement' } } } } catch {}
+  $need = @($items | ? { -not $_.Date })
+}
+# 5) sistema de arquivos (baixa confiança): pasta do produto, senão o executável principal
+if ($need.Count) {
+  $skip = @($env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, "$env:SystemRoot\System32") | % { "$_".TrimEnd('\').ToLower() }
+  foreach ($i in $need) { $dir = $null; $exe = $null
+    $loc = "$($i.Loc)".Trim('"').TrimEnd('\')
+    if ($loc -and (Test-Path -LiteralPath $loc -PathType Container)) { $dir = $loc }
+    foreach ($s in "$($i.Icon)", "$($i.Uninst)") { if (-not $exe -and $s -match '"?([A-Za-z]:\\[^",]+?\.exe)') { $f = $Matches[1]
+        if (Test-Path -LiteralPath $f) { $exe = $f; if (-not $dir) { $dir = Split-Path $f -Parent } } } }
+    if ($dir -and (($skip -contains $dir.TrimEnd('\').ToLower()) -or $dir -match '^[A-Za-z]:\\?$')) { $dir = $null }
+    if ($dir) { $i.Date = D (Get-Item -LiteralPath $dir).CreationTime; $i.Source = 'FileSystem' }
+    elseif ($exe) { $i.Date = D (Get-Item -LiteralPath $exe).CreationTime; $i.Source = 'FileSystem' } } }
+[pscustomobject]@{ ServerDate=$today.ToString('yyyy-MM-dd'); UtcOffset=[TimeZoneInfo]::Local.BaseUtcOffset.ToString()
+  Items=@($items | sort Name | select Name,Version,Date,Source,Scope) } | ConvertTo-Json -Depth 4 -Compress
+""".replace("__F__", name_filter).replace("__XP__", _xpath(ids=[1033, 11707], provider="MsiInstaller").replace("'", "''")),  # aspas do XPath dentro de string '...' do PowerShell
+        timeout=120)
+    if not isinstance(res, dict) or "Items" not in res:
+        return res
+    rows = [{"name": x.get("Name"), "version": x.get("Version"), "installDate": x.get("Date"),
+             "confidence": INSTALL_CONFIDENCE.get(x.get("Source")), "source": x.get("Source"),
+             **({"scope": x["Scope"]} if x.get("Scope") else {})} for x in _lst(res.get("Items"))]
+    out = {"host": host, "serverDate": res.get("ServerDate"), "serverUtcOffset": res.get("UtcOffset")}
+    if installed_since_days is None:
+        out.update({"count": len(rows), "software": rows})
+    else:
+        cutoff = (datetime.strptime(res["ServerDate"], "%Y-%m-%d") - timedelta(days=since)).strftime("%Y-%m-%d")
+        sel = [r for r in rows if r["installDate"] and r["installDate"] >= cutoff]
+        out.update({"window": _since_label(since), "count": len(sel), "installed": sel})
+        unknown = sum(1 for r in rows if not r["installDate"])
+        if unknown:
+            out["dateUnknown"] = unknown   # só aparece se houver itens sem data: afeta a confiança da resposta
+    out["more_available"] = _more("inventário completo, editora e local de instalação, patches do período, reinicializações, eventos de erro")
+    return out
 
 
 # ---------- camada de armazenamento (discos, partições, volumes, BitLocker) ----------
@@ -1648,9 +1753,32 @@ $unexp30 = @(Get-WinEvent -FilterHashtable @{LogName='System';Id=41,6008;StartTi
 
 
 @mcp.tool
-def get_last_patches(host: str, top: int = 10):
+def get_last_patches(host: str, top: int = 10, installed_since_days: int | None = None):
     """Últimos patches aplicados: Get-HotFix (KB, data, dias atrás) + instalações com sucesso do Windows
-    Update (evento 19), build/UBR atual e dias desde o último patch."""
+    Update (evento 19), build/UBR atual e dias desde o último patch. installed_since_days (0 = hoje, 1 = hoje e ontem, dias de
+    calendário do servidor) devolve SÓ os patches do período (KB, descrição e data), sem build nem outros dados; o Get-HotFix
+    informa só a DATA, não a hora. Só sugere o que mais pode ser obtido."""
+    if installed_since_days is not None:
+        n = max(0, min(int(installed_since_days), 3650))
+        res = _ps(host, r"""
+$today = (Get-Date).Date; $since = $today.AddDays(-__S__)
+$hf = @(Get-HotFix | ? { $_.InstalledOn -and $_.InstalledOn.Date -ge $since } | sort InstalledOn -desc |
+  select @{n='Kb';e={$_.HotFixID}}, Description, @{n='InstalledOn';e={$_.InstalledOn.ToString('yyyy-MM-dd')}})
+$wu = @(Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-WindowsUpdateClient/Operational';Id=19;StartTime=$since} -ErrorAction SilentlyContinue |
+  select @{n='Time';e={$_.TimeCreated.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')}}, @{n='Update';e={$_.Properties[0].Value}})
+[pscustomobject]@{ ServerDate=$today.ToString('yyyy-MM-dd'); UtcOffset=[TimeZoneInfo]::Local.BaseUtcOffset.ToString(); HotFixes=$hf; WuInstalls=$wu } | ConvertTo-Json -Depth 4 -Compress
+""".replace("__S__", str(n)), timeout=90)
+        if not isinstance(res, dict) or "HotFixes" not in res:
+            return res
+        hf = [{"kb": x.get("Kb"), "description": x.get("Description"), "installedOn": x.get("InstalledOn")} for x in _lst(res.get("HotFixes"))]
+        out = {"host": host, "serverDate": res.get("ServerDate"), "serverUtcOffset": res.get("UtcOffset"),
+               "window": _since_label(n), "count": len(hf), "patches": hf,
+               "note": "Get-HotFix informa só a data da instalação, não a hora."}
+        wu = _lst(res.get("WuInstalls"))
+        if wu:
+            out["windowsUpdateInstallEvents"] = wu   # só aparece se houver eventos de instalação no período
+        out["more_available"] = _more("build atual, histórico de falhas do Windows Update, reinicializações, software instalado no período")
+        return out
     return _ps(host, r"""
 $now = Get-Date
 $nt = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'

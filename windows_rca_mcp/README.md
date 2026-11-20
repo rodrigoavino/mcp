@@ -120,6 +120,36 @@ Depois é só pedir em linguagem natural, por exemplo: *"faça um health check d
 
 Todas recebem `host` (nome ou FQDN do servidor alvo).
 
+### Padrão de resposta (envelope)
+Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`:
+
+```json
+{ "computerName": "FASTMCP", "timestamp": "2026-11-20T20:00:00Z", "success": true, "data": {} }
+```
+
+- **Análises completas** (painel de saúde etc.) acrescentam `os` e `summary` (`status` e quantidade de `findings`); os achados ficam em `data`.
+- **`moreAvailable`** (opcional) é **uma linha** que apenas sugere o que mais pode ser obtido. O coletor não coleta nada além do perguntado.
+- **Falha:** `{ "computerName", "timestamp", "success": false, "error": "..." }`. Erros de uso (host inválido, fora da allowlist) continuam como erro do MCP.
+- **Não entram por padrão** (boot, uptime, disco, CPU, memória, serviços, usuários, eventos, volumes, adaptadores de rede): só se a pergunta pedir, se forem necessários para responder ou se forem erro/diagnóstico relacionado.
+- O envelope é aplicado na **fronteira do MCP** (middleware do FastMCP), então as funções Python e as chamadas internas entre tools seguem devolvendo o dado cru, e toda tool nova já nasce no padrão.
+- O MCP entrega ao Claude, ao conectar, as **instruções** desse padrão (responder só o perguntado e sugerir o resto, usar o filtro mais estreito, só fatos, carga só com evidência, data de instalação só local, nada inventado).
+
+### Data de instalação de software (fato local)
+`get_installed_software` determina a data **só com evidência local do host, nunca internet ou documentação**, nesta ordem, e informa a confiança:
+
+| Prioridade | Fonte | `source` | `confidence` |
+|---|---|---|---|
+| 1 | `InstallDate` no registro Uninstall (HKLM 64 e 32 bits) | `Registry` | `high` |
+| 2 | Instalação por usuário (HKCU e HKEY_USERS carregados) | `Registry` (com `scope`) | `high` (se tiver `InstallDate`) |
+| 3 | Eventos `MsiInstaller` 1033 (status 0) e 11707 | `MsiInstaller` | `medium` |
+| 4 | Package Management (só se o provedor expuser data; o provedor `Programs` não expõe) | `PackageManagement` | `medium` |
+| 5 | `CreationTime` da pasta do produto, senão do executável | `FileSystem` | `low` |
+
+- O evento **11724 não é usado**: pelo que se sabe é de remoção, e não há nenhum no servidor de teste para confirmar.
+- A correspondência de evento com programa é por **nome igual** (ignorando arquitetura e versão no fim); nunca por prefixo.
+- Hives de outros usuários **não carregados** não são lidos (carregá-los seria alterar o servidor).
+- `installed_since_days` (0 = hoje, 1 = hoje e ontem, dias de calendário do servidor) devolve **só** os programas do período; `get_last_patches` tem o mesmo parâmetro e o `Get-HotFix` informa só a data, não a hora.
+
 ### Padrão de coleta de logs (foco em problema, análise rápida)
 - **Event Viewer:** só **Crítico (1), Erro (2) e Aviso (3)**. Informativos ficam de fora, a não ser que `levels=[4]` seja pedido explicitamente.
 - **Período padrão: `days=1`** (último dia) em todas as tools de log: `get_events`, `get_event_summary`, `get_reboot_and_crash_history`, `get_service_failures`, `get_windows_update_history`, `get_update_error_analysis`, `get_cbs_log_errors`, `validate_cbs`, `get_applied_gpos`, `get_failed_logons` e `get_cluster_health`. Para analisar mais dias, informe `days` (máximo 90).
@@ -162,7 +192,7 @@ Todas recebem `host` (nome ou FQDN do servidor alvo).
 | `get_service_failures` | Falhas do Service Control Manager (eventos 70xx) |
 | `get_server_roles` | **Roles instaladas em hierarquia** (role → role services), features e estado dos serviços das roles principais (AD DS, DNS, DHCP, IIS, Hyper-V, Cluster, DFS, RDS, WSUS, AD CS…) |
 | `get_roles_and_features` | Lista plana de roles e features (inclui as não instaladas com `only_installed=false`) |
-| `get_installed_software` | Software instalado (64 e 32 bits) |
+| `get_installed_software` | Software instalado como no "Adicionar ou remover programas" (sem componentes de sistema nem atualizações; inclui instalações por usuário). Cada item: `name`, `version`, `installDate`, `confidence`, `source`. `installed_since_days` devolve só o período |
 | `get_storage_overview` | **Discos**, só fatos: quantidade, modelo, tamanho, barramento (NVMe/SAS/SATA/SCSI/iSCSI/Virtual) e tipo de mídia (SSD/HDD/SCM) em campos **separados** (`Unspecified` quando o sistema não informa, ex.: disco virtual), GPT/MBR, básico/dinâmico (com a base da detecção), online/offline (+ motivo), somente leitura, saúde, bytes por setor lógico/físico (512n/512e/4Kn). Sinais: `diskOffline`, `diskReadOnly`, `diskNotHealthy`, `dynamicDiskPresent`, `mbrDiskAbove2TiB` (limiar do projeto). Serial e GUID do disco em `identifiers` |
 | `get_volumes` | **Partições e volumes** ligados ao disco: letra e pontos de montagem, GUID do volume, rótulo, sistema de arquivos, tamanho do cluster (bytes), tamanho do volume e da partição, espaço livre (bytes e %), saúde, disco/partição/offset, tipo, somente leitura/oculta/ativa e BitLocker (proteção, estado, bloqueio, % criptografado, método, **tipos** de protetor; nunca senha nem chave de recuperação). BitLocker indisponível = `indeterminate`, nunca "desligado". Sinais: `freeSpaceBelowBaseline` (`low_free_pct`, padrão 15, limiar do projeto), `notHealthy`, `readOnly`, `bitLockerIndeterminate` |
 | `get_platform_info` | **Plataforma**: físico, virtual (VMware, Hyper-V, KVM/QEMU, Xen, VirtualBox) ou nuvem (AWS, Azure, GCP), com a evidência usada (cadeias SMBIOS, agentes de guest, metadados). Físico: fabricante, modelo, BIOS, placa, chassi, CPU, sockets, núcleos e memória. `indeterminate` quando nada casa. O serviço de metadados da instância só é consultado se o SMBIOS indicar nuvem possível (`probe_cloud`), em campos de lista fixa, nunca credenciais nem user-data. `docs_context` traz rótulos genéricos para o RAG; `identifiers` (serial, UUID, id da instância) são sensíveis e não vão ao RAG |
@@ -171,7 +201,7 @@ Todas recebem `host` (nome ou FQDN do servidor alvo).
 ### Patches, CBS e Windows Update
 | Tool | O que faz |
 |---|---|
-| `get_last_patches` | Últimos patches aplicados (HotFix e Windows Update), build/UBR, dias desde o último patch |
+| `get_last_patches` | Últimos patches aplicados (HotFix e Windows Update), build/UBR, dias desde o último patch. `installed_since_days` devolve só os patches do período (KB, descrição e data) |
 | `get_patch_status` | Dias sem patch, WSUS, últimas detecção/instalação, reboot pendente |
 | `get_recent_hotfixes` | Últimos KBs (Get-HotFix) |
 | `get_pending_updates` | Updates pendentes (API do agente de Windows Update) |
