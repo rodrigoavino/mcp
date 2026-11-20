@@ -19,7 +19,7 @@ O Claude chama o coletor (fatos), e só quando a pergunta é de recomendação, 
 2. **Nada inventado.** Sem evidência: *"Não encontrei documentação oficial da Microsoft que confirme essa informação."*
 3. **Carga do servidor só com evidência** (SQL Server etc.). Sem evidência vale só o SO e a versão.
 4. **Consulta externa só para recomendação, suporte, compatibilidade ou boa prática.** Inventário, configuração, serviços, usuários, grupos, discos, eventos, SIDs, RIDs e status nunca saem para a internet. As tools do RAG exigem `intent` e recusam o resto antes de qualquer requisição.
-5. **Data de instalação de software é fato local** (registro, instalação por usuário, eventos MsiInstaller, Package Management, sistema de arquivos), com confiança `high`, `medium` ou `low`.
+5. **Data de instalação de software é fato local** (registro, instalação por usuário, MSI em Installer/UserData, eventos MsiInstaller, Package Management, sistema de arquivos), com confiança `high`, `medium` ou `low`.
 6. **Resposta objetiva**: só o perguntado, em formato enxuto, com uma linha sugerindo o que mais existe. Todas as tools do coletor respondem `{computerName, timestamp, success, data}` (análises acrescentam `os` e `summary`).
 
 Os dois servidores entregam essas regras ao Claude no handshake (campo `instructions`).

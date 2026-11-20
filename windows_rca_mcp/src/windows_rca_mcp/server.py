@@ -639,18 +639,19 @@ def _since_label(n: int) -> str:
 
 # Data de instalação = fato LOCAL do host. NUNCA se consulta internet, Microsoft Learn ou documentação para determiná-la.
 # Ordem de evidências (regra do projeto): 1) registro Uninstall (InstallDate), 2) instalação por usuário (HKCU e HKEY_USERS
-# carregados), 3) eventos MsiInstaller (1033 com status 0, 11707), 4) Package Management (só se o provedor expuser data),
+# carregados), 2b) MSI em Installer\UserData (InstallProperties\InstallDate; Win32_Product NUNCA: dispara reparo de MSI), 3) eventos MsiInstaller (1033 com status 0, 11707), 4) Package Management (só se o provedor expuser data),
 # 5) sistema de arquivos (CreationTime da pasta do produto, senão do executável). O evento 11724 NÃO é usado: não confirmado
 # localmente como instalação (pelo que se sabe, é remoção).
-INSTALL_CONFIDENCE = {"Registry": "high", "MsiInstaller": "medium", "PackageManagement": "medium", "FileSystem": "low"}
+INSTALL_CONFIDENCE = {"Registry": "high", "MsiUserData": "high", "MsiInstaller": "medium", "PackageManagement": "medium", "FileSystem": "low"}
 
 
 @mcp.tool
 def get_installed_software(host: str, name_filter: str = "*", installed_since_days: int | None = None):
     """Software instalado, como o 'Adicionar ou remover programas' (registro de Uninstall 64/32 bits e instalações por
     usuário; sem componentes de sistema, entradas sem nome e atualizações). Cada item: name, version, installDate (data de
-    calendário do servidor), confidence (high | medium | low) e source (Registry | MsiInstaller | PackageManagement |
-    FileSystem). A data vem SÓ de evidência local, em ordem: InstallDate do registro (high), eventos MsiInstaller 1033/11707
+    calendário do servidor), confidence (high | medium | low) e source (Registry | MsiUserData | MsiInstaller |
+    PackageManagement | FileSystem). A data vem SÓ de evidência local, em ordem: InstallDate do registro (high), InstallDate do
+    MSI em Installer/UserData (high), eventos MsiInstaller 1033/11707
     (medium), Package Management (medium), CreationTime da pasta/executável (low). installed_since_days filtra por dias de
     calendário do servidor (0 = hoje, 1 = hoje e ontem...): com ele devolve SÓ os programas do período. Sem ele, o inventário.
     Não traz nada além do perguntado; só sugere o que mais pode ser obtido."""
@@ -676,8 +677,22 @@ foreach ($r in $roots) { foreach ($sub in @(Get-ChildItem $r.P -ErrorAction Sile
 function D($d) { $d.ToString('yyyy-MM-dd') }
 # 1 e 2) InstallDate no registro (HKLM, HKCU e HKEY_USERS carregados)
 foreach ($i in $items) { if ($i.ID -match '^\d{8}$') { try { $i.Date = D ([datetime]::ParseExact($i.ID, 'yyyyMMdd', $null)); $i.Source = 'Registry' } catch {} } }
-# 3) eventos MsiInstaller (1033 com status 0; 11707): só se ainda houver item sem data
+# 2b) MSI: Installer\UserData\<SID>\Products\<guid>\InstallProperties (InstallDate), só para item ainda sem data
 $need = @($items | ? { -not $_.Date })
+if ($need.Count) {
+  $ud = @{}
+  try { foreach ($ip in @(Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData' -Recurse -ErrorAction SilentlyContinue | ? { $_.PSChildName -eq 'InstallProperties' })) {
+      $q = Get-ItemProperty $ip.PSPath -ErrorAction SilentlyContinue
+      if ($q.DisplayName -and "$($q.InstallDate)" -match '^\d{8}$') { try { $ud[$q.DisplayName.ToLower()] = D ([datetime]::ParseExact("$($q.InstallDate)", 'yyyyMMdd', $null)) } catch {} } } } catch {}
+  foreach ($i in $need) { $n = $i.Name.ToLower(); $t = $ud[$n]
+    # só igualdade, ignorando sufixo de arquitetura e de versão no FIM do nome (mesma regra dos eventos)
+    if (-not $t) { $nn = $n -replace '\s*\((x64|x86|64-bit|32-bit)\)\s*$', '' -replace '\s+v?\d+(\.\d+)+\s*$', ''
+      $key = $ud.Keys | ? { ($_ -replace '\s*\((x64|x86|64-bit|32-bit)\)\s*$', '' -replace '\s+v?\d+(\.\d+)+\s*$', '') -eq $nn } | select -first 1
+      if ($key) { $t = $ud[$key] } }
+    if ($t) { $i.Date = $t; $i.Source = 'MsiUserData' } }
+  $need = @($items | ? { -not $_.Date })
+}
+# 3) eventos MsiInstaller (1033 com status 0; 11707): só se ainda houver item sem data
 if ($need.Count) {
   $msi = @{}
   try { foreach ($e in @(Ev 'Application' '__XP__' 4000)) { $n = $null
