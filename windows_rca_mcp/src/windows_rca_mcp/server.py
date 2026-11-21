@@ -2722,6 +2722,91 @@ $rows = foreach ($e in $ev) {
     return res
 
 
+# ---------- registro e variáveis de ambiente (somente leitura) ----------
+# Princípio: o coletor lê, não interpreta. Valores cujo NOME sugere segredo não são lidos (voltam como '<mascarado>').
+SECRET_NAME_RE = (r"pass(word|wd|phrase)?|pwd|secret|token|credential|api[_-]?key|private[_-]?key|access[_-]?key|"
+                  r"shared[_-]?key|connection[_-]?string")
+REG_PATH_RE = re.compile(r"^HKLM:\\[A-Za-z0-9 ._,(){}\\-]{1,400}$")
+REG_DENY_RE = re.compile(r"^HKLM:\\(SAM|SECURITY)(\\|$)", re.I)
+REG_MAX_VALUES = 200
+REG_MAX_SUBKEYS = 100
+ENV_SPLIT_VARS = {"path", "psmodulepath", "pathext"}
+
+
+def is_secret_name(name: str) -> bool:
+    return re.search(SECRET_NAME_RE, name or "", re.I) is not None
+
+
+def _reg_path(path: str) -> str:
+    r"""Valida o caminho do registro: só HKLM:\..., sem curingas, aspas ou '..', e nunca SAM/SECURITY."""
+    p = (path or "").strip().rstrip("\\")
+    if not REG_PATH_RE.match(p) or ".." in p.split("\\") or REG_DENY_RE.match(p):
+        raise ValueError(r"Caminho do registro inválido: use HKLM:\SOFTWARE\... (não são permitidos HKCU/HKU, SAM, SECURITY, curingas ou '..')")
+    return p
+
+
+def _env_entries(var: dict) -> dict:
+    """Separa por ';' as variáveis que são listas (Path etc.): fato da estrutura, sem interpretar."""
+    if str(var.get("Name", "")).lower() in ENV_SPLIT_VARS and isinstance(var.get("Value"), str) and not var.get("Masked"):
+        return {"Name": var["Name"], "Entries": [x for x in var["Value"].split(";") if x]}
+    return var
+
+
+@mcp.tool
+def get_registry(host: str, path: str, value: str | None = None):
+    r"""Lê uma chave do registro (somente leitura): valores (nome, tipo, dado) e nomes das subchaves. Só HKLM:\...
+    (ex.: HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion). 'value' devolve só esse valor. SAM e SECURITY são
+    recusados e valores cujo nome sugere segredo (senha, token, chave de API, connection string) voltam como
+    '<mascarado>'. REG_BINARY mostra os primeiros 64 bytes em hexadecimal. Limites: 200 valores e 100 subchaves."""
+    p = _reg_path(path)
+    if value is not None and not NAME_RE.match(value):
+        raise ValueError("value inválido")
+    res = _ps(host, r"""
+$rx = '__RX__'; $want = '__V__'
+try { $k = Get-Item -LiteralPath '__P__' -ErrorAction Stop } catch {
+  [pscustomobject]@{ Exists=$false; Error=$_.Exception.Message } | ConvertTo-Json -Compress; return }
+$vals = foreach ($n in @($k.GetValueNames())) {
+  if ($want -and $n -ne $want) { continue }
+  $kind = "$($k.GetValueKind($n))"; $label = if ($n) { $n } else { '(Default)' }
+  if ($n -match $rx) { [pscustomobject]@{ Name=$label; Kind=$kind; Data='<mascarado>'; Masked=$true }; continue }
+  $d = $k.GetValue($n, $null, 'DoNotExpandEnvironmentNames')
+  if ($d -is [byte[]]) {
+    [pscustomobject]@{ Name=$label; Kind=$kind; Data=(($d | select -First 64 | % { $_.ToString('X2') }) -join ''); Bytes=$d.Length; Truncated=($d.Length -gt 64); Masked=$false }
+  } else { [pscustomobject]@{ Name=$label; Kind=$kind; Data=$d; Masked=$false } }
+}
+$sub = @($k.GetSubKeyNames())
+[pscustomobject]@{ Exists=$true; Path='__P__'; ValueCount=@($k.GetValueNames()).Count; Values=@($vals | select -First __MV__)
+  SubKeyCount=$sub.Count; SubKeys=@($sub | select -First __MS__) } | ConvertTo-Json -Depth 4 -Compress
+""".replace("__RX__", SECRET_NAME_RE).replace("__V__", value or "").replace("__P__", p)
+       .replace("__MV__", str(REG_MAX_VALUES)).replace("__MS__", str(REG_MAX_SUBKEYS)))
+    if isinstance(res, dict) and res.get("Exists") is True:
+        res["Values"] = _lst(res.get("Values"))
+        res["SubKeys"] = _lst(res.get("SubKeys"))
+        if value:
+            res["ValueFound"] = bool(res["Values"])
+    return res
+
+
+@mcp.tool
+def get_environment_variables(host: str, scope: str = "machine"):
+    """Variáveis de ambiente do escopo 'machine' (sistema, padrão) ou 'user' (da conta que a coleta usa no servidor).
+    Nomes que sugerem segredo (senha, token, chave de API, connection string) voltam com valor '<mascarado>'.
+    Path, PSModulePath e PATHEXT vêm separados em 'Entries'. Só leitura."""
+    if scope not in ("machine", "user"):
+        raise ValueError("scope deve ser machine ou user")
+    res = _ps(host, r"""
+$rx = '__RX__'
+$d = [Environment]::GetEnvironmentVariables('__S__')
+$vars = @($d.GetEnumerator() | sort Name | % {
+  if ($_.Key -match $rx) { [pscustomobject]@{ Name="$($_.Key)"; Value='<mascarado>'; Masked=$true } }
+  else { [pscustomobject]@{ Name="$($_.Key)"; Value="$($_.Value)"; Masked=$false } } })
+[pscustomobject]@{ Scope='__S__'; Count=$vars.Count; Variables=$vars } | ConvertTo-Json -Depth 4 -Compress
+""".replace("__RX__", SECRET_NAME_RE).replace("__S__", scope.capitalize()))
+    if isinstance(res, dict) and "Variables" in res:
+        res["Variables"] = [_env_entries(v) for v in _lst(res["Variables"])]
+    return res
+
+
 # ---------- painel de saúde rápido ----------
 @mcp.tool
 def get_health_summary(
