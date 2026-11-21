@@ -3351,6 +3351,337 @@ $priv = @(whoami /priv /fo csv /nh 2>$null | ConvertFrom-Csv -Header Name,Descri
     return _security_context_shape(res)
 
 
+# ---------- arquivos e pastas (somente leitura, com bloqueios) ----------
+# Leitura de caminhos arbitrários, entregue com salvaguardas (é uma LISTA DE BLOQUEIO, melhor esforço, e não uma garantia):
+#  - formato C:\pasta, sem '..', '/', aspas, curingas ou '$' no caminho;
+#  - locais sensíveis recusados (hives do registro, NTDS, DPAPI/credenciais, chaves SSH, System Volume Information);
+#  - arquivos sensíveis recusados pelo nome/extensão (certificados com chave privada, chaves, KeePass, dumps, discos
+#    virtuais, respostas de instalação com senha); mais pastas em WINRM_FILE_DENY_EXTRA (separadas por ';');
+#  - nenhum link simbólico ou junção no caminho (senão seria um desvio da lista de bloqueio);
+#  - arquivos binários não são exibidos; chave privada em texto recusa o arquivo; valores de senha/token/chave mascarados;
+#  - tamanhos limitados (linhas, caracteres por linha, resultados, arquivos comparados).
+FS_DENY_PATH_PATTERNS = [
+    r"^[a-z]:\\windows\\system32\\config(\\|$)",
+    r"\\ntds(\\|$)",
+    r"^[a-z]:\\windows\\system32\\microsoft\\(protect|crypto)(\\|$)",
+    r"\\microsoft\\(credentials|protect|vault|crypto)(\\|$)",
+    r"\\\.ssh(\\|$)",
+    r"^[a-z]:\\system volume information(\\|$)",
+]
+FS_DENY_EXTS = (".pfx", ".p12", ".pem", ".key", ".ppk", ".pvk", ".kdbx", ".kdb", ".jks", ".keystore", ".dit", ".hiv",
+                ".dmp", ".hdmp", ".mdmp", ".rdp", ".vhd", ".vhdx", ".vmdk")
+FS_DENY_NAME_RE = re.compile(r"^(id_(rsa|dsa|ecdsa|ed25519)|\.git-credentials|\.netrc|ntuser\.dat.*|(auto)?unattend\.xml|sysprep\.(xml|inf))$", re.I)
+FS_PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
+FS_ENCODINGS = ("utf8", "unicode", "ascii", "default", "oem", "utf32", "bigendianunicode")
+FS_NAME_FILTER_RE = re.compile(r"^[A-Za-z0-9 _*?.()-]{1,100}$")
+FS_MAX_LINES = 500
+FS_LINE_CHARS = 500
+FS_MAX_LIST = 200
+FS_MAX_FIND = 500
+FS_FIND_VISIT_CAP = 50000
+FS_COMPARE_MAX_LINES = 5000
+FS_COMPARE_MAX_BYTES = 2 * 1024 * 1024
+FS_COMPARE_MAX_DIFFS = 200
+FS_HASH_MAX_BYTES = 200 * 1024 * 1024
+
+
+def _fs_deny_extra() -> list[str]:
+    out = []
+    for d in os.getenv("WINRM_FILE_DENY_EXTRA", "").split(";"):
+        d = d.strip().rstrip(chr(92))
+        if d and PATH_RE.match(d) and ".." not in d.split(chr(92)):
+            out.append(d)
+    return out
+
+
+def _fs_blocked_path(p: str) -> str | None:
+    """Motivo do bloqueio se o caminho (arquivo ou pasta) está numa área recusada; None se liberado."""
+    low = p.lower().rstrip(chr(92))
+    for pat in FS_DENY_PATH_PATTERNS:
+        if re.search(pat, low):
+            return "área sensível (hives do registro, NTDS, credenciais/DPAPI, chaves SSH ou System Volume Information)"
+    for d in _fs_deny_extra():
+        dl = d.lower()
+        if low == dl or low.startswith(dl + chr(92)):
+            return "pasta bloqueada em WINRM_FILE_DENY_EXTRA"
+    return None
+
+
+def _fs_blocked_name(name: str) -> str | None:
+    """Motivo do bloqueio pelo nome/extensão do arquivo; None se liberado."""
+    low = (name or "").lower()
+    if low.endswith(FS_DENY_EXTS):
+        return "tipo de arquivo bloqueado (certificado/chave, KeePass, dump, disco virtual, hive ou RDP)"
+    if FS_DENY_NAME_RE.match(low):
+        return "arquivo sensível (chave SSH, credenciais, resposta de instalação)"
+    return None
+
+
+def _fs_path(path: str) -> str:
+    """Valida o caminho de pasta ou arquivo e recusa as áreas bloqueadas."""
+    p = _path((path or "").strip())
+    if len(p) > 3:
+        p = p.rstrip(chr(92))
+    if "/" in p or ".." in p.split(chr(92)):
+        raise ValueError("Caminho inválido (sem '/' nem '..')")
+    why = _fs_blocked_path(p)
+    if why:
+        raise ValueError(f"Caminho bloqueado: {why}")
+    return p
+
+
+def _fs_file(path: str) -> str:
+    p = _fs_path(path)
+    why = _fs_blocked_name(p.rsplit(chr(92), 1)[-1])
+    if why:
+        raise ValueError(f"Arquivo bloqueado: {why}")
+    return p
+
+
+def _fs_deny_regex() -> str:
+    """Regex único (mesmos padrões do Python) para o script de busca pular pastas bloqueadas."""
+    parts = list(FS_DENY_PATH_PATTERNS)
+    for d in _fs_deny_extra():
+        parts.append("^" + re.escape(d.lower()) + r"(\\|$)")
+    return "|".join(f"(?:{x})" for x in parts).replace("'", "''")
+
+
+def _fs_mask_and_check(texts):
+    """Aplica o mascaramento e detecta chave privada. Devolve (textos, erro_ou_None)."""
+    out = []
+    for t in texts:
+        if isinstance(t, str) and FS_PRIVATE_KEY_RE.search(t):
+            return None, "O arquivo contém uma chave privada: o conteúdo não é exibido"
+        out.append(_mask_secrets(t))
+    return out, None
+
+
+PS_FS_GUARD = r"""
+function Guard([string]$p) {
+  try { $it = Get-Item -LiteralPath $p -Force -ErrorAction Stop } catch { return $_.Exception.Message }
+  if ($it.PSIsContainer) { return 'O caminho é uma pasta, não um arquivo' }
+  $x = $it
+  while ($x) {
+    if ($x.Attributes -band [IO.FileAttributes]::ReparsePoint) { return 'Link simbólico ou junção no caminho: use o caminho real' }
+    $x = if ($x.PSIsContainer) { $x.Parent } else { $x.Directory } }
+  $fs = [IO.File]::Open($p, 'Open', 'Read', 'ReadWrite')
+  try { $buf = New-Object byte[] 4096; $n = $fs.Read($buf, 0, 4096) } finally { $fs.Dispose() }
+  if ($n -gt 0) {
+    $bom = ($n -ge 2 -and (($buf[0] -eq 255 -and $buf[1] -eq 254) -or ($buf[0] -eq 254 -and $buf[1] -eq 255))) -or
+           ($n -ge 3 -and $buf[0] -eq 239 -and $buf[1] -eq 187 -and $buf[2] -eq 191)
+    if (-not $bom -and ($buf[0..($n - 1)] -contains 0)) { return 'Arquivo binário: o conteúdo não é exibido' } }
+  return $null
+}
+"""
+
+PS_FS_DIRGUARD = r"""
+function DirGuard([string]$d) {
+  try { $it = Get-Item -LiteralPath $d -Force -ErrorAction Stop } catch { return $_.Exception.Message }
+  if (-not $it.PSIsContainer) { return 'O caminho é um arquivo, não uma pasta' }
+  $x = $it
+  while ($x) {
+    if ($x.Attributes -band [IO.FileAttributes]::ReparsePoint) { return 'Link simbólico ou junção no caminho: use o caminho real' }
+    $x = $x.Parent }
+  return $null
+}
+"""
+
+
+def _fs_result(res, host: str):
+    """Recusas do servidor viram erro; linhas e diferenças passam por mascaramento e checagem de chave privada."""
+    if isinstance(res, dict) and res.get("Refused"):
+        return {"host": host, "error": res["Refused"]}
+    if not isinstance(res, dict):
+        return res
+    if "Lines" in res:
+        lines = [x.get("value") if isinstance(x, dict) else x for x in _lst(res.get("Lines"))]
+        lines, err = _fs_mask_and_check(lines)
+        if err:
+            return {"host": host, "error": err}
+        res["Lines"] = lines
+    if "Diffs" in res:
+        diffs = [d for d in _lst(res.get("Diffs")) if isinstance(d, dict)]
+        texts, err = _fs_mask_and_check([d.get("Text") for d in diffs])
+        if err:
+            return {"host": host, "error": err}
+        for d, t in zip(diffs, texts):
+            d["Text"] = t
+        res["Diffs"] = diffs
+    return res
+
+
+@mcp.tool
+def list_directory(host: str, path: str, name_filter: str | None = None, top: int = 100):
+    r"""Lista o conteúdo de UMA pasta (somente leitura), do mais recente ao mais antigo: nome, tipo, tamanho, última
+    gravação, atributos e se é link. 'path' no formato C:\pasta; 'name_filter' aceita curinga; até 200 itens (padrão 100).
+    Itens cujo conteúdo é bloqueado para leitura vêm com ReadBlocked=true. Recusa áreas sensíveis, links e junções."""
+    p = _fs_path(path)
+    if name_filter is not None and not FS_NAME_FILTER_RE.match(name_filter):
+        raise ValueError("name_filter inválido")
+    n = max(1, min(int(top), FS_MAX_LIST))
+    res = _ps(host, PS_FS_DIRGUARD + r"""
+$d = '__D__'; $f = '__F__'
+$r = DirGuard $d
+if ($r) { [pscustomobject]@{ Refused=$r } | ConvertTo-Json -Compress; return }
+$all = @(Get-ChildItem -LiteralPath $d -Force -ErrorAction SilentlyContinue | ? { -not $f -or $_.Name -like $f })
+[pscustomobject]@{ Directory=$d; Total=$all.Count; Entries=@($all | sort LastWriteTime -Descending | select -First __N__ | % {
+  [pscustomobject]@{ Name=$_.Name; IsDirectory=[bool]$_.PSIsContainer; SizeBytes=$(if ($_.PSIsContainer) { $null } else { $_.Length })
+    LastWriteTime=$_.LastWriteTime; Attributes="$($_.Attributes)"; IsLink=[bool]($_.Attributes -band [IO.FileAttributes]::ReparsePoint) } }) } | ConvertTo-Json -Depth 4 -Compress
+""".replace("__N__", str(n)).replace("__D__", p).replace("__F__", name_filter or ""))
+    res = _fs_result(res, host)
+    if isinstance(res, dict) and "Entries" in res:
+        res["Entries"] = [e for e in _lst(res["Entries"]) if isinstance(e, dict)]
+        for e in res["Entries"]:
+            child = p.rstrip(chr(92)) + chr(92) + str(e.get("Name"))
+            e["ReadBlocked"] = bool(_fs_blocked_path(child) or (not e.get("IsDirectory") and _fs_blocked_name(str(e.get("Name")))))
+        res["Truncated"] = (res.get("Total") or 0) > len(res["Entries"])
+    return res
+
+
+@mcp.tool
+def find_files(host: str, path: str, pattern: str, max_depth: int = 5, max_results: int = 100):
+    r"""Procura ARQUIVOS pelo nome (wildcard, ex.: '*.config', 'web.config') a partir de uma pasta, sem seguir links ou
+    junções e sem entrar em áreas bloqueadas (somente leitura). max_depth 0-10 (padrão 5), até 500 resultados (padrão
+    100), com caminho, tamanho e última gravação. Lê no máximo 50.000 itens: 'Visited' informa quantos e 'Truncated'
+    avisa se a busca foi cortada. Procura por NOME; para texto dentro de arquivos use search_log (logs) ou read_file."""
+    p = _fs_path(path)
+    if not FS_NAME_FILTER_RE.match(pattern or ""):
+        raise ValueError("pattern inválido (letras, números, espaço, '*', '?', '.', '(', ')', '-' e '_')")
+    depth = max(0, min(int(max_depth), 10))
+    cap = max(1, min(int(max_results), FS_MAX_FIND))
+    res = _ps(host, PS_FS_DIRGUARD + r"""
+$root = '__D__'; $pat = '__PAT__'; $max = __DEPTH__; $cap = __CAP__; $visitCap = __VC__; $deny = '__DENY__'
+$r = DirGuard $root
+if ($r) { [pscustomobject]@{ Refused=$r } | ConvertTo-Json -Compress; return }
+$script:n = 0; $script:v = 0; $script:res = New-Object System.Collections.ArrayList
+function Walk([string]$d, [int]$depth) {
+  if ($depth -gt $max -or $script:n -ge $cap -or $script:v -ge $visitCap) { return }
+  foreach ($c in @(Get-ChildItem -LiteralPath $d -Force -ErrorAction SilentlyContinue)) {
+    $script:v++
+    if ($c.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+    if ($c.PSIsContainer) { if ($c.FullName -inotmatch $deny) { Walk $c.FullName ($depth + 1) } }
+    elseif ($c.Name -like $pat) { [void]$script:res.Add([pscustomobject]@{ Path=$c.FullName; SizeBytes=$c.Length; LastWriteTime=$c.LastWriteTime }); $script:n++ }
+    if ($script:n -ge $cap -or $script:v -ge $visitCap) { return } } }
+Walk $root 0
+[pscustomobject]@{ Root=$root; Pattern=$pat; Visited=$script:v; Count=$script:n; Files=@($script:res) } | ConvertTo-Json -Depth 4 -Compress
+""".replace("__DEPTH__", str(depth)).replace("__CAP__", str(cap)).replace("__VC__", str(FS_FIND_VISIT_CAP))
+       .replace("__DENY__", _fs_deny_regex()).replace("__D__", p).replace("__PAT__", pattern), timeout=240)
+    res = _fs_result(res, host)
+    if isinstance(res, dict) and "Files" in res:
+        res["Files"] = [f for f in _lst(res["Files"]) if isinstance(f, dict)]
+        for f in res["Files"]:
+            f["ReadBlocked"] = bool(_fs_blocked_path(str(f.get("Path"))) or _fs_blocked_name(str(f.get("Path")).rsplit(chr(92), 1)[-1]))
+        res["Truncated"] = (res.get("Count") or 0) >= cap or (res.get("Visited") or 0) >= FS_FIND_VISIT_CAP
+    return res
+
+
+@mcp.tool
+def file_info(host: str, path: str, hash: bool = False):
+    r"""Metadados de um arquivo ou pasta (somente leitura), no formato C:\caminho: tipo, tamanho, datas de criação,
+    gravação e acesso, atributos, dono, se é link (e o destino) e, para executáveis e bibliotecas, a versão (arquivo,
+    produto, empresa, nome original). hash=true acrescenta o SHA-256 (arquivos até 200 MB e fora da lista de bloqueio).
+    Não lê o conteúdo."""
+    p = _fs_path(path)
+    name = p.rsplit(chr(92), 1)[-1]
+    if hash and _fs_blocked_name(name):
+        raise ValueError("hash recusado: arquivo bloqueado para leitura")
+    res = _ps(host, r"""
+$p = '__P__'; $hash = __H__
+try { $it = Get-Item -LiteralPath $p -Force -ErrorAction Stop } catch {
+  [pscustomobject]@{ Exists=$false; Error=$_.Exception.Message } | ConvertTo-Json -Compress; return }
+$owner = try { (Get-Acl -LiteralPath $p -ErrorAction Stop).Owner } catch { $null }
+$vi = $null
+if (-not $it.PSIsContainer -and $it.VersionInfo -and ($it.VersionInfo.FileVersion -or $it.VersionInfo.ProductName)) {
+  $v = $it.VersionInfo
+  $vi = [pscustomobject]@{ FileVersion=$v.FileVersion; ProductVersion=$v.ProductVersion; ProductName=$v.ProductName
+    CompanyName=$v.CompanyName; OriginalFilename=$v.OriginalFilename; FileDescription=$v.FileDescription } }
+$sha = $null; $shaNote = $null
+if ($hash -and -not $it.PSIsContainer) {
+  if ($it.Length -gt __HM__) { $shaNote = 'Arquivo maior que 200 MB: hash não calculado' }
+  else { $sha = try { (Get-FileHash -LiteralPath $p -Algorithm SHA256 -ErrorAction Stop).Hash } catch { $null } } }
+[pscustomobject]@{ Exists=$true; Path=$it.FullName; IsDirectory=[bool]$it.PSIsContainer
+  SizeBytes=$(if ($it.PSIsContainer) { $null } else { $it.Length })
+  CreationTime=$it.CreationTime; LastWriteTime=$it.LastWriteTime; LastAccessTime=$it.LastAccessTime
+  Attributes="$($it.Attributes)"; Owner=$owner
+  IsLink=[bool]($it.Attributes -band [IO.FileAttributes]::ReparsePoint); LinkType=$it.LinkType; LinkTarget=$(if ($it.Target) { "$($it.Target)" } else { $null })
+  Version=$vi; Sha256=$sha; HashNote=$shaNote } | ConvertTo-Json -Depth 4 -Compress
+""".replace("__H__", "$true" if hash else "$false").replace("__HM__", str(FS_HASH_MAX_BYTES)).replace("__P__", p))
+    if isinstance(res, dict) and res.get("Exists"):
+        res["ReadBlocked"] = bool(_fs_blocked_path(p) or (not res.get("IsDirectory") and _fs_blocked_name(name)))
+    return res
+
+
+@mcp.tool
+def read_file(host: str, path: str, start_line: int = 1, end_line: int = 200, tail: bool = False, encoding: str | None = None):
+    r"""Lê um arquivo de TEXTO (somente leitura), no formato C:\caminho. Por intervalo (start_line a end_line, até 500
+    linhas por chamada) ou, com tail=true, as últimas end_line linhas (máx. 500). encoding opcional: utf8, unicode,
+    ascii, default, oem, utf32, bigendianunicode (padrão: detecta pelo BOM). Linhas cortadas em 500 caracteres e valores
+    de senha/token/chave mascarados. Recusa: áreas e arquivos sensíveis, binários, links/junções e arquivos com chave
+    privada. Para logs de serviços use também get_log_tail/search_log."""
+    p = _fs_file(path)
+    if encoding is not None and encoding.lower() not in FS_ENCODINGS:
+        raise ValueError("encoding inválido. Válidos: " + ", ".join(FS_ENCODINGS))
+    enc = f" -Encoding {encoding.lower()}" if encoding else ""
+    if tail:
+        count = max(1, min(int(end_line), FS_MAX_LINES))
+        read = f"@(Get-Content -LiteralPath $p -Tail {count}{enc} -ErrorAction Stop | % {{ [string]$_ }})"
+        first = None
+    else:
+        s0 = max(1, int(start_line))
+        e0 = int(end_line)
+        if e0 < s0:
+            raise ValueError("end_line deve ser maior ou igual a start_line")
+        e0 = min(e0, s0 + FS_MAX_LINES - 1)
+        read = f"@(Get-Content -LiteralPath $p -TotalCount {e0}{enc} -ErrorAction Stop | select -Skip {s0 - 1} | % {{ [string]$_ }})"
+        first = s0
+    res = _ps(host, PS_FS_GUARD + r"""
+$p = '__P__'
+$r = Guard $p
+if ($r) { [pscustomobject]@{ Refused=$r } | ConvertTo-Json -Compress; return }
+$it = Get-Item -LiteralPath $p -Force
+$lines = __READ__
+[pscustomobject]@{ Path=$p; SizeBytes=$it.Length; LastWriteTime=$it.LastWriteTime; Mode='__MODE__'; StartLine=__FIRST__; LineCount=$lines.Count
+  Lines=@($lines | % { if ($_.Length -gt __C__) { $_.Substring(0, __C__) + '…' } else { $_ } }) } | ConvertTo-Json -Depth 3 -Compress
+""".replace("__READ__", read).replace("__MODE__", "tail" if tail else "range").replace("__FIRST__", str(first) if first else "$null")
+       .replace("__C__", str(FS_LINE_CHARS)).replace("__P__", p))
+    return _fs_result(res, host)
+
+
+@mcp.tool
+def compare_files(host: str, path_a: str, path_b: str, max_diffs: int = 100):
+    r"""Compara dois arquivos de TEXTO do mesmo servidor, linha a linha (somente leitura): 'Identical', quantas linhas
+    cada um tem, 'DiffCount' e as diferenças (Side OnlyInA ou OnlyInB, número da linha e texto, até 200). Cada arquivo:
+    até 2 MB e 5.000 linhas. Mesmas proteções de read_file (áreas e arquivos sensíveis, binários, links, chave privada;
+    segredos mascarados). Útil para comparar o mesmo arquivo de configuração entre duas pastas ou versões."""
+    a, b = _fs_file(path_a), _fs_file(path_b)
+    n = max(1, min(int(max_diffs), FS_COMPARE_MAX_DIFFS))
+    res = _ps(host, PS_FS_GUARD + r"""
+$pa = '__A__'; $pb = '__B__'
+foreach ($p in $pa, $pb) {
+  $r = Guard $p
+  if ($r) { [pscustomobject]@{ Refused="$p : $r" } | ConvertTo-Json -Compress; return }
+  $it = Get-Item -LiteralPath $p -Force
+  if ($it.Length -gt __MB__) { [pscustomobject]@{ Refused="$p : arquivo maior que 2 MB" } | ConvertTo-Json -Compress; return } }
+function Load($p) {
+  $l = @(Get-Content -LiteralPath $p -TotalCount (__ML__ + 1) -ErrorAction Stop | % { [string]$_ })
+  if ($l.Count -gt __ML__) { return $null }
+  $o = New-Object System.Collections.ArrayList; $i = 0
+  foreach ($t in $l) { $i++; [void]$o.Add([pscustomobject]@{ N=$i; Text=$t }) }
+  return ,$o }
+$A = Load $pa; $B = Load $pb
+if ($A -eq $null -or $B -eq $null) { [pscustomobject]@{ Refused='Arquivo com mais de __ML__ linhas' } | ConvertTo-Json -Compress; return }
+$d = @(Compare-Object $A $B -Property Text -PassThru -SyncWindow 50 | sort @{e={$_.SideIndicator}}, N)
+[pscustomobject]@{ PathA=$pa; PathB=$pb; LeftLines=$A.Count; RightLines=$B.Count; DiffCount=$d.Count; Identical=($d.Count -eq 0)
+  Diffs=@($d | select -First __N__ | % { [pscustomobject]@{ Side=$(if ($_.SideIndicator -eq '<=') { 'OnlyInA' } else { 'OnlyInB' }); Line=$_.N
+    Text=$(if ($_.Text.Length -gt __C__) { $_.Text.Substring(0, __C__) + '…' } else { $_.Text }) } }) } | ConvertTo-Json -Depth 4 -Compress
+""".replace("__MB__", str(FS_COMPARE_MAX_BYTES)).replace("__ML__", str(FS_COMPARE_MAX_LINES)).replace("__N__", str(n))
+       .replace("__C__", str(FS_LINE_CHARS)).replace("__A__", a).replace("__B__", b), timeout=180)
+    res = _fs_result(res, host)
+    if isinstance(res, dict) and "Diffs" in res:
+        res["Truncated"] = (res.get("DiffCount") or 0) > len(res["Diffs"])
+    return res
+
+
 # ---------- painel de saúde rápido ----------
 @mcp.tool
 def get_health_summary(
