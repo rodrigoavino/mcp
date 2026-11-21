@@ -2807,6 +2807,60 @@ $vars = @($d.GetEnumerator() | sort Name | % {
     return res
 
 
+# ---------- permissões (ACL) de arquivos e pastas (somente leitura) ----------
+ACL_MAX_ENTRIES = 200
+
+
+GENERIC_RIGHTS = {0x10000000: "GenericAll", 0x20000000: "GenericExecute", 0x40000000: "GenericWrite", 0x80000000: "GenericRead"}
+
+
+def _decode_rights(rights) -> str | None:
+    """Direitos que o .NET devolve só como número (bits GENERIC_* das ACEs de herança, ex.: 268435456) viram nomes.
+    Bits fora dos quatro GENERIC_* ficam em hexadecimal; texto já legível (FullControl...) não é tocado."""
+    if not isinstance(rights, str) or not re.fullmatch(r"-?\d+", rights.strip()):
+        return None
+    v = int(rights) & 0xFFFFFFFF
+    names = [n for bit, n in GENERIC_RIGHTS.items() if v & bit]
+    rest = v & ~sum(GENERIC_RIGHTS)
+    if rest:
+        names.append(f"0x{rest:08X}")
+    return ", ".join(names) or "0"
+
+
+def _acl_shape(res):
+    """Normaliza a resposta: lista de entradas sempre lista e contagem de entradas Deny (fato, sem interpretar)."""
+    if isinstance(res, dict) and res.get("Exists") is True:
+        res["Entries"] = _lst(res.get("Entries"))
+        for e in res["Entries"]:
+            if isinstance(e, dict) and (d := _decode_rights(e.get("Rights"))) is not None:
+                e["RightsDecoded"] = d
+        res["DenyEntries"] = sum(1 for e in res["Entries"] if isinstance(e, dict) and e.get("Type") == "Deny")
+        res["Truncated"] = (res.get("EntryCount") or 0) > len(res["Entries"])
+    return res
+
+
+@mcp.tool
+def get_permissions(host: str, path: str):
+    r"""ACL de um arquivo ou pasta (somente leitura), no formato C:\pasta: dono, grupo, se a herança está bloqueada
+    e cada entrada (identidade, SID, Allow/Deny, direitos, herdada, flags de herança), até 200 entradas. Útil para
+    erros de 'acesso negado'. Devolve só fatos: não classifica nenhuma permissão como excessiva ou adequada."""
+    p = _path(path).rstrip("\\") if len(path) > 3 else _path(path)
+    res = _ps(host, r"""
+$p = '__P__'
+try { $a = Get-Acl -LiteralPath $p -ErrorAction Stop } catch {
+  [pscustomobject]@{ Exists=$false; Error=$_.Exception.Message } | ConvertTo-Json -Compress; return }
+function Sid($i) { try { "$($i.Translate([Security.Principal.SecurityIdentifier]).Value)" } catch { $null } }
+$all = @($a.Access)
+$rules = @($all | select -First __MAX__ | % { [pscustomobject]@{ Identity="$($_.IdentityReference)"; SID=(Sid $_.IdentityReference)
+  Type="$($_.AccessControlType)"; Rights="$($_.FileSystemRights)"; Inherited=[bool]$_.IsInherited
+  InheritanceFlags="$($_.InheritanceFlags)"; PropagationFlags="$($_.PropagationFlags)" } })
+$it = Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+[pscustomobject]@{ Exists=$true; Path=$p; IsDirectory=[bool]($it -and $it.PSIsContainer); Owner="$($a.Owner)"; Group="$($a.Group)"
+  InheritanceBlocked=[bool]$a.AreAccessRulesProtected; EntryCount=$all.Count; Entries=$rules } | ConvertTo-Json -Depth 4 -Compress
+""".replace("__P__", p).replace("__MAX__", str(ACL_MAX_ENTRIES)))
+    return _acl_shape(res)
+
+
 # ---------- painel de saúde rápido ----------
 @mcp.tool
 def get_health_summary(

@@ -8,7 +8,7 @@ Dois servidores MCP **separados**, com responsabilidades diferentes:
 
 | Servidor | Projeto | Papel | Rede |
 |---|---|---|---|
-| `windows-ops` | `windows_rca_mcp` | **Coleta** somente leitura de servidores Windows via WinRM HTTPS 5986. 56 tools. Só fatos e sinais objetivos | Só WinRM para os servidores permitidos. **Nenhuma chamada externa** |
+| `windows-ops` | `windows_rca_mcp` | **Coleta** somente leitura de servidores Windows via WinRM HTTPS 5986. 57 tools. Só fatos e sinais objetivos | Só WinRM para os servidores permitidos. **Nenhuma chamada externa** |
 | `microsoft-docs` | `microsoft_docs_mcp` | **RAG** da documentação oficial Microsoft: boas práticas, recomendação, fonte e data. 5 tools | Só internet (Microsoft Learn etc.). **Sem credenciais, sem WinRM** |
 
 O Claude chama o coletor (fatos), e só quando a pergunta é de recomendação, suporte, compatibilidade ou boa prática chama o RAG, juntando fato e evidência com a fonte.
