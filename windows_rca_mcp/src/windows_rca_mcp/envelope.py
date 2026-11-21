@@ -2,7 +2,9 @@
 
 Toda tool responde com o mesmo formato mínimo, e o conteúdo vai SÓ em ``data``:
 
-    {"computerName": "...", "timestamp": "2026-11-20T10:00:00Z", "success": true, "data": ...}
+    {"computerName": "...", "timestamp": "2026-11-20T10:00:00-03:00", "success": true, "data": ...}
+
+- Fuso: todas as datas ISO UTC do dado e o ``timestamp`` saem em GMT-3 (``-03:00``); ajustável com MCP_TZ_OFFSET_HOURS.
 
 - Análises completas (painel de saúde etc.) acrescentam ``os`` e ``summary`` {status, findings}; os achados ficam em ``data``.
 - ``moreAvailable`` (opcional) é UMA linha que apenas SUGERE o que mais pode ser obtido; nada além do perguntado é coletado.
@@ -16,7 +18,9 @@ devolvendo o dado cru, e toda tool nova segue o padrão sem mudar nada.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+import os
+import re
+from datetime import datetime, timedelta, timezone
 
 from fastmcp.server.middleware import Middleware
 from fastmcp.tools.base import ToolResult
@@ -26,8 +30,44 @@ _NAME_KEYS = ("computerName", "Host", "host", "Computer", "computer")
 _ERROR_ONLY = {"error", "host", "hint", "Error"}
 
 
+# Fuso padrão das respostas (decidido pelo usuário): GMT-3, fixo (sem horário de verão). Mude com MCP_TZ_OFFSET_HOURS.
+# Só a APRESENTAÇÃO muda: o servidor segue em UTC e a coleta (janelas de dias, XPath) não é afetada.
+def _tz() -> timezone:
+    try:
+        h = float(os.environ.get("MCP_TZ_OFFSET_HOURS", "-3"))
+    except ValueError:
+        h = -3.0
+    return timezone(timedelta(hours=max(-12.0, min(14.0, h))))
+
+
+_ISO_Z = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+
+
+def to_local(value: str) -> str:
+    """'2026-11-20T23:00:00Z' -> '2026-11-20T20:00:00-03:00'. Só converte o valor INTEIRO no formato ISO UTC; datas
+    sentinela (ano < 1900) e qualquer outro texto ficam como estão."""
+    if not _ISO_Z.match(value) or int(value[:4]) < 1900:
+        return value
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(_tz())
+    except ValueError:
+        return value
+    return dt.isoformat(timespec="seconds")
+
+
+def localize(obj):
+    """Percorre o dado e converte as datas ISO UTC para o fuso padrão (campos de texto livre não são tocados)."""
+    if isinstance(obj, str):
+        return to_local(obj)
+    if isinstance(obj, list):
+        return [localize(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: localize(v) for k, v in obj.items()}
+    return obj
+
+
 def _now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(_tz()).isoformat(timespec="seconds")
 
 
 def build_envelope(host: str | None, raw, now: str | None = None) -> dict:
@@ -60,7 +100,7 @@ def build_envelope(host: str | None, raw, now: str | None = None) -> dict:
         hint = data.pop("more_available", None)
         if isinstance(hint, str):
             env["moreAvailable"] = hint
-    env["data"] = data
+    env["data"] = localize(data)
     return env
 
 

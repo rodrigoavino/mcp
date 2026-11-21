@@ -17,7 +17,7 @@ Claude / cliente MCP ──(stdio ou HTTP)──► FastMCP (este projeto)
 ```
 
 - Cada tool executa um **script PowerShell fixo**, parametrizado só com valores validados (hostname, inteiros, nomes e caminhos passam por regex). Não existe tool de "executar comando".
-- A saída é JSON. As datas são normalizadas para ISO 8601 UTC.
+- A saída é JSON. As datas ISO saem em **GMT-3** (`-03:00`, fixo, sem horário de verão); só a apresentação muda, o servidor segue em UTC. Ajuste com `MCP_TZ_OFFSET_HOURS` (padrão `-3`); datas sentinela (ano < 1900) e textos livres de eventos ficam como estão.
 - Falhas de conexão, autenticação ou SSL voltam como `{"error": ..., "host": ...}` e não derrubam o servidor MCP.
 
 ## Estrutura
