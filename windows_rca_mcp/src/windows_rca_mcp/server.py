@@ -3875,6 +3875,154 @@ $sorted = @($out | sort WastedBytes -Descending)
     return _dup_shape(res)
 
 
+# ---------- logs de eventos (canais) e arquivos .config (somente leitura) ----------
+EVLOG_FILTER_RE = re.compile(r"^[A-Za-z0-9 _*?./-]{1,100}$")
+EVLOG_MAX = 500
+
+
+def _evlog_shape(res, top):
+    """Lista sempre lista; % de uso do arquivo em relação ao tamanho máximo (fato calculado)."""
+    if not isinstance(res, dict) or "Logs" not in res:
+        return res
+    logs = [x for x in _lst(res.get("Logs")) if isinstance(x, dict)]
+    for x in logs:
+        mx, fs = x.get("MaximumSizeInBytes"), x.get("FileSize")
+        x["UsedPct"] = round(100.0 * fs / mx, 1) if isinstance(mx, (int, float)) and mx > 0 and isinstance(fs, (int, float)) else None
+    res["Logs"] = logs
+    res["Truncated"] = (res.get("Matched") or 0) > len(logs)
+    return res
+
+
+@mcp.tool
+def list_event_logs(host: str, name_filter: str = "*", only_enabled: bool = True, min_records: int = 0, top: int = 100):
+    """Lista os LOGS de eventos (canais) do servidor (somente leitura): nome, tipo, se está habilitado, MODO de retenção
+    (Circular, AutoBackup ou Retain), TAMANHO MÁXIMO configurado, tamanho atual do arquivo e % usado, nº de registros,
+    última gravação e se está cheio. 'name_filter' aceita curinga (ex.: 'Microsoft-Windows-GroupPolicy*', 'Security'),
+    only_enabled omite os desabilitados e min_records omite os com poucos registros. Ordenado pelo tamanho do arquivo
+    (maiores primeiro), até 500 (padrão 100); 'Matched' informa quantos casam. Para ler os eventos use get_events."""
+    if not EVLOG_FILTER_RE.match(name_filter or ""):
+        raise ValueError("name_filter inválido (letras, números, espaço, '*', '?', '.', '/', '-' e '_')")
+    n = max(1, min(int(top), EVLOG_MAX))
+    res = _ps(host, r"""
+$f = '__F__'; $onlyEn = __E__; $minR = __R__
+$all = @(Get-WinEvent -ListLog $f -ErrorAction SilentlyContinue | ? { (-not $onlyEn -or $_.IsEnabled) -and ([int64]$_.RecordCount -ge $minR) })
+[pscustomobject]@{ Matched=$all.Count; Logs=@($all | sort FileSize -Descending | select -First __N__ | % { [pscustomobject]@{
+  LogName=$_.LogName; LogType="$($_.LogType)"; IsEnabled=[bool]$_.IsEnabled; LogMode="$($_.LogMode)"
+  MaximumSizeInBytes=[int64]$_.MaximumSizeInBytes; FileSize=[int64]$_.FileSize; RecordCount=$(if ($_.RecordCount -ne $null) { [int64]$_.RecordCount } else { $null })
+  LastWriteTime=$_.LastWriteTime; IsLogFull=[bool]$_.IsLogFull } }) } | ConvertTo-Json -Depth 4 -Compress
+""".replace("__F__", name_filter).replace("__E__", "$true" if only_enabled else "$false")
+       .replace("__R__", str(max(0, int(min_records)))).replace("__N__", str(n)), timeout=120)
+    return _evlog_shape(res, n)
+
+
+CFG_MAX_BYTES = 2 * 1024 * 1024
+CFG_MAX_NODES = 1000
+CFG_MAX_VALUE = 300
+CFG_SECTION_RE = re.compile(r"^[A-Za-z0-9._:-]{1,60}$")
+CFG_EXTS = (".config", ".xml")
+CFG_PWD_RE = re.compile(r"(?i)\b(password|pwd)\b(\s*=\s*)([^;\"']*)")
+CFG_SECRET_VALUE_ATTRS = ("value", "connectionstring", "password", "secret", "token", "key")
+
+
+def _mask_config_text(s):
+    """Em textos de conexão ('Password=...;', 'Pwd=...'), mascara só o valor da senha."""
+    return CFG_PWD_RE.sub(lambda m: m.group(1) + m.group(2) + "***", s) if isinstance(s, str) else s
+
+
+def _mask_config_node(node: dict) -> dict:
+    """Mascara segredos de um nó XML achatado: atributos cujo NOME sugere segredo, o 'value' de entradas cuja chave/nome
+    sugere segredo (<add key="DbPassword" value="..."/>), senhas dentro de connection strings e o texto de elementos
+    cujo nome sugere segredo."""
+    attrs = {str(k): v for k, v in (node.get("Attributes") or {}).items()}
+    label = " ".join(str(attrs.get(k, "")) for k in ("key", "name", "Key", "Name"))
+    entry_secret = is_secret_name(label)
+    out = {}
+    for k, v in attrs.items():
+        kl = k.lower()
+        if kl == "connectionstring":
+            out[k] = _mask_config_text(v)        # só a senha DENTRO da connection string; servidor e banco continuam visíveis
+        elif is_secret_name(k) or (entry_secret and kl in CFG_SECRET_VALUE_ATTRS and kl not in ("key", "name")):
+            out[k] = "<mascarado>"
+        else:
+            out[k] = _mask_config_text(v)
+    text = node.get("Text")
+    last = str(node.get("Path", "")).rsplit("/", 1)[-1].split("[", 1)[0]
+    if text and (is_secret_name(last) or entry_secret):
+        text = "<mascarado>"
+    return {"Path": node.get("Path"), "Attributes": out, "Text": _mask_config_text(text) if text else text}
+
+
+def _config_summary(nodes: list) -> dict:
+    """Atalhos para os casos comuns: appSettings e connectionStrings (já mascarados)."""
+    app, conns = [], []
+    for n in nodes:
+        path, a = str(n.get("Path", "")), n.get("Attributes") or {}
+        parent = path.rsplit("/", 1)[0].split("[", 1)[0].rsplit("/", 1)[-1] if "/" in path else ""
+        last = path.rsplit("/", 1)[-1].split("[", 1)[0]
+        if parent.lower() == "appsettings" and last.lower() == "add" and "key" in a:
+            app.append({"key": a.get("key"), "value": a.get("value")})
+        elif parent.lower() == "connectionstrings" and last.lower() == "add" and "connectionString" in a:
+            cs = a.get("connectionString") or ""
+            srv = re.search(r"(?i)\b(?:data source|server|address|addr|network address)\s*=\s*([^;]+)", cs)
+            db = re.search(r"(?i)\b(?:initial catalog|database)\s*=\s*([^;]+)", cs)
+            integ = re.search(r"(?i)\b(?:integrated security|trusted_connection)\s*=\s*([^;]+)", cs)
+            conns.append({"name": a.get("name"), "provider": a.get("providerName"), "server": srv.group(1).strip() if srv else None,
+                          "database": db.group(1).strip() if db else None,
+                          "integrated_security": integ.group(1).strip() if integ else None, "connection_string": cs})
+    return {"AppSettings": app, "ConnectionStrings": conns}
+
+
+@mcp.tool
+def get_dotnet_config(host: str, path: str, section: str | None = None):
+    r"""Lê um arquivo de configuração XML (.config ou .xml: web.config, app.config, machine.config, applicationHost.config)
+    e devolve a ESTRUTURA como nós (caminho, atributos e texto), até 1.000 nós, mais atalhos 'AppSettings' e
+    'ConnectionStrings' (nome, provedor, servidor, banco, segurança integrada, e a connection string COM A SENHA
+    MASCARADA). 'section' (ex.: 'appSettings', 'system.webServer') limita aos nós daquela seção. Somente leitura, com
+    as mesmas proteções de read_file (áreas e arquivos sensíveis, binários, links), XML sem DTD (sem XXE), arquivo de
+    até 2 MB e segredos mascarados (atributos 'password', chaves como 'DbPassword', 'Pwd=' em connection strings)."""
+    p = _fs_file(path)
+    if not p.lower().endswith(CFG_EXTS):
+        raise ValueError("Só arquivos .config e .xml são lidos por esta tool")
+    if section is not None and not CFG_SECTION_RE.match(section):
+        raise ValueError("section inválida (letras, números, '.', '-', '_' e ':')")
+    res = _ps(host, PS_FS_GUARD + r"""
+$p = '__P__'; $sect = '__S__'; $maxNodes = __MN__; $maxVal = __MV__
+$r = Guard $p
+if ($r) { [pscustomobject]@{ Refused=$r } | ConvertTo-Json -Compress; return }
+$it = Get-Item -LiteralPath $p -Force
+if ($it.Length -gt __MB__) { [pscustomobject]@{ Refused='Arquivo maior que 2 MB' } | ConvertTo-Json -Compress; return }
+try {
+  $st = New-Object System.Xml.XmlReaderSettings; $st.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit; $st.XmlResolver = $null
+  $rd = [System.Xml.XmlReader]::Create($p, $st); $doc = New-Object System.Xml.XmlDocument; $doc.XmlResolver = $null; $doc.Load($rd); $rd.Close()
+} catch { [pscustomobject]@{ Refused=('XML inválido ou com DTD (não permitido): ' + $_.Exception.Message) } | ConvertTo-Json -Compress; return }
+$script:nodes = New-Object System.Collections.ArrayList; $script:trunc = $false
+function Cut([string]$s) { if ($s -and $s.Length -gt $maxVal) { $s.Substring(0, $maxVal) + '…' } else { $s } }
+function Walk($e, [string]$path) {
+  if ($script:nodes.Count -ge $maxNodes) { $script:trunc = $true; return }
+  $emit = (-not $sect) -or ($path -notlike '*/*') -or ($path -match ('/' + [regex]::Escape($sect) + '(\[\d+\])?(/|$)'))
+  if ($emit) {
+    $attrs = [ordered]@{}; foreach ($a in $e.Attributes) { $attrs[$a.Name] = (Cut $a.Value) }
+    $txt = ''; foreach ($c in $e.ChildNodes) { if ($c.NodeType -eq 'Text' -or $c.NodeType -eq 'CDATA') { $txt += $c.Value } }
+    [void]$script:nodes.Add([pscustomobject]@{ Path=$path; Attributes=$attrs; Text=(Cut $txt.Trim()) }) }
+  $cnt = @{}; foreach ($c in $e.ChildNodes) { if ($c.NodeType -eq 'Element') { $cnt[$c.LocalName] = 1 + [int]$cnt[$c.LocalName] } }
+  $seen = @{}
+  foreach ($c in $e.ChildNodes) { if ($c.NodeType -eq 'Element') {
+    $n = $c.LocalName; $seen[$n] = 1 + [int]$seen[$n]
+    Walk $c ($path + '/' + $n + $(if ($cnt[$n] -gt 1) { '[' + $seen[$n] + ']' } else { '' })) } } }
+Walk $doc.DocumentElement $doc.DocumentElement.LocalName
+[pscustomobject]@{ Path=$p; SizeBytes=$it.Length; LastWriteTime=$it.LastWriteTime; Root=$doc.DocumentElement.LocalName
+  NodeCount=$script:nodes.Count; Truncated=$script:trunc; Nodes=@($script:nodes) } | ConvertTo-Json -Depth 5 -Compress
+""".replace("__MN__", str(CFG_MAX_NODES)).replace("__MV__", str(CFG_MAX_VALUE)).replace("__MB__", str(CFG_MAX_BYTES))
+       .replace("__S__", section or "").replace("__P__", p), timeout=120)
+    if isinstance(res, dict) and res.get("Refused"):
+        return {"host": host, "error": res["Refused"]}
+    if isinstance(res, dict) and "Nodes" in res:
+        nodes = [_mask_config_node(n) for n in _lst(res.get("Nodes")) if isinstance(n, dict)]
+        res["Nodes"] = nodes
+        res.update(_config_summary(nodes))
+    return res
+
+
 # ---------- painel de saúde rápido ----------
 @mcp.tool
 def get_health_summary(

@@ -118,7 +118,7 @@ Depois é só pedir em linguagem natural, por exemplo: *"faça um health check d
 4. Registre no cliente, enviando o token:
    `claude mcp add --transport http windows-ops https://<host>/mcp --header "Authorization: Bearer <token>"`.
 
-## Catálogo de tools (70)
+## Catálogo de tools (72)
 
 Todas recebem `host` (nome ou FQDN do servidor alvo).
 
@@ -184,6 +184,7 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 |---|---|
 | `get_event_summary` | **Ponto de partida da RCA.** Crítico/Erro/Aviso agrupados por log + nível + provedor + ID, com totais, primeira/última ocorrência e mensagem de exemplo |
 | `get_events` | Consulta filtrada (log, `days` ou **`hours`** de 1 a 720, níveis, IDs, provedor) |
+| `list_event_logs` | **Lista os logs de eventos (canais)**: tipo, habilitado, **modo de retenção** (Circular/AutoBackup/Retain), **tamanho máximo**, tamanho atual e **% usado**, nº de registros, última gravação e se está cheio. `name_filter` com curinga, `only_enabled`, `min_records`; maiores primeiro, até 500 |
 | `get_reboot_and_crash_history` | Reboots, shutdowns inesperados e BSOD |
 
 ### Serviços, roles e software
@@ -294,6 +295,7 @@ Leitura de **caminhos arbitrários** (`C:\pasta`), entregue com salvaguardas. É
 | `read_file` | Lê um arquivo de **texto**: intervalo (até 500 linhas por chamada) ou `tail=true`. `encoding` opcional (padrão: pelo BOM) |
 | `compare_files` | Compara dois arquivos de texto do mesmo servidor, linha a linha (`OnlyInA`/`OnlyInB`, até 200 diferenças). Cada arquivo: até 2 MB e 5.000 linhas |
 | `find_duplicate_files` | **Arquivos duplicados** (conteúdo idêntico) abaixo de uma pasta, só com `min_size_mb` ou mais (padrão 10 MB). Lê o mínimo: mesmo tamanho, depois hash dos primeiros 64 KB e só então o SHA-256 completo. Devolve os grupos de maior espaço desperdiçado (`WastedBytes` = tamanho x (cópias distintas - 1)), com hash, tamanho e até 20 caminhos, e o total desperdiçado. **Hard links do mesmo dado não são duplicados** (`HardLinkOnlyGroups`). Não segue links, respeita os bloqueios das tools de arquivos e **não apaga nada**. Limites de tempo (30-900 s, `Partial=true` se estourar) e de leitura (`max_hash_gb`). Exige `Add-Type` |
+| `get_dotnet_config` | Lê **`web.config`/`app.config`/`machine.config`/`applicationHost.config`** (`.config` ou `.xml`) e devolve a estrutura em nós (caminho, atributos, texto), até 1.000, com atalhos `AppSettings` e `ConnectionStrings` (nome, provedor, servidor, banco, segurança integrada). **Segredos mascarados**: atributos `password`, entradas como `DbPassword` e `Pwd=` dentro da connection string (servidor e banco ficam visíveis). `section` limita a uma seção. XML sem DTD (sem XXE), até 2 MB, mesmas proteções de `read_file` |
 
 ### Coleta × interpretação
 Este MCP **só coleta**: fatos observáveis, normalização, sinais objetivos e comparação com baseline do projeto. Boas práticas, recomendação, severidade e fontes documentais ficam no **`microsoft-docs-mcp`** (`C:\mcp\microsoft_docs_mcp`), outro servidor MCP e o único com acesso à internet. O Claude chama o coletor, depois o RAG, e junta fato e evidência citando a fonte. Veja a tabela do que cada um pode afirmar no README do `microsoft-docs-mcp`.
