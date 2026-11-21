@@ -24,7 +24,7 @@ MCP (FastMCP) de **OPS para Windows Server**. Serve para o Claude triar incident
   - Migradas para fatos + sinais: `get_stopped_auto_services`, `get_local_groups`, `get_health_summary`, `validate_cbs`, `get_time_config`, `get_cluster_health`, `get_disk_allocation_analysis`, conexões, teaming e as dicas de HRESULT (removidas). Tool nova já nasce sem julgamento.
 
 ## Arquitetura
-- `src/windows_rca_mcp/server.py`: todas as tools (63) e os prompts (`ops_health_check`, `root_cause_analysis`).
+- `src/windows_rca_mcp/server.py`: todas as tools (64) e os prompts (`ops_health_check`, `root_cause_analysis`).
 - `src/windows_rca_mcp/__init__.py`: `main()`. `MCP_TRANSPORT=stdio` (padrão) ou `http` (`MCP_HOST`/`MCP_PORT`).
 - `src/windows_rca_mcp/diskscan.cs`: scanner de disco em C#, compilado no alvo via `Add-Type` (`get_disk_usage_tree`).
 - Execução remota:

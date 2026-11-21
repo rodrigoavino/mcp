@@ -3313,6 +3313,44 @@ $m = @(Select-String -LiteralPath $p -Pattern '__PAT__' -SimpleMatch -ErrorActio
     return res
 
 
+# ---------- contexto de segurança da própria coleta (somente leitura) ----------
+INTEGRITY_LEVELS = {"S-1-16-0": "Untrusted", "S-1-16-4096": "Low", "S-1-16-8192": "Medium", "S-1-16-8448": "MediumPlus",
+                    "S-1-16-12288": "High", "S-1-16-16384": "System", "S-1-16-20480": "ProtectedProcess"}   # SIDs de nível de integridade
+
+
+def _security_context_shape(res):
+    """Listas sempre listas e o nível de integridade por nome (SIDs documentados)."""
+    if isinstance(res, dict) and "Groups" in res:
+        res["Groups"] = [g for g in _lst(res.get("Groups")) if isinstance(g, dict)]
+        res["Privileges"] = [p for p in _lst(res.get("Privileges")) if isinstance(p, dict)]
+        sid = res.get("IntegritySid")
+        res["IntegrityLevel"] = INTEGRITY_LEVELS.get(sid, sid) if sid else None
+    return res
+
+
+@mcp.tool
+def get_security_context(host: str):
+    """Identidade com que a COLETA roda no servidor (somente leitura): conta, SID, tipo de autenticação, nível de
+    integridade (Low/Medium/High/System), se é membro do grupo Administradores local, grupos do token (SID e nome) e
+    privilégios do token (nome e estado como o Windows informa, no idioma do servidor). Descreve a conta usada pelo
+    coletor, não o servidor: serve para explicar 'acesso negado' ou recusas de leitura. Só fatos."""
+    res = _ps(host, r"""
+$id = [Security.Principal.WindowsIdentity]::GetCurrent()
+function Nm($sid) { try { $sid.Translate([Security.Principal.NTAccount]).Value } catch { $null } }
+$groups = @($id.Groups | % { [pscustomobject]@{ SID="$($_.Value)"; Name=(Nm $_) } })
+# o rótulo de integridade não vem em $id.Groups; 'whoami /groups' o lista, e a coluna SID independe do idioma
+$integ = @(whoami /groups /fo csv /nh 2>$null | ConvertFrom-Csv -Header Name,Type,SID,Attr | ? { $_.SID -like 'S-1-16-*' } | select -First 1)
+$priv = @(whoami /priv /fo csv /nh 2>$null | ConvertFrom-Csv -Header Name,Description,State | % { [pscustomobject]@{ Name=$_.Name; State=$_.State } })
+[pscustomobject]@{ Computer=$env:COMPUTERNAME; Name=$id.Name; UserSid="$($id.User.Value)"
+  AuthenticationType=$id.AuthenticationType; ImpersonationLevel="$($id.ImpersonationLevel)"
+  IsSystem=$id.IsSystem; IsAnonymous=$id.IsAnonymous; IsGuest=$id.IsGuest
+  IntegritySid=$(if ($integ) { $integ[0].SID } else { $null })
+  MemberOfAdministratorsGroup=[bool]($groups | ? { $_.SID -eq 'S-1-5-32-544' })
+  GroupCount=$groups.Count; Groups=$groups; Privileges=$priv } | ConvertTo-Json -Depth 4 -Compress
+""", timeout=60)
+    return _security_context_shape(res)
+
+
 # ---------- painel de saúde rápido ----------
 @mcp.tool
 def get_health_summary(
