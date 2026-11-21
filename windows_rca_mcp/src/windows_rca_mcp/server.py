@@ -2861,6 +2861,90 @@ $it = Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
     return _acl_shape(res)
 
 
+# ---------- DNS do ponto de vista do servidor (somente leitura) ----------
+DNS_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,253}$")
+DNS_FILTER_RE = re.compile(r"^[A-Za-z0-9_*.-]{1,253}$")
+DNS_RECORD_TYPES = ("A", "AAAA", "CNAME", "MX", "NS", "PTR", "SOA", "SRV", "TXT")
+DNS_TYPE_NAMES = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT", 28: "AAAA", 33: "SRV"}
+# Códigos de status do cliente DNS (WinDNS.h): só os que aparecem no cache; os demais ficam como número.
+DNS_STATUS_NAMES = {0: "Success", 9003: "DNS_ERROR_RCODE_NAME_ERROR (nome inexistente)", 9501: "DNS_INFO_NO_RECORDS (sem registros)"}
+DNS_CACHE_MAX = 500
+
+
+def _dns_cache_shape(res, name_filter, top):
+    """Nomes legíveis para tipo e status (números do Windows) e contagens; o que não é conhecido fica numérico."""
+    if not isinstance(res, dict) or "Entries" not in res:
+        return res
+    ents = _lst(res.get("Entries"))
+    for e in ents:
+        if isinstance(e, dict):
+            t, st = e.get("Type"), e.get("Status")
+            if isinstance(t, int):
+                e["TypeName"] = DNS_TYPE_NAMES.get(t, str(t))
+            if isinstance(st, int):
+                e["StatusName"] = DNS_STATUS_NAMES.get(st, str(st))
+    res["Entries"] = ents
+    res["Filter"] = name_filter
+    res["Top"] = top
+    res["Truncated"] = (res.get("Matched") or 0) > len(ents)
+    return res
+
+
+@mcp.tool
+def get_dns_cache(host: str, name_filter: str | None = None, top: int = 100):
+    """Cache do cliente DNS do servidor (somente leitura): nome, tipo, status, seção, TTL restante e dado de cada
+    entrada. 'name_filter' aceita curinga (ex.: '*.familia.local'). Máximo 500 entradas (padrão 100); 'Total' informa
+    quantas existem e 'Matched' quantas casam com o filtro. Entradas de status 9003 são respostas negativas em cache. Só fatos."""
+    if name_filter is not None and not DNS_FILTER_RE.match(name_filter):
+        raise ValueError("name_filter inválido (letras, números, '.', '-', '_' e '*')")
+    n = max(1, min(int(top), DNS_CACHE_MAX))
+    res = _ps(host, r"""
+$f = '__F__'
+$all = @(Get-DnsClientCache -ErrorAction SilentlyContinue)
+$m = @($all | ? { -not $f -or $_.Entry -like $f -or $_.Name -like $f })
+$sel = @($m | sort Entry | select -First __N__ |
+  % { [pscustomobject]@{ Entry=$_.Entry; Name=$_.Name; Type=[int]$_.Type; Status=[int]$_.Status; Section=[int]$_.Section
+        TTL=[int]$_.TimeToLive; Data=$_.Data } })
+[pscustomobject]@{ Total=$all.Count; Matched=$m.Count; Entries=$sel } | ConvertTo-Json -Depth 4 -Compress
+""".replace("__F__", name_filter or "").replace("__N__", str(n)))
+    return _dns_cache_shape(res, name_filter, n)
+
+
+@mcp.tool
+def resolve_dns_name(host: str, name: str, record_type: str = "A", dns_server: str | None = None):
+    """Resolve um nome DNS DO PONTO DE VISTA DO SERVIDOR (somente leitura; a consulta sai do servidor, para o DNS dele
+    ou para 'dns_server'). Tipos: A, AAAA, CNAME, MX, NS, PTR, SOA, SRV, TXT. Devolve os registros (nome, tipo, TTL,
+    seção, dado) ou o motivo da falha. Serve para comparar a resolução entre servidores. O coletor em si não consulta DNS."""
+    rt = record_type.strip().upper()
+    if rt not in DNS_RECORD_TYPES:
+        raise ValueError(f"record_type inválido. Válidos: {', '.join(DNS_RECORD_TYPES)}")
+    if not DNS_NAME_RE.match(name):
+        raise ValueError("name inválido (letras, números, '.', '-' e '_')")
+    if dns_server is not None and not HOST_RE.match(dns_server):
+        raise ValueError("dns_server inválido")
+    res = _ps(host, r"""
+$srv = '__S__'
+$args2 = @{ Name='__N__'; Type='__T__'; DnsOnly=$true; ErrorAction='Stop' }
+if ($srv) { $args2.Server = $srv }
+try {
+  $r = @(Resolve-DnsName @args2)
+  $recs = @($r | % {
+    $d = if ($_.IPAddress) { $_.IPAddress } elseif ($_.NameHost) { $_.NameHost }
+         elseif ($_.NameExchange) { "$($_.NameExchange) (preferência $($_.Preference))" }
+         elseif ($_.NameTarget) { "$($_.NameTarget):$($_.Port) (prioridade $($_.Priority), peso $($_.Weight))" }
+         elseif ($_.Strings) { ($_.Strings -join ' ') } elseif ($_.PrimaryServer) { "$($_.PrimaryServer) $($_.NameAdministrator)" } else { $null }
+    [pscustomobject]@{ Name=$_.Name; Type="$($_.Type)"; TTL=$_.TTL; Section="$($_.Section)"; Data=$d } })
+  [pscustomobject]@{ Query='__N__'; Type='__T__'; Server=$(if ($srv) { $srv } else { 'padrão do servidor' }); Resolved=$true; Records=$recs } | ConvertTo-Json -Depth 4 -Compress
+} catch {
+  [pscustomobject]@{ Query='__N__'; Type='__T__'; Server=$(if ($srv) { $srv } else { 'padrão do servidor' }); Resolved=$false
+    Error=$_.Exception.Message } | ConvertTo-Json -Compress
+}
+""".replace("__S__", dns_server or "").replace("__N__", name).replace("__T__", rt))
+    if isinstance(res, dict) and res.get("Resolved") is True:
+        res["Records"] = _lst(res.get("Records"))
+    return res
+
+
 # ---------- painel de saúde rápido ----------
 @mcp.tool
 def get_health_summary(

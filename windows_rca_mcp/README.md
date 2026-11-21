@@ -118,7 +118,7 @@ Depois é só pedir em linguagem natural, por exemplo: *"faça um health check d
 4. Registre no cliente, enviando o token:
    `claude mcp add --transport http windows-ops https://<host>/mcp --header "Authorization: Bearer <token>"`.
 
-## Catálogo de tools (57)
+## Catálogo de tools (59)
 
 Todas recebem `host` (nome ou FQDN do servidor alvo).
 
@@ -260,6 +260,12 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 | `get_registry` | Lê uma chave de `HKLM:\...` (valores com nome, tipo e dado, e nomes das subchaves; `value` filtra um valor). **SAM e SECURITY são recusados**, só `HKLM:` é aceito (sem curingas, aspas ou `..`) e valores cujo **nome** sugere segredo (senha, token, chave de API, connection string) voltam `<mascarado>`. O mascaramento é conservador: pode ocultar também um valor inofensivo cujo nome contenha, por exemplo, `Pass`. REG_BINARY mostra 64 bytes em hexadecimal. Limites: 200 valores, 100 subchaves |
 | `get_environment_variables` | Variáveis de ambiente `machine` (padrão) ou `user` (a conta da coleta). Mesmo mascaramento de segredos; `Path`, `PSModulePath` e `PATHEXT` saem em lista (`Entries`) |
 | `get_permissions` | **ACL** de arquivo ou pasta (`C:\pasta`): dono, grupo, herança bloqueada e cada entrada (identidade, SID, Allow/Deny, direitos, herdada, flags), até 200. Direitos que o .NET devolve só como número (bits `GENERIC_*`) ganham `RightsDecoded`. Só fatos: não classifica nenhuma permissão |
+
+### DNS do ponto de vista do servidor
+| Tool | O que faz |
+|---|---|
+| `get_dns_cache` | Cache do cliente DNS do servidor: nome, tipo, status, seção, TTL restante e dado. `name_filter` aceita curinga (`*.familia.local`), até 500 entradas; `Total` e `Matched` informam o tamanho do cache e quantas casam com o filtro. Tipo e status (números do Windows) ganham `TypeName` e `StatusName` só para os códigos conhecidos (9003 = nome inexistente, 9501 = sem registros). **O cache pode revelar nomes que o servidor consultou** |
+| `resolve_dns_name` | Resolve um nome **a partir do servidor** (`A`, `AAAA`, `CNAME`, `MX`, `NS`, `PTR`, `SOA`, `SRV`, `TXT`), com `dns_server` opcional. Devolve os registros (nome, tipo, TTL, seção, dado) ou o motivo da falha. Serve para comparar a resolução entre servidores. A consulta sai do servidor consultado, para o DNS dele; o coletor não consulta DNS |
 
 ### Coleta × interpretação
 Este MCP **só coleta**: fatos observáveis, normalização, sinais objetivos e comparação com baseline do projeto. Boas práticas, recomendação, severidade e fontes documentais ficam no **`microsoft-docs-mcp`** (`C:\mcp\microsoft_docs_mcp`), outro servidor MCP e o único com acesso à internet. O Claude chama o coletor, depois o RAG, e junta fato e evidência citando a fonte. Veja a tabela do que cada um pode afirmar no README do `microsoft-docs-mcp`.
