@@ -2945,6 +2945,50 @@ try {
     return res
 
 
+# ---------- usuários locais (somente leitura) ----------
+def _users_shape(res):
+    """Contagens objetivas sobre as contas locais (só fatos, sem classificar nenhuma conta)."""
+    if isinstance(res, dict) and "Users" in res:
+        us = [u for u in _lst(res.get("Users")) if isinstance(u, dict)]
+        res["Users"] = us
+        res["Counts"] = {
+            "Total": len(us),
+            "Enabled": sum(1 for u in us if u.get("Enabled") is True),
+            "Disabled": sum(1 for u in us if u.get("Enabled") is False),
+            "EnabledPasswordNeverExpires": sum(1 for u in us if u.get("Enabled") is True and u.get("PasswordNeverExpires") is True),
+            "NeverLoggedOn": sum(1 for u in us if not u.get("LastLogon")),
+        }
+    return res
+
+
+@mcp.tool
+def get_local_users(host: str, name: str | None = None):
+    """Contas de usuário LOCAIS (somente leitura): nome, nome completo, SID, habilitada, descrição, último logon, senha
+    alterada em, senha expira em, senha nunca expira, senha exigida, usuário pode alterar a senha e expiração da conta.
+    'name' filtra por nome. 'Counts' traz contagens objetivas (total, habilitadas, desabilitadas, habilitadas com senha
+    que nunca expira, nunca logaram). Não classifica nenhuma conta. Em controlador de domínio não há contas locais
+    (use as ferramentas de AD). Para grupos e membros, use get_local_groups."""
+    if name is not None and not NAME_RE.match(name):
+        raise ValueError("name inválido")
+    res = _ps(host, r"""
+if ((Get-CimInstance Win32_ComputerSystem).DomainRole -ge 4) { [pscustomobject]@{ IsDomainController=$true } | ConvertTo-Json -Compress; return }
+$f = '__N__'
+try { $us = @(Get-LocalUser -ErrorAction Stop | ? { -not $f -or $_.Name -eq $f } | sort Name) } catch {
+  [pscustomobject]@{ Error=$_.Exception.Message } | ConvertTo-Json -Compress; return }
+[pscustomobject]@{ Computer=$env:COMPUTERNAME; Users=@($us | % { [pscustomobject]@{
+  Name=$_.Name; FullName=$_.FullName; SID="$($_.SID)"; Enabled=[bool]$_.Enabled; Description=$_.Description
+  LastLogon=$_.LastLogon; PasswordLastSet=$_.PasswordLastSet; PasswordExpires=$_.PasswordExpires
+  PasswordNeverExpires=[bool](-not $_.PasswordExpires); PasswordRequired=[bool]$_.PasswordRequired
+  UserMayChangePassword=[bool]$_.UserMayChangePassword; AccountExpires=$_.AccountExpires
+  PrincipalSource="$($_.PrincipalSource)" } }) } | ConvertTo-Json -Depth 4 -Compress
+""".replace("__N__", name or ""), timeout=90)
+    if isinstance(res, dict) and res.get("IsDomainController"):
+        return {"host": host, "error": "Controlador de domínio: não há contas locais. Use ferramentas de AD."}
+    if isinstance(res, dict) and res.get("Error") and "Users" not in res:
+        return {"host": host, "error": res["Error"]}
+    return _users_shape(res)
+
+
 # ---------- painel de saúde rápido ----------
 @mcp.tool
 def get_health_summary(
