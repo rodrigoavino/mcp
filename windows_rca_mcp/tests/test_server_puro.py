@@ -228,9 +228,9 @@ class TestRegrasDoProjeto:
             async with Client(S.mcp) as c:
                 return {t.name for t in await c.list_tools()}
         n = asyncio.run(nomes())
-        assert len(n) == 59
+        assert len(n) == 60
         for esperado in ("get_license_status", "get_workload_evidence", "get_platform_info", "get_storage_overview",
-                         "get_stopped_auto_services", "get_local_groups", "get_installed_software", "get_registry", "get_environment_variables", "get_permissions", "get_dns_cache", "resolve_dns_name"):
+                         "get_stopped_auto_services", "get_local_groups", "get_installed_software", "get_registry", "get_environment_variables", "get_permissions", "get_dns_cache", "resolve_dns_name", "get_local_users"):
             assert esperado in n
 
     def test_resposta_do_wmi_para_json_e_ida_e_volta(self):
