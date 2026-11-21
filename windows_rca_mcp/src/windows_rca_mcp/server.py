@@ -25,6 +25,7 @@ import winrm
 from dotenv import find_dotenv, load_dotenv
 from fastmcp import FastMCP
 
+from .audit import AuditMiddleware
 from .envelope import EnvelopeMiddleware
 
 # O .env é procurado a partir do DIRETÓRIO DE TRABALHO (usecwd=True), e não da pasta do pacote, para funcionar
@@ -41,6 +42,7 @@ INSTRUCTIONS = """windows-ops: COLETA somente leitura de servidores Windows. Pad
 6. Data de instalação de software é fato LOCAL: registro, instalação por usuário, eventos MsiInstaller, Package Management, sistema de arquivos, com a confiança informada. Nunca internet.
 7. Nada inventado: o que não foi coletado não é afirmado."""
 mcp = FastMCP("windows-server-ops", instructions=INSTRUCTIONS)
+mcp.add_middleware(AuditMiddleware())   # por fora do envelope: registra tool, host, resultado e duração (sem o conteúdo)
 mcp.add_middleware(EnvelopeMiddleware())
 
 ALLOWED = [h.strip().lower() for h in os.getenv("WINRM_ALLOWED_HOSTS", "").split(",") if h.strip()]

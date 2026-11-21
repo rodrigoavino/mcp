@@ -70,6 +70,8 @@ Copie `.env.example` para `.env` e preencha (o `.env` está no `.gitignore`):
 | `MCP_HOST` / `MCP_PORT` | `127.0.0.1` / `8000` | Endereço no modo `http` |
 | `MCP_AUTH_TOKEN` | (vazio) | **Obrigatório no modo `http`**: token Bearer com 32 ou mais caracteres |
 | `MCP_ALLOW_INSECURE_LOOPBACK` | `false` | `true` permite `http` sem token, **somente em loopback** (testes) |
+| `MCP_AUDIT` | `on` | `off` desliga o log de auditoria |
+| `MCP_AUDIT_LOG` | `<projeto>/logs/audit.jsonl` | Arquivo do log de auditoria (rotação 5 MB x 5) |
 
 O `.env` é lido do **diretório de trabalho** do processo (por isso o Claude usa `uv --directory <pasta do projeto>`) ou do caminho em `WINRM_ENV_FILE`.
 
@@ -283,6 +285,7 @@ Este MCP **só coleta**: fatos observáveis, normalização, sinais objetivos e 
 - **Somente leitura.** Única exceção: quando o script passa do limite de cerca de 8 KB da linha de comando do WinRM (por exemplo `get_disk_usage_tree`, `get_cluster_health`, `get_cbs_log_errors`), ele é enviado pelo **stdin** do `powershell.exe`, em um único processo e **sem gravar nada no servidor**.
 - **Validação de entradas**: hostname, nomes, filtros e caminhos passam por regex que bloqueia aspas, `;`, `|`, `$` etc. Números são forçados para `int` e limitados.
 - **Allowlist obrigatória (fail-closed).** A credencial só é enviada a hosts que estejam em `WINRM_ALLOWED_HOSTS`. Isso impede que texto malicioso em eventos, logs ou linhas de comando induza o modelo a autenticar num host do atacante.
+- **Auditoria.** Cada chamada gera uma linha JSON em `logs/audit.jsonl`: data (GMT-3), tool, host, argumentos, ok/erro, duração e a mensagem de erro (truncada). **Nunca** grava o conteúdo devolvido nem valores de argumentos com cara de segredo (`pass`, `token`, `key`...). Falha ao gravar não derruba a tool. Desligue com `MCP_AUDIT=off`.
 - **Modo HTTP autenticado.** O servidor não inicia em `http` sem `MCP_AUTH_TOKEN` (a não ser em loopback com opt-in explícito). Requisições sem o token Bearer correto recebem `401`.
 - **Prazo total por tool.** Se o prazo estourar, o shell WinRM remoto é fechado, o que encerra o `powershell.exe` e os processos filhos no servidor. A tool devolve `{"error": "RemoteTimeout..."}` e nada fica órfão.
 - **DISM protegido.** As tools de CBS não iniciam o DISM se já houver outro em execução, e o encerram se ele passar do limite. Isso evita fila de DISM travados.
