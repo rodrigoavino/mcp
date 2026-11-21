@@ -3693,6 +3693,188 @@ $d = @(Compare-Object $A $B -Property Text -PassThru -SyncWindow 50 | sort @{e={
     return res
 
 
+# ---------- arquivos duplicados (somente leitura) ----------
+# Ideia do SquirrelDisk (módulo de duplicados; AGPL: só a ideia). Estratégia em três etapas, para ler o mínimo possível:
+# 1) agrupa por TAMANHO (só arquivos >= min_size_mb); 2) dentro de cada grupo compara um hash dos primeiros 64 KB;
+# 3) só o que ainda coincide tem o SHA-256 completo calculado. Hard links (mesmo dado físico) NÃO são duplicados:
+# contam como uma cópia. Respeita os mesmos bloqueios de read_file (áreas e arquivos sensíveis nunca são lidos).
+DUP_MAX_GROUPS = 100
+DUP_MAX_FILES_PER_GROUP = 20
+DUP_MAX_CANDIDATES = 50000
+DUP_VISIT_CAP = 300000
+DUP_PARTIAL_BYTES = 65536
+
+PS_DUP_HELPER = r"""
+Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
+public static class DupHelper
+{
+    [StructLayout(LayoutKind.Sequential)]
+    struct Info { public uint Attr; public uint C1, C2, A1, A2, W1, W2; public uint Vol, SizeHigh, SizeLow, Links, IdxHigh, IdxLow; }
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr CreateFileW(string n, uint access, uint share, IntPtr sec, uint disp, uint flags, IntPtr tpl);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetFileInformationByHandle(IntPtr h, out Info i);
+    [DllImport("kernel32.dll")]
+    static extern bool CloseHandle(IntPtr h);
+
+    // identidade física do arquivo (volume + índice): dois hard links do mesmo dado têm o mesmo valor
+    public static string Id(string path)
+    {
+        IntPtr h = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
+        if (h == new IntPtr(-1)) return null;
+        try
+        {
+            Info i;
+            if (!GetFileInformationByHandle(h, out i)) return null;
+            return i.Vol.ToString("x8") + ":" + i.IdxHigh.ToString("x8") + i.IdxLow.ToString("x8");
+        }
+        finally { CloseHandle(h); }
+    }
+
+    // SHA-256 em fluxo; limit <= 0 lê o arquivo todo, senão só os primeiros 'limit' bytes. Falha de leitura devolve null.
+    public static string Hash(string path, long limit)
+    {
+        try
+        {
+            using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 65536))
+            using (SHA256 sha = SHA256.Create())
+            {
+                byte[] buf = new byte[65536];
+                long left = limit > 0 ? limit : long.MaxValue;
+                while (left > 0)
+                {
+                    int n = fs.Read(buf, 0, (int)Math.Min(buf.Length, left));
+                    if (n <= 0) break;
+                    sha.TransformBlock(buf, 0, n, null, 0);
+                    left -= n;
+                }
+                sha.TransformFinalBlock(new byte[0], 0, 0);
+                StringBuilder sb = new StringBuilder();
+                foreach (byte b in sha.Hash) sb.Append(b.ToString("x2"));
+                return sb.ToString();
+            }
+        }
+        catch (Exception) { return null; }
+    }
+}
+'@
+"""
+
+
+def _fs_deny_name_regex() -> str:
+    """Regex único (mesmas regras de _fs_blocked_name) para o script pular arquivos bloqueados."""
+    exts = "|".join(re.escape(e) for e in FS_DENY_EXTS)
+    return f"(?:(?:{exts})$)|(?:{FS_DENY_NAME_RE.pattern})".replace("'", "''")
+
+
+def _dup_shape(res):
+    """Listas sempre listas, espaço desperdiçado em GB e aviso de corte."""
+    if not isinstance(res, dict) or "Groups" not in res:
+        return res
+    groups = [g for g in _lst(res.get("Groups")) if isinstance(g, dict)]
+    for g in groups:
+        g["Files"] = [f for f in _lst(g.get("Files")) if isinstance(f, dict)]
+        g["WastedGB"] = round((g.get("WastedBytes") or 0) / 1073741824, 3)
+        g["SizeMB"] = round((g.get("SizeBytes") or 0) / 1048576, 1)
+    res["Groups"] = groups
+    res["TotalWastedGB"] = round((res.get("TotalWastedBytes") or 0) / 1073741824, 3)
+    res["GroupsTruncated"] = (res.get("GroupsFound") or 0) > len(groups)
+    return res
+
+
+@mcp.tool
+def find_duplicate_files(host: str, path: str, min_size_mb: int = 10, top_groups: int = 20, max_depth: int = 8,
+                         scan_timeout_s: int = 300, max_hash_gb: int = 20):
+    r"""Procura ARQUIVOS DUPLICADOS (conteúdo idêntico) abaixo de uma pasta (somente leitura), no formato C:\pasta. Só
+    considera arquivos com pelo menos min_size_mb (padrão 10 MB). Etapas, para ler o mínimo: mesmo tamanho, depois hash
+    dos primeiros 64 KB e só então o SHA-256 completo. Devolve os grupos com mais espaço desperdiçado (WastedBytes =
+    tamanho x (cópias distintas - 1)), com o hash, o tamanho e os caminhos (até 20 por grupo) e o total desperdiçado.
+    Hard links do mesmo dado NÃO contam como duplicados. Não segue links nem junções e respeita os bloqueios de
+    read_file (áreas e arquivos sensíveis nunca são lidos). Limites: top_groups até 100, max_depth até 10,
+    scan_timeout_s 30-900 (resultado parcial com partial=true) e max_hash_gb 1-200 de leitura total. Só informa: não apaga
+    nada. Exige Add-Type (C#) liberado no servidor."""
+    p = _fs_path(path)
+    minb = max(1, int(min_size_mb)) * 1048576
+    topg = max(1, min(int(top_groups), DUP_MAX_GROUPS))
+    depth = max(0, min(int(max_depth), 10))
+    limit = max(30, min(int(scan_timeout_s), 900))
+    maxhash = max(1, min(int(max_hash_gb), 200)) * 1073741824
+    script = PS_DUP_HELPER + r"""
+$root = '__ROOT__'; $minB = __MIN__; $maxDepth = __DEPTH__; $limitMs = __LIMIT__ * 1000; $maxHash = __MAXHASH__; $topG = __TOPG__
+$deny = '__DENY__'; $denyName = '__DENYNAME__'; $candCap = __CANDCAP__; $visitCap = __VISITCAP__; $partialBytes = __PARTIAL__; $filesPer = __FPG__
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$r = $null
+try { $it = Get-Item -LiteralPath $root -Force -ErrorAction Stop } catch { $r = $_.Exception.Message }
+if (-not $r -and -not $it.PSIsContainer) { $r = 'O caminho é um arquivo, não uma pasta' }
+if (-not $r) { $x = $it; while ($x) { if ($x.Attributes -band [IO.FileAttributes]::ReparsePoint) { $r = 'Link simbólico ou junção no caminho: use o caminho real'; break }; $x = $x.Parent } }
+if ($r) { [pscustomobject]@{ Refused=$r } | ConvertTo-Json -Compress; return }
+$script:cands = New-Object System.Collections.ArrayList; $script:v = 0; $script:capHit = $false; $script:aborted = $false
+function Walk([string]$d, [int]$depth) {
+  if ($depth -gt $maxDepth -or $script:capHit -or $script:aborted) { return }
+  if ($sw.ElapsedMilliseconds -gt $limitMs) { $script:aborted = $true; return }
+  foreach ($c in @(Get-ChildItem -LiteralPath $d -Force -ErrorAction SilentlyContinue)) {
+    $script:v++
+    if ($script:v -ge $visitCap) { $script:capHit = $true; return }
+    if ($c.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+    if ($c.PSIsContainer) { if ($c.FullName -inotmatch $deny) { Walk $c.FullName ($depth + 1) } }
+    elseif ($c.Length -ge $minB -and $c.Name -inotmatch $denyName) {
+      [void]$script:cands.Add([pscustomobject]@{ Path=$c.FullName; Length=[int64]$c.Length; Write=$c.LastWriteTime })
+      if ($script:cands.Count -ge $candCap) { $script:capHit = $true; return } } } }
+Walk $root 0
+$hashed = [int64]0; $unreadable = 0; $filesHashed = 0; $budgetHit = $false
+function Hashing($f, $limit) {
+  if ($script:aborted -or $script:budgetHit) { return $null }
+  if ($sw.ElapsedMilliseconds -gt $limitMs) { $script:aborted = $true; return $null }
+  $b = if ($limit -gt 0) { [math]::Min($limit, $f.Length) } else { $f.Length }
+  if ($script:hashed + $b -gt $maxHash) { $script:budgetHit = $true; return $null }
+  $h = [DupHelper]::Hash($f.Path, $limit)
+  if ($h) { $script:hashed += $b; $script:filesHashed++ } else { $script:unreadable++ }
+  return $h }
+$script:hashed = [int64]0; $script:unreadable = 0; $script:filesHashed = 0; $script:budgetHit = $false
+$sizeGroups = @($script:cands | group Length | ? { $_.Count -ge 2 } | sort { [int64]$_.Name } -Descending)
+$final = New-Object System.Collections.ArrayList
+foreach ($sg in $sizeGroups) {
+  if ($script:aborted -or $script:budgetHit) { break }
+  $byPartial = @{}
+  foreach ($f in $sg.Group) { $h = Hashing $f $partialBytes; if ($h) { if (-not $byPartial.ContainsKey($h)) { $byPartial[$h] = New-Object System.Collections.ArrayList }; [void]$byPartial[$h].Add($f) } }
+  foreach ($pk in @($byPartial.Keys)) {
+    $pg = $byPartial[$pk]; if ($pg.Count -lt 2) { continue }
+    $byFull = @{}
+    foreach ($f in $pg) { $h = Hashing $f 0; if ($h) { if (-not $byFull.ContainsKey($h)) { $byFull[$h] = New-Object System.Collections.ArrayList }; [void]$byFull[$h].Add($f) } }
+    foreach ($fk in @($byFull.Keys)) { if ($byFull[$fk].Count -ge 2) { [void]$final.Add([pscustomobject]@{ Hash=$fk; Files=$byFull[$fk] }) } } } }
+$out = New-Object System.Collections.ArrayList; $hardOnly = 0; $totalWasted = [int64]0
+foreach ($g in $final) {
+  $ids = @{}; foreach ($f in $g.Files) { $id = [DupHelper]::Id($f.Path); if (-not $id) { $id = 'p:' + $f.Path }; if (-not $ids.ContainsKey($id)) { $ids[$id] = 0 }; $ids[$id]++ }
+  $size = [int64]$g.Files[0].Length; $copies = $ids.Count
+  if ($copies -lt 2) { $hardOnly++; continue }
+  $wasted = $size * ($copies - 1); $totalWasted += $wasted
+  [void]$out.Add([pscustomobject]@{ Hash=$g.Hash; SizeBytes=$size; Copies=$copies; Paths=$g.Files.Count; WastedBytes=$wasted
+    Files=@($g.Files | sort Write | select -First $filesPer | % { [pscustomobject]@{ Path=$_.Path; LastWriteTime=$_.Write } }) }) }
+$sorted = @($out | sort WastedBytes -Descending)
+[pscustomobject]@{ Root=$root; MinSizeMB=[math]::Round($minB/1MB,1); ElapsedS=[math]::Round($sw.Elapsed.TotalSeconds,1)
+  Partial=[bool]($script:aborted -or $script:capHit -or $script:budgetHit); TimedOut=$script:aborted; CandidateCapReached=$script:capHit; HashBudgetReached=$script:budgetHit
+  Visited=$script:v; Candidates=$script:cands.Count; SizeGroups=$sizeGroups.Count; FilesHashed=$script:filesHashed; BytesHashed=$script:hashed
+  Unreadable=$script:unreadable; HardLinkOnlyGroups=$hardOnly; GroupsFound=$sorted.Count; TotalWastedBytes=$totalWasted
+  Groups=@($sorted | select -First $topG) } | ConvertTo-Json -Depth 5 -Compress
+"""
+    for k, v in (("__MIN__", str(minb)), ("__DEPTH__", str(depth)), ("__LIMIT__", str(limit)), ("__MAXHASH__", str(maxhash)),
+                 ("__TOPG__", str(topg)), ("__CANDCAP__", str(DUP_MAX_CANDIDATES)), ("__VISITCAP__", str(DUP_VISIT_CAP)),
+                 ("__PARTIAL__", str(DUP_PARTIAL_BYTES)), ("__FPG__", str(DUP_MAX_FILES_PER_GROUP)),
+                 ("__DENYNAME__", _fs_deny_name_regex()), ("__DENY__", _fs_deny_regex()), ("__ROOT__", p)):
+        script = script.replace(k, v)
+    res = _ps_long(host, script, timeout=limit + 90)
+    if isinstance(res, dict) and res.get("Refused"):
+        return {"host": host, "error": res["Refused"]}
+    if isinstance(res, dict) and "error" in res and "Groups" not in res:
+        res["hint"] = "Falha ao compilar/executar o helper (Add-Type bloqueado por AppLocker/WDAC/Constrained Language?)."
+    return _dup_shape(res)
+
+
 # ---------- painel de saúde rápido ----------
 @mcp.tool
 def get_health_summary(
