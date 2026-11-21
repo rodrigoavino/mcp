@@ -282,10 +282,22 @@ def _days(d) -> int:
     return max(1, min(int(d), MAX_LOG_DAYS))
 
 
+# Relógio e fuso DO SERVIDOR (fatos). O UTC sai como 'aaaa-mm-dd hh:mm:ss UTC' (e não ISO com Z) de propósito: o envelope
+# converte datas ISO UTC para GMT-3, e aqui o valor é justamente a leitura bruta do relógio do servidor.
+PS_CLOCK = r"""([pscustomobject]@{
+  TimeZoneId=(Get-TimeZone).Id; TimeZoneName=(Get-TimeZone).DisplayName; BaseUtcOffset="$((Get-TimeZone).BaseUtcOffset)"
+  CurrentUtcOffset="$([TimeZoneInfo]::Local.GetUtcOffset((Get-Date)))"
+  SupportsDaylightSaving=[bool](Get-TimeZone).SupportsDaylightSavingTime
+  DaylightSavingNow=[TimeZoneInfo]::Local.IsDaylightSavingTime((Get-Date))
+  ServerLocalTime=(Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz')
+  ServerUtcTime=((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss') + ' UTC') })"""
+
+
 # ---------- tools ----------
 @mcp.tool
 def get_system_overview(host: str):
-    """Versão do SO, uptime, último boot, CPU/RAM total e domínio."""
+    """Versão do SO, uptime, último boot, CPU/RAM total, domínio e RELÓGIO do servidor (fuso, deslocamento UTC, hora
+    local e hora UTC lidas no próprio servidor, em 'Clock')."""
     return _ps(host, r"""
 $os = Get-CimInstance Win32_OperatingSystem
 $cs = Get-CimInstance Win32_ComputerSystem
@@ -295,8 +307,9 @@ $cs = Get-CimInstance Win32_ComputerSystem
   Domain=$cs.Domain; Sockets=$cs.NumberOfProcessors; LogicalCPUs=$cs.NumberOfLogicalProcessors
   RAM_GB=[math]::Round($cs.TotalPhysicalMemory/1GB,1)
   FreeRAM_GB=[math]::Round($os.FreePhysicalMemory/1MB,1)
-} | ConvertTo-Json -Compress
-""")
+  Clock=__CLOCK__
+} | ConvertTo-Json -Depth 3 -Compress
+""".replace("__CLOCK__", PS_CLOCK))
 
 
 @mcp.tool
@@ -2266,8 +2279,8 @@ $set = @(try { foreach ($s in @(Get-VMSwitch -ErrorAction Stop | ? EmbeddedTeami
 def get_time_config(host: str):
     """Configuração completa de NTP/tempo (w32time): tipo de sincronização (NT5DS=hierarquia do domínio, NTP=
     servidores manuais), servidores NTP configurados, intervalos, fonte atual, stratum, último sync, peers,
-    se é o PDC/servidor de tempo confiável, provedor de tempo do Hyper-V (VMICTimeProvider) e o OFFSET medido
-    contra a fonte. Só fatos e sinais com limiar à vista; interpretação é do RAG (microsoft-docs)."""
+    se é o PDC/servidor de tempo confiável, provedor de tempo do Hyper-V (VMICTimeProvider), o OFFSET medido
+    contra a fonte e o RELÓGIO do servidor (fuso, deslocamento UTC, hora local e UTC lidas no próprio servidor, em 'Clock'). Só fatos e sinais com limiar à vista; interpretação é do RAG (microsoft-docs)."""
     d = _ps(host, r"""
 $ErrorActionPreference='Continue'
 $base = 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time'
@@ -2297,9 +2310,9 @@ $cs = Get-CimInstance Win32_ComputerSystem
   NtpServerEnabled=$ntps.Enabled; AnnounceFlags=$c.AnnounceFlags
   MaxPosPhaseCorrection=$c.MaxPosPhaseCorrection; MaxNegPhaseCorrection=$c.MaxNegPhaseCorrection
   VMICTimeProviderEnabled=$vmic.Enabled
-  CurrentSource=$src; OffsetSeconds=$off; Status=$status; Peers=$peers
-} | ConvertTo-Json -Compress
-""", timeout=120)
+  CurrentSource=$src; OffsetSeconds=$off; Status=$status; Peers=$peers; Clock=__CLOCK__
+} | ConvertTo-Json -Depth 3 -Compress
+""".replace("__CLOCK__", PS_CLOCK), timeout=120)
     if not isinstance(d, dict) or "Host" not in d:
         return d
     st = d.get("Status") or ""

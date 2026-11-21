@@ -170,7 +170,7 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 |---|---|
 | `get_health_summary` | **Comece por aqui.** Faz uma única chamada e devolve `sem_sinais` / `sinais_presentes` / `verificacao_incompleta` para CPU, memória, disco, serviços, patches, disponibilidade e eventos, com o limiar do projeto à vista (parametrizável). Sem severidade nem recomendação. |
 | `get_uptime` | Último boot, uptime, último shutdown planejado (quem/por quê, evento 1074), se o último boot foi inesperado e desligamentos inesperados em 30 dias |
-| `get_system_overview` | SO, build, domínio, CPU/RAM, uptime |
+| `get_system_overview` | SO, build, domínio, CPU/RAM, uptime e **relógio do servidor** (`Clock`: fuso, deslocamento UTC, horário de verão, hora local e hora UTC lidas no próprio servidor; a hora UTC sai como `aaaa-mm-dd hh:mm:ss UTC`, sem conversão para GMT-3) |
 
 ### Performance
 | Tool | O que faz |
@@ -252,7 +252,7 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 | `get_local_users` | **Contas de usuário locais**: nome, nome completo, SID, habilitada, descrição, último logon, senha alterada/expira, senha nunca expira, senha exigida, usuário pode alterar a senha e expiração da conta, com `Counts` objetivos (total, habilitadas, desabilitadas, habilitadas com senha que nunca expira, nunca logaram). Filtro por `name`. Em controlador de domínio devolve que não há contas locais. Não classifica nenhuma conta (para grupos e membros, `get_local_groups`) |
 | `get_failed_logons` | Eventos 4625 agrupados por conta + IP, com o motivo traduzido |
 | `get_security_posture` | Defender, firewall, RDP |
-| `get_time_config` | **Configuração NTP completa**: tipo (NT5DS/NTP), servidores, intervalos, fonte, stratum, último sync, peers, papel no domínio, VMICTimeProvider e **offset medido**, com sinais objetivos (sem severidade nem recomendação) |
+| `get_time_config` | **Configuração NTP completa**: tipo (NT5DS/NTP), servidores, intervalos, fonte, stratum, último sync, peers, papel no domínio, VMICTimeProvider, **offset medido** e **relógio do servidor** (`Clock`), com sinais objetivos (sem severidade nem recomendação) |
 | `get_expiring_certificates` | Certificados vencidos ou próximos do vencimento |
 
 ### Registro e variáveis de ambiente
