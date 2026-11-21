@@ -1,0 +1,7 @@
+{
+  "hosts": {
+    "servidor1.dominio.local": { "tags": ["producao", "web"], "description": "Servidor web principal" },
+    "dc01.dominio.local": { "tags": ["producao", "dc"], "description": "Controlador de domínio (PDC emulator)" },
+    "lab01.dominio.local": { "tags": ["laboratorio"] }
+  }
+}

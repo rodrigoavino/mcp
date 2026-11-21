@@ -118,7 +118,7 @@ Depois é só pedir em linguagem natural, por exemplo: *"faça um health check d
 4. Registre no cliente, enviando o token:
    `claude mcp add --transport http windows-ops https://<host>/mcp --header "Authorization: Bearer <token>"`.
 
-## Catálogo de tools (75)
+## Catálogo de tools (77)
 
 Todas recebem `host` (nome ou FQDN do servidor alvo).
 
@@ -305,6 +305,14 @@ Coletas de minutos (DISM, varredura de disco, duplicados) podem passar do tempo 
 | `start_job` | Inicia uma das tools permitidas (`get_disk_usage_tree`, `find_duplicate_files`, `get_component_store_analysis`, `get_largest_files`, `get_largest_folders`, `get_event_summary`, `get_pending_updates`, `get_cbs_health`, `get_cbs_log_errors`, `get_disk_allocation_analysis`, `get_update_error_analysis`, `get_installed_software`, `search_log`, `find_files`, `get_common_space_offenders`, `get_security_posture`) com `arguments` simples (texto, número, booleano, lista) e devolve o `job_id` |
 | `get_job` | Estado (`running`, `done`, `error`) e, quando `done`, o resultado. `wait_seconds` (0 a 30) espera pelo término |
 | `list_jobs` | Jobs conhecidos (id, tool, host, estado, início, fim, duração), sem os resultados |
+
+### Vários servidores (inventário e lote)
+O inventário `hosts.json` (veja `hosts.example.json`; fica fora do git; `WINRM_HOSTS_FILE` muda o caminho) tem só **nomes, tags e descrição**, **nenhuma credencial**. Os hosts continuam sujeitos à lista `WINRM_ALLOWED_HOSTS`: um host fora dela nem chega a conectar. `run_on_hosts` dispara **uma** tool de leitura em vários servidores, em paralelo limitado, com o resultado de cada um no formato padrão e a **falha de um servidor isolada** das demais. Cada host gera um registro de auditoria (`fanout:<tool>`).
+
+| Tool | O que faz |
+|---|---|
+| `list_hosts` | Servidores do inventário: nome, tags, descrição e se passam na lista de hosts permitidos; `tag` filtra |
+| `run_on_hosts` | Roda uma tool de leitura (`get_uptime`, `get_system_overview`, `get_time_config`, `get_last_patches`, `get_patch_status`, `get_stopped_auto_services`, `get_volumes`, `get_disks`, `get_services`, `get_listening_ports`, `get_events`, `get_health_summary`, `get_performance_snapshot`, `get_local_admins`, `get_local_users`, `get_security_posture`, `get_applied_gpos`, `get_license_status`, `get_platform_info`, `get_network_config`, `get_expiring_certificates`, `list_event_logs`, `get_security_context`, `test_connectivity`, `get_top_processes`, `get_workload_evidence`, `get_scheduled_tasks`) em `hosts` e/ou `tag`. Até 50 hosts e 10 em paralelo; `timeout_s` de 30 a 900 (quem não responde volta como `timeout`); resultado por host acima de `max_chars_per_host` é resumido. **Não inclui** tools que leem conteúdo (`read_file`, `get_registry`, `search_log`...) nem as longas (use `start_job` host a host) |
 
 ### Coleta × interpretação
 Este MCP **só coleta**: fatos observáveis, normalização, sinais objetivos e comparação com baseline do projeto. Boas práticas, recomendação, severidade e fontes documentais ficam no **`microsoft-docs-mcp`** (`C:\mcp\microsoft_docs_mcp`), outro servidor MCP e o único com acesso à internet. O Claude chama o coletor, depois o RAG, e junta fato e evidência citando a fonte. Veja a tabela do que cada um pode afirmar no README do `microsoft-docs-mcp`.

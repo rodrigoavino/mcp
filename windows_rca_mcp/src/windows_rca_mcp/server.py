@@ -4158,6 +4158,158 @@ def list_jobs():
     return {"count": len(items), "running": sum(1 for x in items if x["status"] == "running"), "jobs": items}
 
 
+# ---------- vários servidores: inventário com tags e disparo em lote (somente leitura) ----------
+# O inventário (hosts.json) só tem NOMES e TAGS: nenhuma credencial. Os hosts continuam sujeitos à lista WINRM_ALLOWED_HOSTS.
+# run_on_hosts roda UMA tool de leitura (da lista abaixo) em vários servidores, em paralelo limitado, com a falha de cada
+# servidor isolada e cada resultado no formato padrão. Para coletas longas, use start_job servidor a servidor.
+FANOUT_TOOLS = (
+    "get_uptime", "get_system_overview", "get_time_config", "get_last_patches", "get_patch_status", "get_stopped_auto_services",
+    "get_volumes", "get_disks", "get_services", "get_listening_ports", "get_events", "get_health_summary",
+    "get_performance_snapshot", "get_local_admins", "get_local_users", "get_security_posture", "get_applied_gpos",
+    "get_license_status", "get_platform_info", "get_network_config", "get_expiring_certificates", "list_event_logs",
+    "get_security_context", "test_connectivity", "get_top_processes", "get_workload_evidence", "get_scheduled_tasks",
+)
+FANOUT_MAX_HOSTS = 50
+FANOUT_MAX_PARALLEL = 10
+FANOUT_MIN_TIMEOUT = 30
+FANOUT_TAG_RE = re.compile(r"^[A-Za-z0-9_.-]{1,40}$")
+FANOUT_TOTAL_CHARS = 400_000
+HOSTS_FILE_DEFAULT = Path(__file__).resolve().parents[2] / "hosts.json"
+
+
+def _hosts_file() -> Path:
+    return Path(os.getenv("WINRM_HOSTS_FILE") or HOSTS_FILE_DEFAULT)
+
+
+def _load_inventory() -> dict:
+    """Lê o inventário: {nome: {"tags": [...], "description": "..."}}. Arquivo ausente ou inválido = inventário vazio;
+    entradas com nome ou tag fora do padrão são ignoradas."""
+    try:
+        raw = json.loads(_hosts_file().read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+    hosts = raw.get("hosts") if isinstance(raw, dict) else None
+    out = {}
+    for name, info in (hosts.items() if isinstance(hosts, dict) else []):
+        if not isinstance(name, str) or not HOST_RE.match(name):
+            continue
+        info = info if isinstance(info, dict) else {}
+        tags = [t for t in _lst(info.get("tags")) if isinstance(t, str) and FANOUT_TAG_RE.match(t)]
+        desc = info.get("description") if isinstance(info.get("description"), str) else None
+        out[name.lower()] = {"tags": tags, "description": desc[:200] if desc else None}
+    return out
+
+
+def _select_hosts(hosts, tag) -> list[str]:
+    """Hosts pedidos por nome e/ou por tag do inventário, sem repetição, todos válidos e na lista de hosts permitidos."""
+    names: list[str] = []
+    for h in _lst(hosts):
+        if not isinstance(h, str) or not HOST_RE.match(h):
+            raise ValueError(f"host inválido: {h!r}")
+        if h.lower() not in names:
+            names.append(h.lower())
+    if tag is not None:
+        if not FANOUT_TAG_RE.match(tag):
+            raise ValueError("tag inválida (letras, números, '.', '-' e '_')")
+        inv = _load_inventory()
+        names += [n for n, i in inv.items() if tag in i["tags"] and n not in names]
+    if not names:
+        raise ValueError("nenhum host selecionado: informe 'hosts' e/ou uma 'tag' que exista no inventário (hosts.json)")
+    if len(names) > FANOUT_MAX_HOSTS:
+        raise ValueError(f"no máximo {FANOUT_MAX_HOSTS} hosts por chamada (pedidos: {len(names)})")
+    return names
+
+
+@mcp.tool
+def list_hosts(tag: str | None = None):
+    """Lista os servidores do inventário (hosts.json, só nomes e tags, sem credenciais): nome, tags, descrição e se o host
+    passa na lista WINRM_ALLOWED_HOSTS. 'tag' filtra. O arquivo é editado à mão (WINRM_HOSTS_FILE muda o caminho)."""
+    if tag is not None and not FANOUT_TAG_RE.match(tag):
+        raise ValueError("tag inválida (letras, números, '.', '-' e '_')")
+    inv = _load_inventory()
+    rows = [{"host": n, "tags": i["tags"], "description": i["description"], "allowed": _host_allowed(n)}
+            for n, i in sorted(inv.items()) if tag is None or tag in i["tags"]]
+    tags = sorted({t for i in inv.values() for t in i["tags"]})
+    return {"inventory_file": str(_hosts_file()), "exists": _hosts_file().exists(), "count": len(rows), "tags": tags, "hosts": rows}
+
+
+def _fanout_one(fn, name: str, kwargs: dict, tool: str, per_host_chars: int) -> dict:
+    t0 = time.monotonic()
+    if not _host_allowed(name):
+        return {"host": name, "ok": False, "error": "host fora da lista WINRM_ALLOWED_HOSTS"}
+    ok, err, env = False, None, None
+    try:
+        env = build_envelope(name, fn(name, **kwargs))
+        ok = bool(env.get("success", True))
+        err = env.get("error") if not ok else None
+        size = len(json.dumps(env, ensure_ascii=False, default=str))
+        if size > per_host_chars:
+            env = {"computerName": name, "success": ok, "truncated": True, "size_chars": size,
+                   "hint": "resultado grande demais para o lote: chame a tool direto para este host"}
+    except Exception as e:                       # validação, rede, autenticação, prazo
+        ok, err, env = False, f"{type(e).__name__}: {e}", None
+    default_log().write(build_record(f"fanout:{tool}", {"host": name, **{k: v for k, v in kwargs.items() if _job_scalar(v)}},
+                                     ok, err, (time.monotonic() - t0) * 1000))
+    out = {"host": name, "ok": ok}
+    if env is not None:
+        out["result"] = env
+    if err:
+        out["error"] = err
+    return out
+
+
+@mcp.tool
+def run_on_hosts(tool: str, hosts: list[str] | None = None, tag: str | None = None, arguments: dict | None = None,
+                 max_parallel: int = 5, timeout_s: int = 180, max_chars_per_host: int = 30000):
+    """Roda UMA tool de leitura em VÁRIOS servidores, em paralelo limitado (até 10 ao mesmo tempo, 50 hosts por chamada),
+    e devolve um resultado por servidor, cada um no formato padrão; o erro de um servidor não afeta os outros.
+    'hosts' (nomes) e/ou 'tag' (do inventário hosts.json, veja list_hosts). 'tool' é uma de: get_uptime,
+    get_system_overview, get_time_config, get_last_patches, get_patch_status, get_stopped_auto_services, get_volumes,
+    get_disks, get_services, get_listening_ports, get_events, get_health_summary, get_performance_snapshot,
+    get_local_admins, get_local_users, get_security_posture, get_applied_gpos, get_license_status, get_platform_info,
+    get_network_config, get_expiring_certificates, list_event_logs, get_security_context, test_connectivity,
+    get_top_processes, get_workload_evidence, get_scheduled_tasks. 'arguments' são os parâmetros da tool além do host
+    (valores simples). timeout_s (30-900): servidores que não terminam a tempo voltam como 'timeout'.
+    max_chars_per_host (1000-100000): resultados maiores são resumidos. Para coletas longas use start_job."""
+    if tool not in FANOUT_TOOLS or tool not in globals():
+        raise ValueError("tool não permitida em lote. Permitidas: " + ", ".join(FANOUT_TOOLS))
+    args = dict(arguments or {})
+    if not all(isinstance(k, str) and _job_scalar(v) for k, v in args.items()) or "host" in args:
+        raise ValueError("arguments aceita só valores simples e não inclui 'host'")
+    names = _select_hosts(hosts, tag)
+    fn = globals()[tool]
+    try:
+        inspect.signature(fn).bind(names[0], **args)
+    except TypeError as e:
+        raise ValueError(f"arguments não casam com os parâmetros de {tool}: {e}") from None
+    par = max(1, min(int(max_parallel), FANOUT_MAX_PARALLEL))
+    limit = max(FANOUT_MIN_TIMEOUT, min(int(timeout_s), 900))
+    per = max(1000, min(int(max_chars_per_host), 100000))
+    t0 = time.monotonic()
+    ex = ThreadPoolExecutor(max_workers=par, thread_name_prefix="fanout")
+    futs = {ex.submit(_fanout_one, fn, n, args, tool, per): n for n in names}
+    results: dict[str, dict] = {}
+    try:
+        from concurrent.futures import as_completed
+        for f in as_completed(futs, timeout=limit):
+            results[futs[f]] = f.result()
+    except Exception:                            # TimeoutError: o que faltar vira 'timeout'
+        pass
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    rows, total = [], 0
+    for n in names:
+        r = results.get(n) or {"host": n, "ok": False, "error": f"timeout: sem resposta em {limit} s (a coleta pode ainda estar rodando no servidor)"}
+        size = len(json.dumps(r, ensure_ascii=False, default=str))
+        if total + size > FANOUT_TOTAL_CHARS and "result" in r:
+            r = {"host": n, "ok": r["ok"], "truncated": True, "hint": "limite total da resposta em lote atingido: chame a tool direto para este host"}
+            size = 200
+        total += size
+        rows.append(r)
+    return {"tool": tool, "requested": len(names), "succeeded": sum(1 for r in rows if r["ok"]), "failed": sum(1 for r in rows if not r["ok"]),
+            "elapsed_s": round(time.monotonic() - t0, 1), "results": rows}
+
+
 # ---------- painel de saúde rápido ----------
 @mcp.tool
 def get_health_summary(
