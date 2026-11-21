@@ -603,14 +603,53 @@ Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-WindowsUpdateClient/O
 SVC_RE = re.compile(r"^[A-Za-z0-9*._-]{1,100}$")
 
 
+SERVICE_DETAIL_MAX = 50
+FAILURE_ACTION_TYPES = {0: "None", 1: "Restart", 2: "Reboot", 3: "RunCommand"}   # SC_ACTION_TYPE (winsvc.h)
+
+
+def _parse_failure_actions(hex_str):
+    """Interpreta o valor binário FailureActions do registro do serviço (estrutura SERVICE_FAILURE_ACTIONS: período de
+    reset, ponteiros de mensagem e comando, contagem e deslocamento das ações, e pares tipo/atraso em ms). Só fatos;
+    binário ausente ou truncado devolve None (o serviço não tem ações de recuperação configuradas)."""
+    if not isinstance(hex_str, str) or len(hex_str) < 40 or len(hex_str) % 2 or not re.fullmatch(r"[0-9A-Fa-f]+", hex_str):
+        return None
+    b = bytes.fromhex(hex_str)
+    rd = lambda o: int.from_bytes(b[o:o + 4], "little")
+    reset, msg, cmd, count, off = rd(0), rd(4), rd(8), rd(12), rd(16)
+    if count > 16 or off < 20 or off + count * 8 > len(b):
+        return None
+    acts = [{"Action": FAILURE_ACTION_TYPES.get(rd(off + i * 8), str(rd(off + i * 8))), "DelaySeconds": rd(off + i * 8 + 4) // 1000}
+            for i in range(count)]
+    return {"ResetPeriodSeconds": None if reset == 0xFFFFFFFF else reset, "Actions": acts,
+            "HasCommand": cmd != 0, "HasRebootMessage": msg != 0}
+
+
+def _service_detail_shape(res):
+    """Normaliza o modo detalhe: listas sempre listas e ações de recuperação interpretadas."""
+    if not isinstance(res, dict) or "Services" not in res:
+        return res
+    svcs = [x for x in _lst(res.get("Services")) if isinstance(x, dict)]
+    for s_ in svcs:
+        s_["DependsOn"] = [str(x) for x in _lst(s_.get("DependsOn"))]
+        s_["DependedBy"] = [str(x) for x in _lst(s_.get("DependedBy"))]
+        s_["Recovery"] = _parse_failure_actions(s_.pop("FailureActionsHex", None))
+    res["Services"] = svcs
+    res["Truncated"] = (res.get("Total") or 0) > len(svcs)
+    return res
+
+
 @mcp.tool
 def get_services(
     host: str,
     name_filter: str = "*",
     state: str | None = None,
     start_mode: str | None = None,
+    detail: bool = False,
 ):
-    """Lista serviços (wildcard em nome/display name). state: Running|Stopped; start_mode: Auto|Manual|Disabled."""
+    """Lista serviços (wildcard em nome/display name). state: Running|Stopped; start_mode: Auto|Manual|Disabled.
+    detail=True (use com name_filter; máximo 50 serviços) acrescenta, por serviço: descrição, início atrasado, memória
+    do processo, código de saída específico do serviço, dependências (DependsOn) e dependentes (DependedBy) e as AÇÕES
+    DE RECUPERAÇÃO configuradas (Recovery: período de reset e ações Restart/Reboot/RunCommand com atraso). Só fatos."""
     if not SVC_RE.match(name_filter):
         raise ValueError("name_filter inválido")
     if state not in (None, "Running", "Stopped") or start_mode not in (None, "Auto", "Manual", "Disabled"):
@@ -618,6 +657,25 @@ def get_services(
     extra = (f" -and $_.State -eq '{state}'" if state else "") + (
         f" -and $_.StartMode -eq '{start_mode}'" if start_mode else ""
     )
+    if detail:
+        res = _ps(host, rf"""
+$all = @(Get-CimInstance Win32_Service |
+  ? {{ ($_.Name -like '{name_filter}' -or $_.DisplayName -like '{name_filter}'){extra} }} | sort Name)
+$out = foreach ($w in ($all | select -First {SERVICE_DETAIL_MAX})) {{
+  $reg = Get-ItemProperty ('HKLM:\SYSTEM\CurrentControlSet\Services\' + $w.Name) -ErrorAction SilentlyContinue
+  $gs = Get-Service -Name $w.Name -ErrorAction SilentlyContinue
+  $mem = if ($w.ProcessId) {{ (Get-Process -Id $w.ProcessId -ErrorAction SilentlyContinue).WorkingSet64 }} else {{ $null }}
+  $fa = $reg.FailureActions
+  [pscustomobject]@{{ Name=$w.Name; DisplayName=$w.DisplayName; State=$w.State; StartMode=$w.StartMode; StartName=$w.StartName
+    ProcessId=$w.ProcessId; ExitCode=$w.ExitCode; ServiceSpecificExitCode=$w.ServiceSpecificExitCode; PathName=$w.PathName
+    Description=$w.Description; DelayedAutoStart=[bool]($reg.DelayedAutostart -eq 1)
+    MemoryMB=$(if ($mem) {{ [math]::Round($mem/1MB,1) }} else {{ $null }})
+    DependsOn=@($gs.ServicesDependedOn | % {{ $_.Name }}); DependedBy=@($gs.DependentServices | % {{ $_.Name }})
+    FailureActionsHex=$(if ($fa -is [byte[]]) {{ ($fa | % {{ $_.ToString('X2') }}) -join '' }} else {{ $null }}) }}
+}}
+[pscustomobject]@{{ Total=$all.Count; Services=@($out) }} | ConvertTo-Json -Depth 4 -Compress
+""", timeout=120)
+        return _service_detail_shape(res)
     return _ps(host, rf"""
 Get-CimInstance Win32_Service |
   ? {{ ($_.Name -like '{name_filter}' -or $_.DisplayName -like '{name_filter}'){extra} }} |
