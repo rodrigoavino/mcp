@@ -232,8 +232,8 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 | `get_network_adapters` | **Configuração das placas de rede**: velocidade, duplex, MTU, VLAN, driver (versão/data), RSS, IPv6, erros e descartes, propriedades avançadas (offloads, jumbo, buffers), NIC Teaming/SET |
 | `get_nic_teaming` | **NIC Teaming detalhado**: LBFO (modo, balanceamento, membros ativos/standby, falhas, VLANs) e SET do Hyper-V (membros, vNICs, VLAN), com alertas |
 | `get_routes` | **Tabela de rotas** ativa, rotas persistentes e gateways padrão |
-| `get_network_connections` | **Equivalente ao netstat -ano** com análise: conexões por estado, maiores destinos, processos com mais conexões, uso de portas efêmeras, alertas de TIME_WAIT/CLOSE_WAIT |. `port` lista as conexões da porta (local ou remota) e informa `PortMatches` |
-| `get_listening_ports` | Portas TCP (e UDP, com `include_udp`) em escuta, com processo e serviço |. `port` limita a essa porta local |
+| `get_network_connections` | **Equivalente ao netstat -ano** com análise: conexões por estado, maiores destinos, processos com mais conexões, uso de portas efêmeras, alertas de TIME_WAIT/CLOSE_WAIT. `port` lista as conexões da porta (local ou remota) e informa `PortMatches` |
+| `get_listening_ports` | Portas TCP (e UDP, com `include_udp`) em escuta, com processo e serviço. `port` limita a essa porta local |
 | `test_connectivity` | **A partir do servidor**: resolução de nome, ping e teste de porta TCP até um destino |
 
 ### Failover Cluster
@@ -245,7 +245,7 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 | Tool | O que faz |
 |---|---|
 | `get_applied_gpos` | **GPOs aplicadas** ao computador e aos usuários com perfil carregado (nome, GUID, link), OU, site, DC, último processamento e erros/avisos do Group Policy |
-| `get_scheduled_tasks` | Tarefas (fora de `\Microsoft\`) com último resultado em hex. `only_failed=True` por padrão |. `name_filter` (wildcard no nome da tarefa) limita às que casam |
+| `get_scheduled_tasks` | Tarefas (fora de `\Microsoft\`) com último resultado em hex. `only_failed=True` por padrão. `name_filter` (wildcard no nome da tarefa) limita às que casam |
 | `get_user_sessions` | Sessões logadas (console/RDP), estado e tempo ocioso |
 | `get_local_admins` | Membros do grupo Administradores local (pelo SID, independe do idioma) |
 | `get_local_groups` | **Todos os grupos locais e seus membros**: SID, descrição, tipo e origem de cada membro (`Local`, `Interno (BUILTIN)`, `Sistema (NT AUTHORITY)`, `Domínio`, `Azure AD`, `Externo`), estado das contas locais (habilitada, último logon, senha) e **sinais** (só fatos): SIDs não resolvidos, principais de domínio/Azure AD no Administrators, contas locais habilitadas com senha que nunca expira, contas desabilitadas como membros, grupos vazios. Funciona mesmo com o DC inacessível. Não classifica nada como "privilegiado". Filtro por `group` |
