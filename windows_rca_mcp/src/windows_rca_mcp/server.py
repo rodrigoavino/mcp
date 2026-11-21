@@ -4299,6 +4299,270 @@ def run_on_hosts(tool: str, hosts: list[str] | None = None, tag: str | None = No
             "elapsed_s": round(time.monotonic() - t0, 1), "results": rows}
 
 
+# ---------- SQL Server: diagnóstico com consultas FIXAS (somente leitura) ----------
+# Nada de SQL livre: cada seção é uma consulta fixa do catálogo/DMVs, com parâmetros SOMENTE como parâmetros SQL (@db,
+# @hours, @text), nunca concatenados. A conexão é feita DENTRO do servidor alvo (via WinRM), na instância local, com a
+# autenticação integrada da conta da coleta: nenhuma credencial SQL é guardada. A conta precisa de VIEW SERVER STATE /
+# VIEW ANY DEFINITION (e leitura no msdb) para as seções que as exigem; a seção sem permissão volta com o erro e as demais
+# continuam. Só consulta se houver serviço de instância SQL Server (regra do projeto: nada de presumir a carga).
+SQL_NAME_RE = re.compile(r"^[A-Za-z0-9_$#@ .-]{1,128}$")
+SQL_INSTANCE_RE = re.compile(r"^[A-Za-z0-9_$#@-]{1,128}$")
+SQL_MAX_HOURS = 168
+SQL_DEFAULT_SECTIONS = ("overview", "databases", "backups", "jobs", "blocking")
+SQL_FULL_BACKUP_DAYS = 7          # limiar do projeto: último backup completo mais antigo que isto vira sinal
+SQL_BLOCKED_MS = 30000            # limiar do projeto: sessão bloqueada há mais que isto vira sinal
+SQL_BENIGN_WAITS = (
+    "BROKER_EVENTHANDLER", "BROKER_RECEIVE_WAITFOR", "BROKER_TASK_STOP", "BROKER_TO_FLUSH", "BROKER_TRANSMITTER",
+    "CHECKPOINT_QUEUE", "CLR_AUTO_EVENT", "CLR_MANUAL_EVENT", "DIRTY_PAGE_POLL", "DISPATCHER_QUEUE_SEMAPHORE",
+    "FT_IFTS_SCHEDULER_IDLE_WAIT", "HADR_CLUSAPI_CALL", "HADR_FILESTREAM_IOMGR_IOCOMPLETION", "HADR_LOGCAPTURE_WAIT",
+    "HADR_NOTIFICATION_DEQUEUE", "HADR_TIMER_TASK", "HADR_WORK_QUEUE", "KSOURCE_WAKEUP", "LAZYWRITER_SLEEP", "LOGMGR_QUEUE",
+    "ONDEMAND_TASK_QUEUE", "PWAIT_ALL_COMPONENTS_INITIALIZED", "QDS_PERSIST_TASK_MAIN_LOOP_SLEEP",
+    "QDS_CLEANUP_STALE_QUERIES_TASK_MAIN_LOOP_SLEEP", "REQUEST_FOR_DEADLOCK_SEARCH", "RESOURCE_QUEUE", "SERVER_IDLE_CHECK",
+    "SLEEP_BPOOL_FLUSH", "SLEEP_DBSTARTUP", "SLEEP_DCOMSTARTUP", "SLEEP_MASTERDBREADY", "SLEEP_MASTERMDREADY",
+    "SLEEP_MASTERUPGRADED", "SLEEP_MSDBSTARTUP", "SLEEP_SYSTEMTASK", "SLEEP_TASK", "SLEEP_TEMPDBSTARTUP", "SNI_HTTP_ACCEPT",
+    "SP_SERVER_DIAGNOSTICS_SLEEP", "SQLTRACE_BUFFER_FLUSH", "SQLTRACE_INCREMENTAL_FLUSH_SLEEP", "WAITFOR", "XE_DISPATCHER_JOIN",
+    "XE_DISPATCHER_WAIT", "XE_TIMER_EVENT",
+)
+
+SQL_QUERIES = {
+    "overview": """
+SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) AS ServerName,
+  CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(64)) AS ProductVersion,
+  CAST(SERVERPROPERTY('ProductLevel') AS nvarchar(64)) AS ProductLevel,
+  CAST(SERVERPROPERTY('ProductUpdateLevel') AS nvarchar(64)) AS ProductUpdateLevel,
+  CAST(SERVERPROPERTY('Edition') AS nvarchar(128)) AS Edition,
+  CAST(SERVERPROPERTY('EngineEdition') AS int) AS EngineEdition,
+  CAST(SERVERPROPERTY('IsClustered') AS int) AS IsClustered,
+  CAST(SERVERPROPERTY('IsHadrEnabled') AS int) AS IsHadrEnabled,
+  CAST(SERVERPROPERTY('Collation') AS nvarchar(128)) AS Collation,
+  CAST(SERVERPROPERTY('IsIntegratedSecurityOnly') AS int) AS WindowsAuthenticationOnly,
+  SUSER_SNAME() AS ConnectedAs,
+  (SELECT COUNT(*) FROM sys.databases) AS DatabaseCount,
+  @@VERSION AS VersionText;
+""",
+    "databases": """
+SELECT d.name AS Name, d.database_id AS DatabaseId, d.state_desc AS State, d.recovery_model_desc AS RecoveryModel,
+  d.compatibility_level AS CompatibilityLevel, d.is_read_only AS IsReadOnly, d.user_access_desc AS UserAccess,
+  d.log_reuse_wait_desc AS LogReuseWait, d.is_auto_close_on AS AutoClose, d.is_auto_shrink_on AS AutoShrink,
+  d.page_verify_option_desc AS PageVerify, d.create_date AS CreateDate,
+  CAST(SUM(CASE WHEN mf.type = 0 THEN CAST(mf.size AS bigint) END) * 8 / 1024 AS bigint) AS DataMB,
+  CAST(SUM(CASE WHEN mf.type = 1 THEN CAST(mf.size AS bigint) END) * 8 / 1024 AS bigint) AS LogMB
+FROM sys.databases d LEFT JOIN sys.master_files mf ON mf.database_id = d.database_id
+GROUP BY d.name, d.database_id, d.state_desc, d.recovery_model_desc, d.compatibility_level, d.is_read_only, d.user_access_desc,
+  d.log_reuse_wait_desc, d.is_auto_close_on, d.is_auto_shrink_on, d.page_verify_option_desc, d.create_date
+ORDER BY d.name;
+""",
+    "files": """
+SELECT DB_NAME(mf.database_id) AS DatabaseName, mf.name AS LogicalName, mf.type_desc AS FileType, mf.physical_name AS PhysicalName,
+  CAST(mf.size AS bigint) * 8 / 1024 AS SizeMB,
+  CASE WHEN mf.max_size = -1 THEN NULL ELSE CAST(mf.max_size AS bigint) * 8 / 1024 END AS MaxSizeMB,
+  CASE WHEN mf.max_size = -1 THEN 1 ELSE 0 END AS UnlimitedGrowth,
+  mf.is_percent_growth AS IsPercentGrowth,
+  CASE WHEN mf.is_percent_growth = 1 THEN CAST(mf.growth AS bigint) ELSE CAST(mf.growth AS bigint) * 8 / 1024 END AS GrowthValue,
+  mf.state_desc AS State
+FROM sys.master_files mf
+WHERE (@db IS NULL OR DB_NAME(mf.database_id) = @db)
+ORDER BY CAST(mf.size AS bigint) DESC;
+""",
+    "backups": """
+SELECT d.name AS DatabaseName, d.recovery_model_desc AS RecoveryModel, d.state_desc AS State,
+  MAX(CASE WHEN b.type = 'D' THEN b.backup_finish_date END) AS LastFull,
+  MAX(CASE WHEN b.type = 'I' THEN b.backup_finish_date END) AS LastDifferential,
+  MAX(CASE WHEN b.type = 'L' THEN b.backup_finish_date END) AS LastLog,
+  DATEDIFF(DAY, MAX(CASE WHEN b.type = 'D' THEN b.backup_finish_date END), GETDATE()) AS DaysSinceLastFull
+FROM sys.databases d LEFT JOIN msdb.dbo.backupset b ON b.database_name = d.name
+WHERE d.name <> 'tempdb' AND (@db IS NULL OR d.name = @db)
+GROUP BY d.name, d.recovery_model_desc, d.state_desc
+ORDER BY d.name;
+""",
+    "jobs": """
+SELECT TOP (50) j.name AS JobName, j.enabled AS Enabled, h.run_status AS RunStatus,
+  msdb.dbo.agent_datetime(h.run_date, h.run_time) AS RunTime, LEFT(h.message, 500) AS Message
+FROM msdb.dbo.sysjobhistory h JOIN msdb.dbo.sysjobs j ON j.job_id = h.job_id
+WHERE h.step_id = 0 AND h.run_status = 0
+  AND msdb.dbo.agent_datetime(h.run_date, h.run_time) >= DATEADD(HOUR, -@hours, GETDATE())
+ORDER BY RunTime DESC;
+""",
+    "blocking": """
+SELECT r.session_id AS SessionId, r.blocking_session_id AS BlockingSessionId, r.status AS Status, r.command AS Command,
+  r.wait_type AS WaitType, r.wait_time AS WaitMs, r.total_elapsed_time AS ElapsedMs, DB_NAME(r.database_id) AS DatabaseName,
+  s.login_name AS LoginName, s.host_name AS HostName, s.program_name AS ProgramName,
+  CASE WHEN @text = 1 THEN LEFT(t.text, 400) END AS SqlText
+FROM sys.dm_exec_requests r
+JOIN sys.dm_exec_sessions s ON s.session_id = r.session_id
+OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) t
+WHERE r.blocking_session_id <> 0
+   OR r.session_id IN (SELECT blocking_session_id FROM sys.dm_exec_requests WHERE blocking_session_id <> 0)
+ORDER BY r.wait_time DESC;
+""",
+    "waits": """
+SELECT TOP (15) wait_type AS WaitType, waiting_tasks_count AS WaitingTasks, wait_time_ms AS WaitMs,
+  signal_wait_time_ms AS SignalMs, max_wait_time_ms AS MaxWaitMs,
+  (SELECT sqlserver_start_time FROM sys.dm_os_sys_info) AS CountingSince
+FROM sys.dm_os_wait_stats
+WHERE wait_time_ms > 0 AND wait_type NOT IN (__BENIGN__)
+ORDER BY wait_time_ms DESC;
+""",
+    "resources": """
+SELECT si.cpu_count AS CpuCount, si.physical_memory_kb / 1024 AS PhysicalMemoryMB, si.committed_kb / 1024 AS SqlCommittedMB,
+  si.committed_target_kb / 1024 AS SqlTargetMB, si.sqlserver_start_time AS StartTime,
+  (SELECT CAST(value_in_use AS bigint) FROM sys.configurations WHERE name = 'max server memory (MB)') AS MaxServerMemoryMB,
+  (SELECT CAST(value_in_use AS bigint) FROM sys.configurations WHERE name = 'min server memory (MB)') AS MinServerMemoryMB,
+  (SELECT CAST(value_in_use AS bigint) FROM sys.configurations WHERE name = 'max degree of parallelism') AS MaxDop,
+  (SELECT CAST(value_in_use AS bigint) FROM sys.configurations WHERE name = 'cost threshold for parallelism') AS CostThresholdForParallelism
+FROM sys.dm_os_sys_info si;
+""",
+    "errorlog": "EXEC sys.sp_readerrorlog 0, 1, N'Error';",
+    "availability": """
+SELECT ar.replica_server_name AS ReplicaServer, DB_NAME(drs.database_id) AS DatabaseName, drs.is_local AS IsLocal,
+  drs.synchronization_state_desc AS SynchronizationState, drs.synchronization_health_desc AS SynchronizationHealth
+FROM sys.dm_hadr_database_replica_states drs
+JOIN sys.availability_replicas ar ON ar.replica_id = drs.replica_id AND ar.group_id = drs.group_id
+ORDER BY ar.replica_server_name, DatabaseName;
+""",
+}
+SQL_QUERIES["waits"] = SQL_QUERIES["waits"].replace("__BENIGN__", ", ".join(f"'{w}'" for w in SQL_BENIGN_WAITS))
+SQL_ALL_SECTIONS = tuple(SQL_QUERIES)
+
+
+def _sql_sections(sections) -> list[str]:
+    secs = list(dict.fromkeys(_lst(sections) if sections else SQL_DEFAULT_SECTIONS))
+    bad = [x for x in secs if x not in SQL_QUERIES]
+    if bad:
+        raise ValueError(f"seção inválida: {bad}. Válidas: {', '.join(SQL_ALL_SECTIONS)}")
+    return secs
+
+
+def _sql_signals(data: dict) -> tuple[str, list[str]]:
+    """Sinais objetivos com limiar à vista (sem severidade e sem recomendação): estado dos bancos, ausência de backup
+    completo, backup completo antigo, jobs que falharam, bloqueios longos, auto-shrink/auto-close ligados e seções que
+    não puderam ser lidas."""
+    findings, status = [], SEM
+    def rows(name):
+        v = data.get(name)
+        return [r for r in _lst(v) if isinstance(r, dict) and "Error" not in r] if v is not None else None
+    for sec in data:
+        v = data[sec]
+        if isinstance(v, dict) and v.get("Error"):
+            status = _worst(status, INC)
+            findings.append(f"Seção '{sec}' não pôde ser lida: {str(v['Error'])[:160]}")
+    dbs = rows("databases") or []
+    off = [d["Name"] for d in dbs if d.get("State") != "ONLINE"]
+    if off:
+        status = _worst(status, SIG)
+        findings.append("Bancos fora de ONLINE: " + ", ".join(f"{n} ({next(d['State'] for d in dbs if d['Name'] == n)})" for n in off[:10]))
+    shr = [d["Name"] for d in dbs if d.get("AutoShrink") is True]
+    if shr:
+        status = _worst(status, SIG)
+        findings.append("Auto-shrink ligado em: " + ", ".join(shr[:10]))
+    acl = [d["Name"] for d in dbs if d.get("AutoClose") is True]
+    if acl:
+        status = _worst(status, SIG)
+        findings.append("Auto-close ligado em: " + ", ".join(acl[:10]))
+    bk = rows("backups") or []
+    nobk = [b["DatabaseName"] for b in bk if b.get("State") == "ONLINE" and not b.get("LastFull") and b.get("DatabaseName") not in ("model", "msdb", "master", "tempdb")]
+    nobk_sys = [b["DatabaseName"] for b in bk if b.get("State") == "ONLINE" and not b.get("LastFull") and b.get("DatabaseName") in ("master", "model", "msdb")]
+    if nobk or nobk_sys:
+        status = _worst(status, SIG)
+        findings.append("Sem nenhum backup completo registrado no msdb: " + ", ".join((nobk + nobk_sys)[:10]))
+    old = [(b["DatabaseName"], b["DaysSinceLastFull"]) for b in bk if isinstance(b.get("DaysSinceLastFull"), (int, float)) and b["DaysSinceLastFull"] > SQL_FULL_BACKUP_DAYS]
+    if old:
+        status = _worst(status, SIG)
+        findings.append(f"Último backup completo há mais de {SQL_FULL_BACKUP_DAYS} dias (limiar do projeto): " + ", ".join(f"{n} ({d} d)" for n, d in old[:10]))
+    jobs = rows("jobs")
+    if jobs:
+        status = _worst(status, SIG)
+        findings.append(f"{len(jobs)} execução(ões) de job do SQL Server Agent com falha no período consultado")
+    blk = [b for b in (rows("blocking") or []) if isinstance(b.get("WaitMs"), (int, float)) and b["WaitMs"] > SQL_BLOCKED_MS and b.get("BlockingSessionId")]
+    if blk:
+        status = _worst(status, SIG)
+        findings.append(f"{len(blk)} sessão(ões) bloqueada(s) há mais de {SQL_BLOCKED_MS // 1000} s (limiar do projeto)")
+    return status, findings or ["Nenhum sinal encontrado."]
+
+
+def _sql_shape(res, host):
+    """Normaliza a resposta: instâncias e seções sempre listas; texto de SQL mascarado; sinais objetivos."""
+    if not isinstance(res, dict) or "SqlFound" not in res:
+        return res
+    res["Instances"] = [i for i in _lst(res.get("Instances")) if isinstance(i, dict)]
+    if res.get("SqlFound") is False or not res.get("Connected"):
+        return res
+    data = {}
+    for sec, v in (res.get("Sections") or {}).items():
+        if isinstance(v, dict) and "Error" in v:
+            data[sec] = v
+        else:
+            data[sec] = [r for r in _lst(v) if isinstance(r, dict)]
+    for r in data.get("blocking", []) if isinstance(data.get("blocking"), list) else []:
+        r["SqlText"] = _mask_secrets(r.get("SqlText"))
+    for r in data.get("errorlog", []) if isinstance(data.get("errorlog"), list) else []:
+        r["Text"] = _mask_secrets(r.get("Text"))
+    res["Sections"] = data
+    res["status"], res["findings"] = _sql_signals(data)
+    return res
+
+
+PS_SQL = r"""
+$inst = '__I__'; $secs = @(__SECS__); $db = '__DB__'; $hours = __H__; $withText = __T__
+$svc = @(Get-Service -ErrorAction SilentlyContinue | ? { $_.Name -eq 'MSSQLSERVER' -or $_.Name -like 'MSSQL$*' } |
+  % { [pscustomobject]@{ Service=$_.Name; Instance=$(if ($_.Name -eq 'MSSQLSERVER') { 'MSSQLSERVER' } else { $_.Name -replace '^MSSQL\$','' }); Status="$($_.Status)" } })
+if (-not $svc.Count) { [pscustomobject]@{ SqlFound=$false; Message='Nenhum serviço de instância do SQL Server (MSSQLSERVER ou MSSQL$nome) neste servidor' } | ConvertTo-Json -Compress; return }
+$pick = if ($inst) { $svc | ? { $_.Instance -eq $inst } | select -First 1 } else { ($svc | ? { $_.Status -eq 'Running' } | select -First 1) }
+$base = [ordered]@{ SqlFound=$true; Instances=$svc; Connected=$false }
+if (-not $pick) { $base.Message = $(if ($inst) { "Instância '$inst' não encontrada" } else { 'Nenhuma instância em execução' }); [pscustomobject]$base | ConvertTo-Json -Depth 4 -Compress; return }
+$base.Instance = $pick.Instance; $base.ServiceStatus = $pick.Status
+if ($pick.Status -ne 'Running') { $base.Message = "O serviço da instância está $($pick.Status)"; [pscustomobject]$base | ConvertTo-Json -Depth 4 -Compress; return }
+$srv = if ($pick.Instance -eq 'MSSQLSERVER') { '.' } else { '.\' + $pick.Instance }
+$conn = New-Object System.Data.SqlClient.SqlConnection("Server=$srv;Integrated Security=SSPI;Connect Timeout=10;Application Name=windows-ops-mcp;ApplicationIntent=ReadOnly;TrustServerCertificate=True")
+try { $conn.Open() } catch { $base.Message = 'Falha ao conectar: ' + $_.Exception.Message; [pscustomobject]$base | ConvertTo-Json -Depth 4 -Compress; return }
+$Q = @{}
+__QUERIES__
+function Run($name) {
+  $cmd = $conn.CreateCommand(); $cmd.CommandText = $Q[$name]; $cmd.CommandTimeout = 30
+  [void]$cmd.Parameters.AddWithValue('@db', $(if ($db) { $db } else { [DBNull]::Value }))
+  [void]$cmd.Parameters.AddWithValue('@hours', $hours)
+  [void]$cmd.Parameters.AddWithValue('@text', $withText)
+  $dt = New-Object System.Data.DataTable
+  $da = New-Object System.Data.SqlClient.SqlDataAdapter $cmd; [void]$da.Fill($dt)
+  $rows = @($dt.Rows | % { $r = $_; $o = [ordered]@{}; foreach ($c in $dt.Columns) { $v = $r[$c]; $o[$c.ColumnName] = $(if ($v -is [DBNull]) { $null } else { $v }) }; [pscustomobject]$o })
+  if ($name -eq 'errorlog') { $rows = @($rows | select -Last 50) }
+  return ,$rows }
+$sections = [ordered]@{}
+foreach ($s in $secs) { try { $sections[$s] = Run $s } catch { $sections[$s] = [pscustomobject]@{ Error=$_.Exception.Message } } }
+$conn.Close()
+$base.Connected = $true; $base.ConnectedAs = "$([Security.Principal.WindowsIdentity]::GetCurrent().Name)"; $base.Sections = $sections
+[pscustomobject]$base | ConvertTo-Json -Depth 5 -Compress
+"""
+
+
+@mcp.tool
+def get_sql_diagnostics(host: str, sections: list[str] | None = None, instance: str | None = None, database: str | None = None,
+                        job_hours: int = 24, include_sql_text: bool = False):
+    """Diagnóstico do SQL Server com consultas FIXAS (somente leitura; nada de SQL livre). Só consulta se o servidor tiver
+    serviço de instância do SQL Server (senão responde SqlFound=false). Conecta DENTRO do servidor, na instância local,
+    com a autenticação integrada da conta da coleta (nenhuma credencial SQL guardada); precisa de permissão como
+    VIEW SERVER STATE e leitura no msdb: a seção sem permissão volta com o erro e as outras continuam.
+    'sections' (padrão: overview, databases, backups, jobs, blocking): overview (versão, edição, collation), databases
+    (estado, recuperação, tamanho de dados e log, auto-shrink/auto-close), files (arquivos, tamanho, crescimento),
+    backups (último completo/diferencial/log e dias desde o completo), jobs (falhas do SQL Server Agent em 'job_hours',
+    1-168), blocking (sessões bloqueadas e bloqueadoras; include_sql_text=true traz até 400 caracteres do SQL, mascarado),
+    waits (maiores esperas acumuladas, sem as esperas de fundo conhecidas), resources (CPU, memória, max server memory,
+    MAXDOP, cost threshold), errorlog (últimas 50 linhas do log atual com 'Error'), availability (réplicas do Always On).
+    'instance' (nome da instância, ex.: MSSQLSERVER ou SQLEXPRESS) e 'database' filtram. Devolve sinais objetivos com
+    limiar à vista (sem severidade nem recomendação); interpretar é do RAG (microsoft-docs)."""
+    secs = _sql_sections(sections)
+    if instance is not None and not SQL_INSTANCE_RE.match(instance):
+        raise ValueError("instance inválida")
+    if database is not None and not SQL_NAME_RE.match(database):
+        raise ValueError("database inválido")
+    hours = max(1, min(int(job_hours), SQL_MAX_HOURS))
+    queries = "\n".join("$Q['" + n + "'] = @'\n" + SQL_QUERIES[n].strip() + "\n'@" for n in secs)
+    script = (PS_SQL.replace("__QUERIES__", queries).replace("__SECS__", ", ".join(f"'{n}'" for n in secs))
+              .replace("__H__", str(hours)).replace("__T__", "1" if include_sql_text else "0")
+              .replace("__DB__", (database or "").replace("'", "''")).replace("__I__", instance or ""))
+    return _sql_shape(_ps(host, script, timeout=180), host)
+
+
 # ---------- painel de saúde rápido ----------
 @mcp.tool
 def get_health_summary(

@@ -118,7 +118,7 @@ Depois é só pedir em linguagem natural, por exemplo: *"faça um health check d
 4. Registre no cliente, enviando o token:
    `claude mcp add --transport http windows-ops https://<host>/mcp --header "Authorization: Bearer <token>"`.
 
-## Catálogo de tools (77)
+## Catálogo de tools (78)
 
 Todas recebem `host` (nome ou FQDN do servidor alvo).
 
@@ -313,6 +313,13 @@ O inventário `hosts.json` (veja `hosts.example.json`; fica fora do git; `WINRM_
 |---|---|
 | `list_hosts` | Servidores do inventário: nome, tags, descrição e se passam na lista de hosts permitidos; `tag` filtra |
 | `run_on_hosts` | Roda uma tool de leitura (`get_uptime`, `get_system_overview`, `get_time_config`, `get_last_patches`, `get_patch_status`, `get_stopped_auto_services`, `get_volumes`, `get_disks`, `get_services`, `get_listening_ports`, `get_events`, `get_health_summary`, `get_performance_snapshot`, `get_local_admins`, `get_local_users`, `get_security_posture`, `get_applied_gpos`, `get_license_status`, `get_platform_info`, `get_network_config`, `get_expiring_certificates`, `list_event_logs`, `get_security_context`, `test_connectivity`, `get_top_processes`, `get_workload_evidence`, `get_scheduled_tasks`) em `hosts` e/ou `tag`. Até 50 hosts e 10 em paralelo; `timeout_s` de 30 a 900 (quem não responde volta como `timeout`); resultado por host acima de `max_chars_per_host` é resumido. **Não inclui** tools que leem conteúdo (`read_file`, `get_registry`, `search_log`...) nem as longas (use `start_job` host a host) |
+
+### SQL Server (consultas fixas)
+| Tool | O que faz |
+|---|---|
+| `get_sql_diagnostics` | **Diagnóstico do SQL Server com consultas FIXAS**, somente leitura e sem SQL livre. Só consulta se o servidor tiver **serviço de instância** (senão responde `SqlFound=false`; regra do projeto de não presumir a carga). Conecta **dentro do servidor**, na instância local, com a **autenticação integrada** da conta da coleta (nenhuma credencial SQL é guardada) e precisa de permissões como `VIEW SERVER STATE` e leitura no `msdb`: a seção sem permissão volta com o erro e as demais continuam. Seções (`sections`; padrão: `overview`, `databases`, `backups`, `jobs`, `blocking`): `overview` (versão, edição, collation), `databases` (estado, recuperação, tamanho de dados e log, auto-shrink/auto-close), `files`, `backups` (último completo/diferencial/log e dias desde o completo), `jobs` (falhas do Agent em `job_hours`, 1-168), `blocking` (`include_sql_text=true` traz até 400 caracteres do SQL, mascarado), `waits` (maiores esperas acumuladas, sem as esperas de fundo conhecidas), `resources` (CPU, memória, max server memory, MAXDOP, cost threshold), `errorlog` (últimas 50 linhas com "Error") e `availability` (Always On). `instance` e `database` filtram (o banco entra como parâmetro SQL). Devolve **sinais objetivos com limiar à vista**: bancos fora de ONLINE, sem backup completo, backup completo com mais de 7 dias, jobs com falha, sessões bloqueadas há mais de 30 s, auto-shrink/auto-close ligados |
+
+**Estado da validação:** o laboratório não tem SQL Server. Foi validado nos servidores reais só o caminho "sem instância" (o script inteiro é gerado, enviado e executado até a descoberta de serviços) e, nos testes, que todas as consultas são fixas, de leitura, com um único comando e sem parâmetros concatenados, além da lógica dos sinais com dados simulados. **A sintaxe T-SQL e os nomes das colunas ainda precisam ser confirmados numa instância real.**
 
 ### Coleta × interpretação
 Este MCP **só coleta**: fatos observáveis, normalização, sinais objetivos e comparação com baseline do projeto. Boas práticas, recomendação, severidade e fontes documentais ficam no **`microsoft-docs-mcp`** (`C:\mcp\microsoft_docs_mcp`), outro servidor MCP e o único com acesso à internet. O Claude chama o coletor, depois o RAG, e junta fato e evidência citando a fonte. Veja a tabela do que cada um pode afirmar no README do `microsoft-docs-mcp`.

@@ -228,9 +228,9 @@ class TestRegrasDoProjeto:
             async with Client(S.mcp) as c:
                 return {t.name for t in await c.list_tools()}
         n = asyncio.run(nomes())
-        assert len(n) == 77
+        assert len(n) == 78
         for esperado in ("get_license_status", "get_workload_evidence", "get_platform_info", "get_storage_overview",
-                         "get_stopped_auto_services", "get_local_groups", "get_installed_software", "get_registry", "get_environment_variables", "get_permissions", "get_dns_cache", "resolve_dns_name", "get_local_users", "list_log_files", "get_log_tail", "search_log", "get_security_context", "list_directory", "find_files", "file_info", "read_file", "compare_files", "find_duplicate_files", "list_event_logs", "get_dotnet_config", "start_job", "get_job", "list_jobs", "list_hosts", "run_on_hosts"):
+                         "get_stopped_auto_services", "get_local_groups", "get_installed_software", "get_registry", "get_environment_variables", "get_permissions", "get_dns_cache", "resolve_dns_name", "get_local_users", "list_log_files", "get_log_tail", "search_log", "get_security_context", "list_directory", "find_files", "file_info", "read_file", "compare_files", "find_duplicate_files", "list_event_logs", "get_dotnet_config", "start_job", "get_job", "list_jobs", "list_hosts", "run_on_hosts", "get_sql_diagnostics"):
             assert esperado in n
 
     def test_resposta_do_wmi_para_json_e_ida_e_volta(self):
