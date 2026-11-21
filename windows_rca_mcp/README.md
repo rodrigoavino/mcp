@@ -118,7 +118,7 @@ Depois é só pedir em linguagem natural, por exemplo: *"faça um health check d
 4. Registre no cliente, enviando o token:
    `claude mcp add --transport http windows-ops https://<host>/mcp --header "Authorization: Bearer <token>"`.
 
-## Catálogo de tools (63)
+## Catálogo de tools (64)
 
 Todas recebem `host` (nome ou FQDN do servidor alvo).
 
@@ -250,6 +250,7 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 | `get_local_admins` | Membros do grupo Administradores local (pelo SID, independe do idioma) |
 | `get_local_groups` | **Todos os grupos locais e seus membros**: SID, descrição, tipo e origem de cada membro (`Local`, `Interno (BUILTIN)`, `Sistema (NT AUTHORITY)`, `Domínio`, `Azure AD`, `Externo`), estado das contas locais (habilitada, último logon, senha) e **sinais** (só fatos): SIDs não resolvidos, principais de domínio/Azure AD no Administrators, contas locais habilitadas com senha que nunca expira, contas desabilitadas como membros, grupos vazios. Funciona mesmo com o DC inacessível. Não classifica nada como "privilegiado". Filtro por `group` |
 | `get_local_users` | **Contas de usuário locais**: nome, nome completo, SID, habilitada, descrição, último logon, senha alterada/expira, senha nunca expira, senha exigida, usuário pode alterar a senha e expiração da conta, com `Counts` objetivos (total, habilitadas, desabilitadas, habilitadas com senha que nunca expira, nunca logaram). Filtro por `name`. Em controlador de domínio devolve que não há contas locais. Não classifica nenhuma conta (para grupos e membros, `get_local_groups`) |
+| `get_security_context` | **Identidade da própria coleta** no servidor: conta, SID, tipo de autenticação, **nível de integridade** (Low/Medium/High/System), se é membro de Administradores (pelo SID), grupos do token (SID e nome) e privilégios do token (nome e estado como o Windows informa, no idioma do servidor). Descreve a conta do coletor, não o servidor; serve para explicar "acesso negado" |
 | `get_failed_logons` | Eventos 4625 agrupados por conta + IP, com o motivo traduzido |
 | `get_security_posture` | Defender, firewall, RDP |
 | `get_time_config` | **Configuração NTP completa**: tipo (NT5DS/NTP), servidores, intervalos, fonte, stratum, último sync, peers, papel no domínio, VMICTimeProvider, **offset medido** e **relógio do servidor** (`Clock`), com sinais objetivos (sem severidade nem recomendação) |
