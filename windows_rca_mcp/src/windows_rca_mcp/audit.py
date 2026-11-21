@@ -76,11 +76,22 @@ class AuditLog:
             pass   # auditoria nunca derruba a tool
 
 
+_DEFAULT_LOG: AuditLog | None = None
+
+
+def default_log() -> AuditLog:
+    """Log de auditoria único do processo: o middleware e os jobs em segundo plano gravam no mesmo arquivo."""
+    global _DEFAULT_LOG
+    if _DEFAULT_LOG is None:
+        _DEFAULT_LOG = AuditLog()
+    return _DEFAULT_LOG
+
+
 class AuditMiddleware(Middleware):
     """Registra cada chamada de tool. Fica POR FORA do envelope: lê o resultado já no formato padrão (success/error)."""
 
     def __init__(self, log: AuditLog | None = None):
-        self.log = log or AuditLog()
+        self.log = log or default_log()
 
     async def on_call_tool(self, context, call_next):
         t0 = time.monotonic()

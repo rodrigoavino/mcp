@@ -70,6 +70,11 @@ def _now() -> str:
     return datetime.now(_tz()).isoformat(timespec="seconds")
 
 
+def now_local() -> str:
+    """Data e hora atuais no fuso padrão das respostas (GMT-3 por padrão), em ISO 8601 com deslocamento."""
+    return _now()
+
+
 def build_envelope(host: str | None, raw, now: str | None = None) -> dict:
     """Função pura: dado cru de uma tool -> envelope padrão."""
     ts = now or _now()

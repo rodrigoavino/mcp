@@ -118,7 +118,7 @@ Depois é só pedir em linguagem natural, por exemplo: *"faça um health check d
 4. Registre no cliente, enviando o token:
    `claude mcp add --transport http windows-ops https://<host>/mcp --header "Authorization: Bearer <token>"`.
 
-## Catálogo de tools (72)
+## Catálogo de tools (75)
 
 Todas recebem `host` (nome ou FQDN do servidor alvo).
 
@@ -296,6 +296,15 @@ Leitura de **caminhos arbitrários** (`C:\pasta`), entregue com salvaguardas. É
 | `compare_files` | Compara dois arquivos de texto do mesmo servidor, linha a linha (`OnlyInA`/`OnlyInB`, até 200 diferenças). Cada arquivo: até 2 MB e 5.000 linhas |
 | `find_duplicate_files` | **Arquivos duplicados** (conteúdo idêntico) abaixo de uma pasta, só com `min_size_mb` ou mais (padrão 10 MB). Lê o mínimo: mesmo tamanho, depois hash dos primeiros 64 KB e só então o SHA-256 completo. Devolve os grupos de maior espaço desperdiçado (`WastedBytes` = tamanho x (cópias distintas - 1)), com hash, tamanho e até 20 caminhos, e o total desperdiçado. **Hard links do mesmo dado não são duplicados** (`HardLinkOnlyGroups`). Não segue links, respeita os bloqueios das tools de arquivos e **não apaga nada**. Limites de tempo (30-900 s, `Partial=true` se estourar) e de leitura (`max_hash_gb`). Exige `Add-Type` |
 | `get_dotnet_config` | Lê **`web.config`/`app.config`/`machine.config`/`applicationHost.config`** (`.config` ou `.xml`) e devolve a estrutura em nós (caminho, atributos, texto), até 1.000, com atalhos `AppSettings` e `ConnectionStrings` (nome, provedor, servidor, banco, segurança integrada). **Segredos mascarados**: atributos `password`, entradas como `DbPassword` e `Pwd=` dentro da connection string (servidor e banco ficam visíveis). `section` limita a uma seção. XML sem DTD (sem XXE), até 2 MB, mesmas proteções de `read_file` |
+
+### Jobs assíncronos (coletas longas)
+Coletas de minutos (DISM, varredura de disco, duplicados) podem passar do tempo que o cliente MCP espera por uma chamada. Com `start_job` a coleta roda em segundo plano e o resultado é lido depois, **no mesmo formato da chamada direta**. A execução respeita os mesmos bloqueios, lista de hosts e prazos de cada tool, e cada job é registrado na auditoria (`job:<tool>`). Os jobs ficam **na memória** do processo do MCP (somem se ele reiniciar), por 1 hora depois de terminar; no máximo 4 em execução e 50 guardados; resultado de até 5 MB. Não há cancelamento: a coleta termina no prazo da própria tool.
+
+| Tool | O que faz |
+|---|---|
+| `start_job` | Inicia uma das tools permitidas (`get_disk_usage_tree`, `find_duplicate_files`, `get_component_store_analysis`, `get_largest_files`, `get_largest_folders`, `get_event_summary`, `get_pending_updates`, `get_cbs_health`, `get_cbs_log_errors`, `get_disk_allocation_analysis`, `get_update_error_analysis`, `get_installed_software`, `search_log`, `find_files`, `get_common_space_offenders`, `get_security_posture`) com `arguments` simples (texto, número, booleano, lista) e devolve o `job_id` |
+| `get_job` | Estado (`running`, `done`, `error`) e, quando `done`, o resultado. `wait_seconds` (0 a 30) espera pelo término |
+| `list_jobs` | Jobs conhecidos (id, tool, host, estado, início, fim, duração), sem os resultados |
 
 ### Coleta × interpretação
 Este MCP **só coleta**: fatos observáveis, normalização, sinais objetivos e comparação com baseline do projeto. Boas práticas, recomendação, severidade e fontes documentais ficam no **`microsoft-docs-mcp`** (`C:\mcp\microsoft_docs_mcp`), outro servidor MCP e o único com acesso à internet. O Claude chama o coletor, depois o RAG, e junta fato e evidência citando a fonte. Veja a tabela do que cada um pode afirmar no README do `microsoft-docs-mcp`.
