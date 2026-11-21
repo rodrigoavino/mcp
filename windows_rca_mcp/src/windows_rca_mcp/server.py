@@ -275,6 +275,12 @@ def _ints(values) -> str:
 
 
 MAX_LOG_DAYS = 90
+MAX_LOG_HOURS = 24 * 30
+
+
+def _hours(h) -> int:
+    """Janela em horas, limitada a 1..720."""
+    return max(1, min(int(h), MAX_LOG_HOURS))
 
 
 def _days(d) -> int:
@@ -393,12 +399,18 @@ $procs = @(); if ($flt) {
 
 
 @mcp.tool
-def get_top_processes(host: str, sort_by: str = "cpu", top: int = 15):
-    """Top processos por 'cpu' ou 'memory' (valores instantâneos)."""
+def get_top_processes(host: str, sort_by: str = "cpu", top: int = 15, name_filter: str | None = None):
+    """Top processos por 'cpu' ou 'memory' (valores instantâneos). name_filter (wildcard no nome, ex.: 'sqlservr*',
+    'w3wp*') limita aos processos que casam; as instâncias aparecem como 'nome#n' quando há várias."""
+    if sort_by not in ("cpu", "memory"):
+        raise ValueError("sort_by deve ser cpu ou memory")
+    if name_filter is not None and not PERF_PROC_RE.match(name_filter):
+        raise ValueError("name_filter inválido (letras, números, '*', '?', '.', '-', '_' e '#')")
     key = "PercentProcessorTime" if sort_by == "cpu" else "WorkingSetPrivate"
+    flt = f" -and $_.Name -like '{name_filter}'" if name_filter else ""
     return _ps(host, rf"""
 Get-CimInstance Win32_PerfFormattedData_PerfProc_Process |
-  ? {{ $_.Name -notin '_Total','Idle' }} | sort {key} -desc | select -first {int(top)} |
+  ? {{ $_.Name -notin '_Total','Idle'{flt} }} | sort {key} -desc | select -first {max(1, min(int(top), 100))} |
   select Name,IDProcess,PercentProcessorTime,
     @{{n='PrivateMB';e={{[math]::Round($_.WorkingSetPrivate/1MB,1)}}}},ThreadCount,HandleCount |
   ConvertTo-Json -Compress
@@ -414,15 +426,18 @@ def get_events(
     event_ids: list[int] | None = None,
     provider: str | None = None,
     max_events: int = 50,
+    hours: int | None = None,
 ):
     """Eventos de PROBLEMA do Event Viewer: por padrão só Crítico(1), Erro(2) e Aviso(3) do último dia.
     days: período (padrão 1; aumente só se o usuário pedir análise de mais dias, máx. 90).
+    hours: janela em HORAS (1 a 720), para "últimas 6 horas"; quando informado, substitui 'days'.
     levels: 1=Crítico, 2=Erro, 3=Aviso (4=Info só se pedido explicitamente)."""
     if not NAME_RE.match(log_name) or (provider and not NAME_RE.match(provider)):
         raise ValueError("log_name/provider inválido")
     if not levels or any(int(lv) not in (1, 2, 3, 4, 5) for lv in levels):
         raise ValueError("levels deve conter valores entre 1 e 5")
-    flt = f"LogName='{log_name}'; StartTime=(Get-Date).AddDays(-{_days(days)}); Level={_ints(levels)}"
+    start = f"AddHours(-{_hours(hours)})" if hours is not None else f"AddDays(-{_days(days)})"
+    flt = f"LogName='{log_name}'; StartTime=(Get-Date).{start}; Level={_ints(levels)}"
     if event_ids:
         flt += f"; Id={_ints(event_ids)}"
     if provider:
@@ -1509,15 +1524,25 @@ $rdp = ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Serve
 
 
 
+CERT_LOCATIONS = ("LocalMachine", "CurrentUser")
+CERT_STORES = ("My", "WebHosting", "Root", "CA", "AuthRoot", "TrustedPeople", "TrustedPublisher", "Remote Desktop")
+
+
 @mcp.tool
-def get_expiring_certificates(host: str, days_threshold: int = 60):
-    """Certificados do repositório LocalMachine\\My vencidos ou que vencem em até N dias."""
+def get_expiring_certificates(host: str, days_threshold: int = 60, location: str = "LocalMachine", store: str = "My"):
+    """Certificados vencidos ou que vencem em até N dias. Por padrão o repositório LocalMachine\\My. location:
+    LocalMachine | CurrentUser (este é o da conta usada pela coleta). store: My, WebHosting, Root, CA, AuthRoot,
+    TrustedPeople, TrustedPublisher ou 'Remote Desktop'."""
+    if location not in CERT_LOCATIONS:
+        raise ValueError("location deve ser LocalMachine ou CurrentUser")
+    if store not in CERT_STORES:
+        raise ValueError("store inválido. Válidos: " + ", ".join(CERT_STORES))
     return _ps(host, r"""
-Get-ChildItem Cert:\LocalMachine\My |
-  select Subject,Thumbprint,NotAfter,HasPrivateKey,
+Get-ChildItem 'Cert:\__L__\__S__' -ErrorAction SilentlyContinue |
+  select Subject,Issuer,Thumbprint,NotAfter,HasPrivateKey,
     @{n='DaysLeft';e={[int]($_.NotAfter-(Get-Date)).TotalDays}} |
   ? { $_.DaysLeft -le __D__ } | sort DaysLeft | ConvertTo-Json -Compress
-""".replace("__D__", str(int(days_threshold))))
+""".replace("__D__", str(int(days_threshold))).replace("__L__", location).replace("__S__", store))
 
 
 # ---------- saúde do CBS e do Windows Update (erros escondidos na aplicação de patches) ----------
@@ -2123,9 +2148,12 @@ $out = foreach ($c in @(Get-NetIPConfiguration | ? { $_.NetAdapter.Status -eq 'U
 
 
 @mcp.tool
-def get_listening_ports(host: str, include_udp: bool = False):
-    """Portas TCP em escuta (e opcionalmente UDP) com o processo e os serviços donos de cada porta."""
+def get_listening_ports(host: str, include_udp: bool = False, port: int | None = None):
+    """Portas TCP em escuta (e opcionalmente UDP) com o processo e os serviços donos de cada porta.
+    port (1-65535) limita a essa porta local."""
     udp = "$true" if include_udp else "$false"
+    if port is not None and not 1 <= int(port) <= 65535:
+        raise ValueError("port deve estar entre 1 e 65535")
     return _ps(host, r"""
 $proc = @{}; Get-Process | % { $proc[[int]$_.Id] = $_.ProcessName }
 $svc = @{}; Get-CimInstance Win32_Service | ? { $_.ProcessId } | % { $k=[int]$_.ProcessId; $svc[$k] = @($svc[$k]) + $_.Name }
@@ -2134,8 +2162,8 @@ function Row($proto, $e) { $k=[int]$e.OwningProcess
     Process=$proc[$k]; Services=(@($svc[$k] | ? { $_ }) -join ',') } }
 $rows = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | % { Row 'TCP' $_ })
 if (__UDP__) { $rows += @(Get-NetUDPEndpoint -ErrorAction SilentlyContinue | ? { $_.LocalPort -lt 49152 } | % { Row 'UDP' $_ }) }
-$rows | sort Protocol,LocalPort,LocalAddress | ConvertTo-Json -Compress
-""".replace("__UDP__", udp))
+$rows | ? { -not __PORT__ -or $_.LocalPort -eq __PORT__ } | sort Protocol,LocalPort,LocalAddress | ConvertTo-Json -Compress
+""".replace("__UDP__", udp).replace("__PORT__", str(int(port)) if port is not None else "0"))
 
 
 @mcp.tool
@@ -2211,12 +2239,16 @@ $per = @(Get-NetRoute {fam} -PolicyStore PersistentStore -ErrorAction SilentlyCo
 
 
 @mcp.tool
-def get_network_connections(host: str, state: str | None = None, top: int = 30):
+def get_network_connections(host: str, state: str | None = None, top: int = 30, port: int | None = None):
     """Equivalente ao 'netstat -ano' com análise: contagem por estado TCP, maiores destinos remotos, processos com
     mais conexões, uso de portas efêmeras e alerta de TIME_WAIT/CLOSE_WAIT excessivos.
-    state (opcional): Established|Listen|TimeWait|CloseWait|SynSent|... para listar as conexões nesse estado."""
+    state (opcional): Established|Listen|TimeWait|CloseWait|SynSent|... para listar as conexões nesse estado.
+    port (opcional, 1-65535): lista as conexões cuja porta local OU remota é essa (qualquer estado, ou o de 'state')
+    e informa em 'PortMatches' quantas existem."""
     if state is not None and not re.match(r"^[A-Za-z]{3,15}$", state):
         raise ValueError("state inválido")
+    if port is not None and not 1 <= int(port) <= 65535:
+        raise ValueError("port deve estar entre 1 e 65535")
     n = max(1, min(int(top), 200))
     res = _ps(host, r"""
 $proc = @{}; Get-Process | % { $proc[[int]$_.Id] = $_.ProcessName }
@@ -2233,10 +2265,11 @@ $est = @($c | ? { "$($_.State)" -eq 'Established' })
     @{n='Ports';e={(@($_.Group.RemotePort | select -unique | select -first 10) -join ',')}})
   TopProcesses=@($c | group OwningProcess | sort Count -desc | select -first __N__ @{n='PID';e={[int]$_.Name}},
     @{n='Process';e={$proc[[int]$_.Name]}},Count,@{n='States';e={(@($_.Group | group { "$($_.State)" } | % { "$($_.Name)=$($_.Count)" }) -join ' ')}})
-  Connections=@(if ('__S__') { $c | ? { "$($_.State)" -eq '__S__' } | select -first __N__ LocalAddress,LocalPort,RemoteAddress,RemotePort,
+  PortMatches=$(if (__PORT__) { @($c | ? { $_.LocalPort -eq __PORT__ -or $_.RemotePort -eq __PORT__ }).Count } else { $null })
+  Connections=@(if ('__S__' -or __PORT__) { $c | ? { (-not '__S__' -or "$($_.State)" -eq '__S__') -and (-not __PORT__ -or $_.LocalPort -eq __PORT__ -or $_.RemotePort -eq __PORT__) } | select -first __N__ LocalAddress,LocalPort,RemoteAddress,RemotePort,
     @{n='State';e={"$($_.State)"}},@{n='PID';e={$_.OwningProcess}},@{n='Process';e={$proc[[int]$_.OwningProcess]}} })
 } | ConvertTo-Json -Depth 4 -Compress
-""".replace("__N__", str(n)).replace("__S__", state or ""), timeout=120)
+""".replace("__N__", str(n)).replace("__S__", state or "").replace("__PORT__", str(int(port)) if port is not None else "0"), timeout=120)
     if isinstance(res, dict) and "ByState" in res:
         st = {s["State"]: s["Count"] for s in _lst(res["ByState"])}
         alerts = []
@@ -2620,13 +2653,20 @@ $since = (Get-Date).AddDays(-__H__)
 TASK_OK = {0, 0x41300, 0x41301, 0x41303, 0x41325}  # sucesso, pronta, executando, nunca executou, enfileirada
 
 
+TASK_NAME_RE = re.compile(r"^[A-Za-z0-9 _*?.-]{1,100}$")
+
+
 @mcp.tool
-def get_scheduled_tasks(host: str, only_failed: bool = True, include_microsoft: bool = False):
+def get_scheduled_tasks(host: str, only_failed: bool = True, include_microsoft: bool = False, name_filter: str | None = None):
     """Tarefas agendadas com estado, última/próxima execução, resultado (hex) e conta de execução.
-    only_failed=True devolve só as que falharam na última execução. Por padrão ignora \\Microsoft\\*."""
+    only_failed=True devolve só as que falharam na última execução. Por padrão ignora \\Microsoft\\*.
+    name_filter (wildcard no nome da tarefa, ex.: '*backup*') limita às tarefas que casam."""
+    if name_filter is not None and not TASK_NAME_RE.match(name_filter):
+        raise ValueError("name_filter inválido (letras, números, espaço, '*', '?', '.', '-' e '_')")
     rows = _ps(host, r"""
 $t = Get-ScheduledTask -ErrorAction SilentlyContinue
 if (-not __MS__) { $t = $t | ? { $_.TaskPath -notlike '\Microsoft\*' } }
+if ('__NF__') { $t = $t | ? { $_.TaskName -like '__NF__' } }
 @(foreach ($x in $t) {
   $i = $x | Get-ScheduledTaskInfo -ErrorAction SilentlyContinue
   [pscustomobject]@{
@@ -2635,7 +2675,7 @@ if (-not __MS__) { $t = $t | ? { $_.TaskPath -notlike '\Microsoft\*' } }
     Action=(@($x.Actions | % { ("$($_.Execute) $($_.Arguments)").Trim() }) -join ' | ')
   }
 }) | ConvertTo-Json -Compress
-""".replace("__MS__", "$true" if include_microsoft else "$false"), timeout=180)
+""".replace("__MS__", "$true" if include_microsoft else "$false").replace("__NF__", name_filter or ""), timeout=180)
     if isinstance(rows, dict) and "error" in rows:
         return rows
     out = []
