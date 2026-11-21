@@ -118,7 +118,7 @@ Depois é só pedir em linguagem natural, por exemplo: *"faça um health check d
 4. Registre no cliente, enviando o token:
    `claude mcp add --transport http windows-ops https://<host>/mcp --header "Authorization: Bearer <token>"`.
 
-## Catálogo de tools (64)
+## Catálogo de tools (69)
 
 Todas recebem `host` (nome ou FQDN do servidor alvo).
 
@@ -277,6 +277,22 @@ Não é leitura de arquivo arbitrário. Só `.log` e `.txt` dentro de pastas de 
 | `list_log_files` | Arquivos `.log`/`.txt` de uma pasta permitida (não recursivo), do mais recente ao mais antigo: nome, tamanho e última gravação, até 200. `name_filter` com curinga |
 | `get_log_tail` | Últimas N linhas (padrão 100, máximo 500) de um log. Rápido mesmo em arquivos grandes |
 | `search_log` | Procura um texto **literal** (não regex, sem diferenciar maiúsculas) e devolve até 200 linhas com número da linha. Recusa arquivos com mais de 200 MB (use `get_log_tail`) |
+
+### Arquivos e pastas (somente leitura, com bloqueios)
+Leitura de **caminhos arbitrários** (`C:\pasta`), entregue com salvaguardas. É uma **lista de bloqueio, de melhor esforço**, e não uma garantia: quem tem acesso às tools passa a poder ler qualquer arquivo de texto do servidor que a lista não bloqueie. O que é recusado:
+- **Áreas:** `C:\Windows\System32\config` (hives do registro), qualquer pasta `NTDS`, `Microsoft\Credentials|Protect|Vault|Crypto` (DPAPI), `.ssh` e `System Volume Information`.
+- **Arquivos:** certificados e chaves (`.pfx`, `.p12`, `.pem`, `.key`, `.ppk`, `.pvk`, `.jks`), KeePass, dumps (`.dmp`), discos virtuais, hives, `.rdp`, `NTUSER.DAT`, chaves SSH, `.git-credentials`, `.netrc` e respostas de instalação (`unattend.xml`, `sysprep.*`).
+- **Caminho:** `..`, `/`, aspas, curingas e `$`; **qualquer link simbólico ou junção** no caminho (senão seria um desvio da lista); arquivos **binários**; arquivo com **chave privada** em texto.
+- **Conteúdo:** valores de `password=`, `token:`, `api_key=` e semelhantes vêm mascarados (`***`); linhas cortadas em 500 caracteres.
+- Mais pastas bloqueadas com `WINRM_FILE_DENY_EXTRA` (separadas por `;`). Todas as chamadas, com o caminho pedido, ficam no log de auditoria.
+
+| Tool | O que faz |
+|---|---|
+| `list_directory` | Conteúdo de **uma** pasta, do mais recente ao mais antigo: nome, tipo, tamanho, última gravação, atributos e se é link. `name_filter` com curinga, até 200. `ReadBlocked=true` nos itens que não podem ser lidos |
+| `find_files` | Procura **arquivos pelo nome** (wildcard) a partir de uma pasta, até 10 níveis e 500 resultados, sem seguir links nem entrar em áreas bloqueadas. Lê no máximo 50.000 itens (`Visited`, `Truncated`) |
+| `file_info` | Metadados de arquivo ou pasta: tamanho, datas, atributos, dono, link e destino, versão do executável (arquivo, produto, empresa) e, com `hash=true`, o SHA-256 (até 200 MB). Não lê o conteúdo |
+| `read_file` | Lê um arquivo de **texto**: intervalo (até 500 linhas por chamada) ou `tail=true`. `encoding` opcional (padrão: pelo BOM) |
+| `compare_files` | Compara dois arquivos de texto do mesmo servidor, linha a linha (`OnlyInA`/`OnlyInB`, até 200 diferenças). Cada arquivo: até 2 MB e 5.000 linhas |
 
 ### Coleta × interpretação
 Este MCP **só coleta**: fatos observáveis, normalização, sinais objetivos e comparação com baseline do projeto. Boas práticas, recomendação, severidade e fontes documentais ficam no **`microsoft-docs-mcp`** (`C:\mcp\microsoft_docs_mcp`), outro servidor MCP e o único com acesso à internet. O Claude chama o coletor, depois o RAG, e junta fato e evidência citando a fonte. Veja a tabela do que cada um pode afirmar no README do `microsoft-docs-mcp`.
