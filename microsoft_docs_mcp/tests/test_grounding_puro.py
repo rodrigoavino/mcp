@@ -174,3 +174,30 @@ class TestFronteira:
 
     def test_frase_fixa_sem_evidencia(self):
         assert g.NO_EVIDENCE == "Não encontrei documentação oficial da Microsoft que confirme essa informação."
+
+
+# ---------- precisão: os termos principais têm de aparecer juntos ----------
+class TestProximidade:
+    FALSO = ("the new functional level is required for the new 32k database page size feature. " + "x " * 200 +
+             "copy the file to the other server.").lower()
+
+    def test_termos_na_mesma_frase_passam(self):
+        assert g.near(["page", "file"], "set the page file size to 1.5 times the ram".lower())
+
+    def test_termos_distantes_nao_passam(self):
+        assert not g.near(["page", "file"], self.FALSO)
+
+    def test_um_termo_so_nao_ha_o_que_aproximar(self):
+        assert g.near(["ntfs"], "ntfs")
+        assert g.near([], "qualquer coisa")
+
+    def test_portao_recusa_trecho_com_termos_dispersos(self):
+        doc = {"blocks": [("", self.FALSO)]}
+        blocks = g.score_blocks(doc, ["page", "file"])
+        assert blocks and blocks[0]["strong_coverage"] == 1.0 and blocks[0]["near"] is False
+        assert not g.passes(blocks[0], 0.6, 0.75)
+
+    def test_portao_aceita_trecho_com_termos_juntos(self):
+        doc = {"blocks": [("", "Recommended page file size is 1.5 times the RAM.")]}
+        b = g.score_blocks(doc, ["page", "file"])[0]
+        assert b["near"] and g.passes(b, 0.6, 0.75)

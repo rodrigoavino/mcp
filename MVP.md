@@ -70,7 +70,7 @@ Só funções puras: **sem WinRM, sem internet e sem credenciais** (o `.env` rea
 
 ```powershell
 cd C:\mcp\windows_rca_mcp   ; uv sync --group dev ; uv run pytest     # 42 testes
-cd C:\mcp\microsoft_docs_mcp ; uv sync --group dev ; uv run pytest     # 46 testes
+cd C:\mcp\microsoft_docs_mcp ; uv sync --group dev ; uv run pytest     # 51 testes
 ```
 
 Se o Claude Code estiver com os MCPs abertos, o `uv sync` pode falhar ao reescrever o executável em uso: feche o Claude Code antes, ou use `uv pip install pytest` no `.venv` e `uv run --no-sync python -m pytest`.
