@@ -118,7 +118,7 @@ Depois é só pedir em linguagem natural, por exemplo: *"faça um health check d
 4. Registre no cliente, enviando o token:
    `claude mcp add --transport http windows-ops https://<host>/mcp --header "Authorization: Bearer <token>"`.
 
-## Catálogo de tools (60)
+## Catálogo de tools (63)
 
 Todas recebem `host` (nome ou FQDN do servidor alvo).
 
@@ -267,6 +267,15 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 |---|---|
 | `get_dns_cache` | Cache do cliente DNS do servidor: nome, tipo, status, seção, TTL restante e dado. `name_filter` aceita curinga (`*.familia.local`), até 500 entradas; `Total` e `Matched` informam o tamanho do cache e quantas casam com o filtro. Tipo e status (números do Windows) ganham `TypeName` e `StatusName` só para os códigos conhecidos (9003 = nome inexistente, 9501 = sem registros). **O cache pode revelar nomes que o servidor consultou** |
 | `resolve_dns_name` | Resolve um nome **a partir do servidor** (`A`, `AAAA`, `CNAME`, `MX`, `NS`, `PTR`, `SOA`, `SRV`, `TXT`), com `dns_server` opcional. Devolve os registros (nome, tipo, TTL, seção, dado) ou o motivo da falha. Serve para comparar a resolução entre servidores. A consulta sai do servidor consultado, para o DNS dele; o coletor não consulta DNS |
+
+### Leitura de logs (pastas permitidas)
+Não é leitura de arquivo arbitrário. Só `.log` e `.txt` dentro de pastas de log conhecidas: `C:\Windows\Logs`, `C:\Windows\System32\LogFiles`, `C:\Windows\Panther`, `C:\Windows\INF`, `C:\Windows\debug` e `C:\inetpub\logs`. Outras pastas entram com `WINRM_LOG_DIRS_EXTRA` (caminhos separados por `;`). Recusados: `..`, `/`, outras extensões, outras pastas e **qualquer link simbólico ou junção** no caminho. As linhas devolvidas têm o **valor** de `password=`, `token:`, `api_key=` e semelhantes mascarado (`***`) e são cortadas em 500 caracteres.
+
+| Tool | O que faz |
+|---|---|
+| `list_log_files` | Arquivos `.log`/`.txt` de uma pasta permitida (não recursivo), do mais recente ao mais antigo: nome, tamanho e última gravação, até 200. `name_filter` com curinga |
+| `get_log_tail` | Últimas N linhas (padrão 100, máximo 500) de um log. Rápido mesmo em arquivos grandes |
+| `search_log` | Procura um texto **literal** (não regex, sem diferenciar maiúsculas) e devolve até 200 linhas com número da linha. Recusa arquivos com mais de 200 MB (use `get_log_tail`) |
 
 ### Coleta × interpretação
 Este MCP **só coleta**: fatos observáveis, normalização, sinais objetivos e comparação com baseline do projeto. Boas práticas, recomendação, severidade e fontes documentais ficam no **`microsoft-docs-mcp`** (`C:\mcp\microsoft_docs_mcp`), outro servidor MCP e o único com acesso à internet. O Claude chama o coletor, depois o RAG, e junta fato e evidência citando a fonte. Veja a tabela do que cada um pode afirmar no README do `microsoft-docs-mcp`.
