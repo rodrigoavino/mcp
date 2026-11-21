@@ -64,6 +64,24 @@ Validação feita na **árvore integrada** (coletor + RAG juntos, a partir dos p
 
 Defeitos achados e corrigidos durante a validação (todos com teste): data de instalação sem fonte local; XPath com aspas quebrando um trecho do PowerShell em silêncio; correspondência de evento por prefixo; busca progressiva que parava sem a recomendação; `matches_observed` marcando o padrão (4 KB) como conforme; **porta de entrada do RAG que não recusava "which users are in the administrators group"**.
 
+## Testes automatizados
+
+Só funções puras: **sem WinRM, sem internet e sem credenciais** (o `.env` real nunca é lido). Rodam em segundos.
+
+```powershell
+cd C:\mcp\windows_rca_mcp   ; uv sync --group dev ; uv run pytest     # 42 testes
+cd C:\mcp\microsoft_docs_mcp ; uv sync --group dev ; uv run pytest     # 46 testes
+```
+
+Se o Claude Code estiver com os MCPs abertos, o `uv sync` pode falhar ao reescrever o executável em uso: feche o Claude Code antes, ou use `uv pip install pytest` no `.venv` e `uv run --no-sync python -m pytest`.
+
+| Projeto | O que cobre |
+|---|---|
+| `windows_rca_mcp` | allowlist e validação de host/caminho, XPath, datas (inclusive a sentinela de 1600), estados neutros, fatos de serviços, origem de membros por SID, classificação de plataforma e de carga, envelope padrão, e **regras guardadas no código**: o coletor não importa nenhuma biblioteca de internet, não existe OK/Atenção/Crítico nem dica de HRESULT, e há 54 tools |
+| `microsoft_docs_mcp` | porta de entrada (25 casos), privacidade da consulta, fontes permitidas, domínios, termos, tabelas por linha com cabeçalho, decodificação UTF-8, recomendação literal (padrão entre parênteses não conta), teto de 12 páginas com dublês, e o RAG não importa `winrm` |
+
+Cada regra foi conferida quebrando o código de propósito (5 quebras, todas detectadas; o código foi restaurado).
+
 ## Cenários de teste sugeridos
 
 Pergunte ao Claude, em português, e confira o formato da resposta (curta, só o perguntado, com sugestão do que mais existe).

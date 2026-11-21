@@ -1100,6 +1100,8 @@ def _classify_platform(raw: dict, probes: dict | None = None) -> dict:
     cloud = [h for h in hits if h["kind"] == "cloud"]
     if hits:
         ptype = "virtual"
+    elif not cs:
+        ptype = "indeterminate"   # sem dados do ComputerSystem não há evidência: nunca afirmar "físico"
     elif not cs.get("HypervisorPresent"):
         ptype = "physical"
     elif hyperv_host:
