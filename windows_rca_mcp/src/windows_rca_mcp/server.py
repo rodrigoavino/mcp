@@ -2989,6 +2989,161 @@ try { $us = @(Get-LocalUser -ErrorAction Stop | ? { -not $f -or $_.Name -eq $f }
     return _users_shape(res)
 
 
+# ---------- leitura de logs em pastas permitidas (somente leitura) ----------
+# Segurança: NÃO é leitura de arquivo arbitrário. Só arquivos .log/.txt dentro de pastas de log conhecidas (lista abaixo,
+# ampliável com WINRM_LOG_DIRS_EXTRA, separadas por ';'), sem '..', sem link simbólico/junção no caminho, e as linhas
+# devolvidas têm valores de senha/token/chave mascarados.
+LOG_DIRS_DEFAULT = [
+    "C:" + chr(92) + "Windows" + chr(92) + "Logs",
+    "C:" + chr(92) + "Windows" + chr(92) + "System32" + chr(92) + "LogFiles",
+    "C:" + chr(92) + "Windows" + chr(92) + "Panther",
+    "C:" + chr(92) + "Windows" + chr(92) + "INF",
+    "C:" + chr(92) + "Windows" + chr(92) + "debug",
+    "C:" + chr(92) + "inetpub" + chr(92) + "logs",
+]
+LOG_EXTS = (".log", ".txt")
+LOG_MAX_TAIL = 500
+LOG_MAX_MATCHES = 200
+LOG_MAX_LIST = 200
+LOG_LINE_CHARS = 500
+LOG_SEARCH_MAX_BYTES = 200 * 1024 * 1024
+LOG_SECRET_RE = re.compile(r"(?i)\b(pass(?:word|wd|phrase)?|pwd|secret|token|api[_-]?key|access[_-]?key|shared[_-]?key|"
+                           r"connection[_-]?string)\b(\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|\S+)")
+
+
+def _log_dirs() -> list[str]:
+    extra = [d.strip().rstrip(chr(92)) for d in os.getenv("WINRM_LOG_DIRS_EXTRA", "").split(";") if d.strip()]
+    dirs = list(LOG_DIRS_DEFAULT)
+    for d in extra:
+        if PATH_RE.match(d) and ".." not in d.split(chr(92)) and d not in dirs:
+            dirs.append(d)
+    return dirs
+
+
+def _log_root(p: str) -> str | None:
+    """A pasta permitida que contém 'p' (ou None). Comparação sem diferenciar maiúsculas, sempre por limite de pasta."""
+    low = p.lower().rstrip(chr(92))
+    for d in _log_dirs():
+        dl = d.lower()
+        if low == dl or low.startswith(dl + chr(92)):
+            return d
+    return None
+
+
+def _log_path(path: str, must_be_file: bool = True) -> tuple[str, str]:
+    """Valida o caminho do log. Devolve (caminho, pasta permitida). Recusa '..', '/', extensão fora de .log/.txt e pasta fora da lista."""
+    p = _path((path or "").strip()).rstrip(chr(92))
+    if "/" in p or ".." in p.split(chr(92)):
+        raise ValueError("Caminho inválido (sem '/' nem '..')")
+    root = _log_root(p)
+    if root is None:
+        raise ValueError("Pasta fora da lista de logs permitidos. Permitidas: " + "; ".join(_log_dirs()))
+    if must_be_file and not p.lower().endswith(LOG_EXTS):
+        raise ValueError("Só arquivos .log e .txt são lidos")
+    return p, root
+
+
+def _mask_secrets(line):
+    """Mascara o VALOR em pares 'senha=...', 'token: ...', 'api_key=...' (o resto da linha fica como está)."""
+    if not isinstance(line, str):
+        return line
+    return LOG_SECRET_RE.sub(lambda m: m.group(1) + m.group(2) + "***", line)
+
+
+def _check_pattern(pattern: str) -> str:
+    if not pattern or len(pattern) > 100 or any(ord(c) < 32 for c in pattern):
+        raise ValueError("pattern inválido (1 a 100 caracteres, sem caracteres de controle)")
+    return pattern
+
+
+PS_LOG_GUARD = r"""
+$p = '__P__'; $root = '__R__'
+try { $it = Get-Item -LiteralPath $p -Force -ErrorAction Stop } catch {
+  [pscustomobject]@{ Refused=$_.Exception.Message } | ConvertTo-Json -Compress; return }
+if ($it.PSIsContainer) { [pscustomobject]@{ Refused='O caminho é uma pasta, não um arquivo' } | ConvertTo-Json -Compress; return }
+$x = $it
+while ($x -and $x.FullName.TrimEnd('\').Length -gt $root.Length) {
+  if ($x.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+    [pscustomobject]@{ Refused='Link simbólico ou junção no caminho: não é seguido' } | ConvertTo-Json -Compress; return }
+  $x = if ($x.PSIsContainer) { $x.Parent } else { $x.Directory } }
+"""
+
+
+def _log_result(res, host: str):
+    """Recusas do servidor viram erro; linhas e trechos passam pelo mascaramento de segredos."""
+    if isinstance(res, dict) and res.get("Refused"):
+        return {"host": host, "error": res["Refused"]}
+    if isinstance(res, dict):
+        if "Lines" in res:
+            # defesa extra: se alguma linha chegar como objeto ({"value": ...}), usa só o texto; nada de PSPath etc.
+            res["Lines"] = [_mask_secrets(x.get("value") if isinstance(x, dict) else x) for x in _lst(res.get("Lines"))]
+        if "Matches" in res:
+            res["Matches"] = _lst(res.get("Matches"))
+            for m in res["Matches"]:
+                if isinstance(m, dict):
+                    m["Text"] = _mask_secrets(m.get("Text"))
+    return res
+
+
+@mcp.tool
+def list_log_files(host: str, directory: str, name_filter: str | None = None):
+    r"""Lista arquivos .log/.txt de uma pasta de log permitida (somente leitura), do mais recente ao mais antigo:
+    nome, tamanho e última gravação (até 200). Pastas permitidas: C:\Windows\Logs, C:\Windows\System32\LogFiles,
+    C:\Windows\Panther, C:\Windows\INF, C:\Windows\debug, C:\inetpub\logs (e as de WINRM_LOG_DIRS_EXTRA). Não é recursivo."""
+    d, _root = _log_path(directory, must_be_file=False)
+    if name_filter is not None and not re.fullmatch(r"[A-Za-z0-9_.*?-]{1,100}", name_filter):
+        raise ValueError("name_filter inválido")
+    res = _ps(host, r"""
+$d = '__D__'; $f = '__F__'
+if (-not (Test-Path -LiteralPath $d -PathType Container)) { [pscustomobject]@{ Refused='Pasta não encontrada' } | ConvertTo-Json -Compress; return }
+$all = @(Get-ChildItem -LiteralPath $d -File -Force -ErrorAction SilentlyContinue | ? { $_.Extension -in '.log','.txt' -and (-not $f -or $_.Name -like $f) } |
+  ? { -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) } | sort LastWriteTime -Descending)
+[pscustomobject]@{ Directory=$d; Total=$all.Count; Files=@($all | select -First __N__ | % { [pscustomobject]@{
+  Name=$_.Name; SizeBytes=$_.Length; LastWriteTime=$_.LastWriteTime } }) } | ConvertTo-Json -Depth 4 -Compress
+""".replace("__N__", str(LOG_MAX_LIST)).replace("__D__", d).replace("__F__", name_filter or ""))
+    res = _log_result(res, host)
+    if isinstance(res, dict) and "Files" in res:
+        res["Files"] = _lst(res["Files"])
+        res["Truncated"] = (res.get("Total") or 0) > len(res["Files"])
+    return res
+
+
+@mcp.tool
+def get_log_tail(host: str, path: str, lines: int = 100):
+    r"""Últimas N linhas (padrão 100, máximo 500) de um arquivo .log/.txt de pasta de log permitida (ver list_log_files).
+    Somente leitura: sem '..', sem link simbólico no caminho, linhas cortadas em 500 caracteres e valores de
+    senha/token/chave mascarados. Rápido mesmo em arquivos grandes."""
+    p, root = _log_path(path)
+    n = max(1, min(int(lines), LOG_MAX_TAIL))
+    res = _ps(host, (PS_LOG_GUARD + r"""
+$lines = @(Get-Content -LiteralPath $p -Tail __N__ -ErrorAction Stop | % { [string]$_ })
+[pscustomobject]@{ Path=$p; SizeBytes=$it.Length; LastWriteTime=$it.LastWriteTime; LineCount=$lines.Count
+  Lines=@($lines | % { if ($_.Length -gt __C__) { $_.Substring(0, __C__) + '…' } else { $_ } }) } | ConvertTo-Json -Depth 3 -Compress
+""").replace("__N__", str(n)).replace("__C__", str(LOG_LINE_CHARS)).replace("__R__", root).replace("__P__", p))
+    return _log_result(res, host)
+
+
+@mcp.tool
+def search_log(host: str, path: str, pattern: str, max_matches: int = 50):
+    r"""Procura um texto LITERAL (sem diferenciar maiúsculas) em um arquivo .log/.txt de pasta de log permitida e devolve
+    até 200 linhas (número e texto, cortado em 500 caracteres). Mesmas proteções de get_log_tail. Recusa arquivos com mais de
+    200 MB (use get_log_tail). Não é regex."""
+    p, root = _log_path(path)
+    pat = _check_pattern(pattern)
+    n = max(1, min(int(max_matches), LOG_MAX_MATCHES))
+    res = _ps(host, (PS_LOG_GUARD + r"""
+if ($it.Length -gt __MAXB__) { [pscustomobject]@{ Refused='Arquivo maior que 200 MB: use get_log_tail' } | ConvertTo-Json -Compress; return }
+$m = @(Select-String -LiteralPath $p -Pattern '__PAT__' -SimpleMatch -ErrorAction Stop | select -First __N__)
+[pscustomobject]@{ Path=$p; SizeBytes=$it.Length; Pattern='__PAT__'; MatchCount=$m.Count
+  Matches=@($m | % { $t = "$($_.Line)"; [pscustomobject]@{ Line=$_.LineNumber; Text=$(if ($t.Length -gt __C__) { $t.Substring(0, __C__) + '…' } else { $t }) } }) } | ConvertTo-Json -Depth 4 -Compress
+""").replace("__N__", str(n)).replace("__C__", str(LOG_LINE_CHARS)).replace("__MAXB__", str(LOG_SEARCH_MAX_BYTES))
+       .replace("__R__", root).replace("__P__", p).replace("__PAT__", pat.replace("'", "''")), timeout=180)
+    res = _log_result(res, host)
+    if isinstance(res, dict) and "Matches" in res:
+        res["Truncated"] = (res.get("MatchCount") or 0) >= n
+    return res
+
+
 # ---------- painel de saúde rápido ----------
 @mcp.tool
 def get_health_summary(
