@@ -312,26 +312,84 @@ $cs = Get-CimInstance Win32_ComputerSystem
 """.replace("__CLOCK__", PS_CLOCK))
 
 
+PERF_MAX_SAMPLES = 10
+PERF_MAX_INTERVAL = 10
+PERF_MAX_PROCS = 30
+PERF_PROC_RE = re.compile(r"^[A-Za-z0-9*?._#-]{1,100}$")
+
+
+def _perf_args(samples, interval_sec) -> tuple[int, int]:
+    return max(1, min(int(samples), PERF_MAX_SAMPLES)), max(1, min(int(interval_sec), PERF_MAX_INTERVAL))
+
+
+def _perf_shape(res):
+    """Lista de processos sempre lista (um único objeto do ConvertTo-Json vira lista)."""
+    if isinstance(res, dict) and "Samples" in res:
+        res["Processes"] = [p for p in _lst(res.get("Processes")) if isinstance(p, dict)]
+    return res
+
+
 @mcp.tool
-def get_performance_snapshot(host: str):
-    """Snapshot de CPU, memória, paginação, fila de CPU e latência/fila de disco.
-    Usa classes CIM (independe do idioma do Windows, ao contrário do Get-Counter)."""
-    return _ps(host, r"""
-$cpu = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor | ? Name -eq '_Total'
-$mem = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory
-$sys = Get-CimInstance Win32_PerfFormattedData_PerfOS_System
-$dsk = Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk | ? Name -eq '_Total'
+def get_performance_snapshot(host: str, samples: int = 3, interval_sec: int = 2, process_filter: str | None = None):
+    """Desempenho do servidor com MÉDIA de várias amostras (padrão 3 amostras, 2 s entre elas; samples 1-10,
+    interval_sec 1-10; samples=1 devolve um instante): CPU (total, privilegiado, interrupções, fila, máximo da CPU),
+    memória (disponível, comprometida, paginação, pool não paginado), disco (latência de leitura/escrita, fila e
+    máximo da fila, IOPS, MB/s de leitura e escrita, % ocupado), rede (MB/s somando as interfaces e conexões TCP
+    estabelecidas) e sistema (processos e threads). 'process_filter' (wildcard no nome do processo, ex.: 'sqlservr*')
+    acrescenta por processo a média de CPU, memória privada, handles, threads e I/O (até 30). Usa classes CIM
+    (independe do idioma do Windows, ao contrário do Get-Counter). Só fatos."""
+    n, iv = _perf_args(samples, interval_sec)
+    if process_filter is not None and not PERF_PROC_RE.match(process_filter):
+        raise ValueError("process_filter inválido (letras, números, '*', '?', '.', '-', '_' e '#')")
+    res = _ps(host, r"""
+$n = __S__; $iv = __I__; $flt = '__F__'
+$rows = @()
+for ($i = 0; $i -lt $n; $i++) {
+  if ($i -gt 0) { Start-Sleep -Seconds $iv }
+  $cpu = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor | ? Name -eq '_Total'
+  $mem = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory
+  $sys = Get-CimInstance Win32_PerfFormattedData_PerfOS_System
+  $dsk = Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk | ? Name -eq '_Total'
+  $tcp = Get-CimInstance Win32_PerfFormattedData_Tcpip_TCPv4
+  $net = @(Get-CimInstance Win32_PerfFormattedData_Tcpip_NetworkInterface)
+  $pr = @(); if ($flt) { $pr = @(Get-CimInstance Win32_PerfFormattedData_PerfProc_Process | ? { $_.Name -like $flt -and $_.Name -notin '_Total','Idle' }) }
+  $rows += [pscustomobject]@{
+    CpuPct=[double]$cpu.PercentProcessorTime; CpuPrivilegedPct=[double]$cpu.PercentPrivilegedTime
+    CpuInterruptPct=[double]$cpu.PercentInterruptTime; ProcessorQueue=[double]$sys.ProcessorQueueLength
+    ContextSwitchesSec=[double]$sys.ContextSwitchesPersec; Processes=[double]$sys.Processes; Threads=[double]$sys.Threads
+    MemAvailableMB=[double]$mem.AvailableMBytes; MemCommittedPct=[double]$mem.PercentCommittedBytesInUse
+    PagesPerSec=[double]$mem.PagesPersec; PoolNonpagedMB=[double]$mem.PoolNonpagedBytes/1MB
+    DiskReadMs=[double]$dsk.AvgDisksecPerRead*1000; DiskWriteMs=[double]$dsk.AvgDisksecPerWrite*1000
+    DiskQueue=[double]$dsk.CurrentDiskQueueLength; DiskIOPS=[double]$dsk.DiskTransfersPersec; DiskBusyPct=[double]$dsk.PercentDiskTime
+    DiskReadMBs=[double]$dsk.DiskReadBytesPersec/1MB; DiskWriteMBs=[double]$dsk.DiskWriteBytesPersec/1MB
+    NetworkMBs=[double](($net | measure BytesTotalPersec -Sum).Sum)/1MB; TcpEstablished=[double]$tcp.ConnectionsEstablished
+    Procs=$pr }
+}
+function Avg($p) { [math]::Round((($rows | % { $_.$p }) | measure -Average).Average, 2) }
+function Mx($p) { [math]::Round((($rows | % { $_.$p }) | measure -Maximum).Maximum, 2) }
+$procs = @(); if ($flt) {
+  $procs = @($rows.Procs | group Name | % { $g = $_.Group; [pscustomobject]@{
+    Name=$_.Name; Pid=($g | select -First 1).IDProcess
+    CpuPct=[math]::Round((($g | measure PercentProcessorTime -Average).Average),1)
+    PrivateMB=[math]::Round((($g | measure WorkingSetPrivate -Average).Average)/1MB,1)
+    Handles=[int](($g | measure HandleCount -Average).Average); Threads=[int](($g | measure ThreadCount -Average).Average)
+    IoReadKBs=[math]::Round((($g | measure IOReadBytesPersec -Average).Average)/1KB,1)
+    IoWriteKBs=[math]::Round((($g | measure IOWriteBytesPersec -Average).Average)/1KB,1) } } | sort CpuPct -Descending | select -First __P__)
+}
 [pscustomobject]@{
-  CpuPct=$cpu.PercentProcessorTime; CpuPrivilegedPct=$cpu.PercentPrivilegedTime
-  CpuInterruptPct=$cpu.PercentInterruptTime; ProcessorQueue=$sys.ProcessorQueueLength
-  ContextSwitchesSec=$sys.ContextSwitchesPersec
-  MemAvailableMB=$mem.AvailableMBytes; MemCommittedPct=$mem.PercentCommittedBytesInUse
-  PagesPerSec=$mem.PagesPersec; PoolNonpagedMB=[math]::Round($mem.PoolNonpagedBytes/1MB,1)
-  DiskReadMs=[math]::Round($dsk.AvgDisksecPerRead*1000,2)
-  DiskWriteMs=[math]::Round($dsk.AvgDisksecPerWrite*1000,2)
-  DiskQueue=$dsk.CurrentDiskQueueLength; DiskIOPS=$dsk.DiskTransfersPersec
-} | ConvertTo-Json -Compress
-""")
+  Samples=$n; IntervalSec=$(if ($n -gt 1) { $iv } else { 0 })
+  CpuPct=(Avg CpuPct); CpuPctMax=(Mx CpuPct); CpuPrivilegedPct=(Avg CpuPrivilegedPct); CpuInterruptPct=(Avg CpuInterruptPct)
+  ProcessorQueue=(Avg ProcessorQueue); ContextSwitchesSec=(Avg ContextSwitchesSec)
+  ProcessCount=[int](Avg Processes); Threads=[int](Avg Threads)
+  MemAvailableMB=(Avg MemAvailableMB); MemCommittedPct=(Avg MemCommittedPct); PagesPerSec=(Avg PagesPerSec)
+  PoolNonpagedMB=(Avg PoolNonpagedMB)
+  DiskReadMs=(Avg DiskReadMs); DiskWriteMs=(Avg DiskWriteMs); DiskQueue=(Avg DiskQueue); DiskQueueMax=(Mx DiskQueue)
+  DiskIOPS=(Avg DiskIOPS); DiskBusyPct=(Avg DiskBusyPct); DiskReadMBs=(Avg DiskReadMBs); DiskWriteMBs=(Avg DiskWriteMBs)
+  NetworkMBs=(Avg NetworkMBs); TcpEstablished=[int](Avg TcpEstablished)
+  Processes=$procs } | ConvertTo-Json -Depth 4 -Compress
+""".replace("__S__", str(n)).replace("__I__", str(iv)).replace("__P__", str(PERF_MAX_PROCS))
+       .replace("__F__", process_filter or ""), timeout=(n - 1) * iv + 90)
+    return _perf_shape(res)
 
 
 @mcp.tool

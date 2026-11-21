@@ -175,7 +175,7 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 ### Performance
 | Tool | O que faz |
 |---|---|
-| `get_performance_snapshot` | CPU, fila de CPU, memória, paginação, pool não paginado, latência e fila de disco |
+| `get_performance_snapshot` | Desempenho com **média de amostras** (`samples` 1-10, `interval_sec` 1-10; padrão 3 amostras a 2 s): CPU (total, privilegiado, interrupções, fila, máximo), memória, paginação, pool não paginado, disco (latência, fila e máximo, IOPS, MB/s de leitura e escrita, % ocupado), rede (MB/s e conexões TCP estabelecidas) e processos/threads. `process_filter` (ex.: `sqlservr*`) acrescenta por processo CPU, memória privada, handles, threads e I/O. Via CIM (independe do idioma) |
 | `get_top_resource_consumers` | **Processos que mais consomem CPU e memória, medidos por amostragem** (delta de CPU em N segundos), com dono, serviços hospedados, horário de início e linha de comando |
 | `get_top_processes` | Top processos por `cpu` ou `memory` (leitura instantânea, mais rápida) |
 
