@@ -177,13 +177,13 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 |---|---|
 | `get_performance_snapshot` | Desempenho com **média de amostras** (`samples` 1-10, `interval_sec` 1-10; padrão 3 amostras a 2 s): CPU (total, privilegiado, interrupções, fila, máximo), memória, paginação, pool não paginado, disco (latência, fila e máximo, IOPS, MB/s de leitura e escrita, % ocupado), rede (MB/s e conexões TCP estabelecidas) e processos/threads. `process_filter` (ex.: `sqlservr*`) acrescenta por processo CPU, memória privada, handles, threads e I/O. Via CIM (independe do idioma) |
 | `get_top_resource_consumers` | **Processos que mais consomem CPU e memória, medidos por amostragem** (delta de CPU em N segundos), com dono, serviços hospedados, horário de início e linha de comando |
-| `get_top_processes` | Top processos por `cpu` ou `memory` (leitura instantânea, mais rápida) |
+| `get_top_processes` | Top processos por `cpu` ou `memory` (leitura instantânea, mais rápida). `name_filter` (wildcard, ex.: `sqlservr*`) limita aos processos que casam |
 
 ### Eventos
 | Tool | O que faz |
 |---|---|
 | `get_event_summary` | **Ponto de partida da RCA.** Crítico/Erro/Aviso agrupados por log + nível + provedor + ID, com totais, primeira/última ocorrência e mensagem de exemplo |
-| `get_events` | Consulta filtrada (log, `days`, níveis, IDs, provedor) |
+| `get_events` | Consulta filtrada (log, `days` ou **`hours`** de 1 a 720, níveis, IDs, provedor) |
 | `get_reboot_and_crash_history` | Reboots, shutdowns inesperados e BSOD |
 
 ### Serviços, roles e software
@@ -232,8 +232,8 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 | `get_network_adapters` | **Configuração das placas de rede**: velocidade, duplex, MTU, VLAN, driver (versão/data), RSS, IPv6, erros e descartes, propriedades avançadas (offloads, jumbo, buffers), NIC Teaming/SET |
 | `get_nic_teaming` | **NIC Teaming detalhado**: LBFO (modo, balanceamento, membros ativos/standby, falhas, VLANs) e SET do Hyper-V (membros, vNICs, VLAN), com alertas |
 | `get_routes` | **Tabela de rotas** ativa, rotas persistentes e gateways padrão |
-| `get_network_connections` | **Equivalente ao netstat -ano** com análise: conexões por estado, maiores destinos, processos com mais conexões, uso de portas efêmeras, alertas de TIME_WAIT/CLOSE_WAIT |
-| `get_listening_ports` | Portas TCP (e UDP, com `include_udp`) em escuta, com processo e serviço |
+| `get_network_connections` | **Equivalente ao netstat -ano** com análise: conexões por estado, maiores destinos, processos com mais conexões, uso de portas efêmeras, alertas de TIME_WAIT/CLOSE_WAIT |. `port` lista as conexões da porta (local ou remota) e informa `PortMatches` |
+| `get_listening_ports` | Portas TCP (e UDP, com `include_udp`) em escuta, com processo e serviço |. `port` limita a essa porta local |
 | `test_connectivity` | **A partir do servidor**: resolução de nome, ping e teste de porta TCP até um destino |
 
 ### Failover Cluster
@@ -245,7 +245,7 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 | Tool | O que faz |
 |---|---|
 | `get_applied_gpos` | **GPOs aplicadas** ao computador e aos usuários com perfil carregado (nome, GUID, link), OU, site, DC, último processamento e erros/avisos do Group Policy |
-| `get_scheduled_tasks` | Tarefas (fora de `\Microsoft\`) com último resultado em hex. `only_failed=True` por padrão |
+| `get_scheduled_tasks` | Tarefas (fora de `\Microsoft\`) com último resultado em hex. `only_failed=True` por padrão |. `name_filter` (wildcard no nome da tarefa) limita às que casam |
 | `get_user_sessions` | Sessões logadas (console/RDP), estado e tempo ocioso |
 | `get_local_admins` | Membros do grupo Administradores local (pelo SID, independe do idioma) |
 | `get_local_groups` | **Todos os grupos locais e seus membros**: SID, descrição, tipo e origem de cada membro (`Local`, `Interno (BUILTIN)`, `Sistema (NT AUTHORITY)`, `Domínio`, `Azure AD`, `Externo`), estado das contas locais (habilitada, último logon, senha) e **sinais** (só fatos): SIDs não resolvidos, principais de domínio/Azure AD no Administrators, contas locais habilitadas com senha que nunca expira, contas desabilitadas como membros, grupos vazios. Funciona mesmo com o DC inacessível. Não classifica nada como "privilegiado". Filtro por `group` |
@@ -253,7 +253,7 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 | `get_failed_logons` | Eventos 4625 agrupados por conta + IP, com o motivo traduzido |
 | `get_security_posture` | Defender, firewall, RDP |
 | `get_time_config` | **Configuração NTP completa**: tipo (NT5DS/NTP), servidores, intervalos, fonte, stratum, último sync, peers, papel no domínio, VMICTimeProvider, **offset medido** e **relógio do servidor** (`Clock`), com sinais objetivos (sem severidade nem recomendação) |
-| `get_expiring_certificates` | Certificados vencidos ou próximos do vencimento |
+| `get_expiring_certificates` | Certificados vencidos ou próximos do vencimento. `location` (`LocalMachine`, padrão, ou `CurrentUser`) e `store` (`My`, padrão, `WebHosting`, `Root`, `CA`, `AuthRoot`, `TrustedPeople`, `TrustedPublisher`, `Remote Desktop`); inclui o emissor |
 
 ### Registro e variáveis de ambiente
 | Tool | O que faz |
