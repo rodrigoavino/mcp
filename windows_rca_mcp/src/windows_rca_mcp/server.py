@@ -14,9 +14,13 @@ Variáveis de ambiente (podem vir de um arquivo .env no diretório de trabalho):
 """
 import base64
 import fnmatch
+import inspect
 import json
 import os
 import re
+import secrets
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,8 +29,9 @@ import winrm
 from dotenv import find_dotenv, load_dotenv
 from fastmcp import FastMCP
 
-from .audit import AuditMiddleware
-from .envelope import EnvelopeMiddleware
+from .audit import AuditMiddleware, build_record, default_log
+from .envelope import EnvelopeMiddleware, build_envelope
+from .envelope import now_local as _now_local
 
 # O .env é procurado a partir do DIRETÓRIO DE TRABALHO (usecwd=True), e não da pasta do pacote, para funcionar
 # também quando instalado via wheel em site-packages.
@@ -4021,6 +4026,136 @@ Walk $doc.DocumentElement $doc.DocumentElement.LocalName
         res["Nodes"] = nodes
         res.update(_config_summary(nodes))
     return res
+
+
+# ---------- jobs assíncronos para coletas longas (somente leitura) ----------
+# Coletas de minutos (DISM, varredura de disco, duplicados) podem passar do tempo que o cliente MCP espera por uma chamada.
+# start_job roda UMA das tools da lista abaixo em segundo plano e devolve um id; get_job devolve o estado e, ao terminar, o
+# resultado no MESMO formato da chamada direta. Os jobs ficam na memória do processo do MCP (somem se ele reiniciar) e a
+# execução em si respeita os mesmos bloqueios, lista de hosts e prazos de cada tool. Cada job é registrado na auditoria.
+JOB_TOOLS = (
+    "get_disk_usage_tree", "find_duplicate_files", "get_component_store_analysis", "get_largest_files",
+    "get_largest_folders", "get_event_summary", "get_pending_updates", "get_cbs_health", "get_cbs_log_errors",
+    "get_disk_allocation_analysis", "get_update_error_analysis", "get_installed_software", "search_log", "find_files",
+    "get_common_space_offenders", "get_security_posture",
+)
+JOB_MAX_RUNNING = 4
+JOB_MAX_KEPT = 50
+JOB_TTL_S = 3600
+JOB_MAX_WAIT_S = 30
+JOB_RESULT_MAX_BYTES = 5 * 1024 * 1024
+_jobs: dict[str, dict] = {}
+_jobs_lock = threading.Lock()
+
+
+def _job_scalar(v) -> bool:
+    return v is None or isinstance(v, (str, int, float, bool)) or (
+        isinstance(v, list) and all(x is None or isinstance(x, (str, int, float, bool)) for x in v))
+
+
+def _job_prune(now: float) -> None:
+    """Remove os jobs terminados há mais de JOB_TTL_S e, se ainda passar de JOB_MAX_KEPT, os terminados mais antigos."""
+    done = [(j["finished_mono"], k) for k, j in _jobs.items() if j["status"] != "running" and j.get("finished_mono")]
+    for fm, k in done:
+        if now - fm > JOB_TTL_S:
+            del _jobs[k]
+    extra = len(_jobs) - JOB_MAX_KEPT
+    if extra > 0:
+        for _fm, k in sorted((j["finished_mono"], k) for k, j in _jobs.items() if j["status"] != "running" and j.get("finished_mono"))[:extra]:
+            del _jobs[k]
+
+
+def _job_public(j: dict, with_result: bool = True) -> dict:
+    now = time.monotonic()
+    out = {"job_id": j["job_id"], "tool": j["tool"], "host": j["host"], "status": j["status"], "started": j["started"],
+           "finished": j.get("finished"), "elapsed_s": round((j.get("finished_mono") or now) - j["started_mono"], 1)}
+    if j["status"] == "done" and with_result:
+        out["result"] = j["result"]
+    if j["status"] == "error":
+        out["error"] = j["error"]
+    return out
+
+
+def _job_run(jid: str, fn, host: str, kwargs: dict) -> None:
+    ok, err, result = False, None, None
+    try:
+        raw = fn(host, **kwargs)
+        env = build_envelope(host, raw)
+        if len(json.dumps(env, ensure_ascii=False, default=str)) > JOB_RESULT_MAX_BYTES:
+            err = f"Resultado maior que {JOB_RESULT_MAX_BYTES // 1048576} MB: restrinja a coleta (pasta, filtros ou limites)"
+        else:
+            result, ok = env, True
+    except Exception as e:                        # validação da tool, rede, prazo, etc.
+        err = f"{type(e).__name__}: {e}"
+    with _jobs_lock:
+        j = _jobs.get(jid)
+        if j is not None:
+            j["finished_mono"] = time.monotonic()
+            j["finished"] = _now_local()
+            if ok:
+                j["status"], j["result"] = "done", result
+            else:
+                j["status"], j["error"] = "error", err
+            ms = (j["finished_mono"] - j["started_mono"]) * 1000
+    default_log().write(build_record(f"job:{j['tool']}" if j else "job", {"host": host, **{k: v for k, v in kwargs.items() if _job_scalar(v)}},
+                                     ok and bool(result and result.get("success", True)), err, ms if j else 0))
+
+
+@mcp.tool
+def start_job(host: str, tool: str, arguments: dict | None = None):
+    """Inicia em SEGUNDO PLANO uma coleta longa (somente leitura) e devolve um job_id; use get_job para acompanhar e
+    obter o resultado, que vem no mesmo formato da chamada direta. 'tool' é uma de: get_disk_usage_tree,
+    find_duplicate_files, get_component_store_analysis, get_largest_files, get_largest_folders, get_event_summary,
+    get_pending_updates, get_cbs_health, get_cbs_log_errors, get_disk_allocation_analysis, get_update_error_analysis,
+    get_installed_software, search_log, find_files, get_common_space_offenders, get_security_posture. 'arguments'
+    são os parâmetros da tool além do host (ex.: {"path": "C:\\\\Windows", "depth": 2}). No máximo 4 jobs em execução. Os
+    jobs ficam na memória do MCP (somem se ele reiniciar), por 1 hora depois de terminar."""
+    if tool not in JOB_TOOLS or tool not in globals():
+        raise ValueError("tool não permitida em job. Permitidas: " + ", ".join(JOB_TOOLS))
+    args = dict(arguments or {})
+    if not all(isinstance(k, str) and _job_scalar(v) for k, v in args.items()):
+        raise ValueError("arguments aceita só valores simples (texto, número, booleano, nulo ou lista deles)")
+    fn = globals()[tool]
+    try:
+        inspect.signature(fn).bind(host, **args)
+    except TypeError as e:
+        raise ValueError(f"arguments não casam com os parâmetros de {tool}: {e}") from None
+    with _jobs_lock:
+        _job_prune(time.monotonic())
+        if sum(1 for j in _jobs.values() if j["status"] == "running") >= JOB_MAX_RUNNING:
+            raise ValueError(f"Já há {JOB_MAX_RUNNING} jobs em execução: aguarde algum terminar (list_jobs)")
+        jid = secrets.token_hex(6)
+        _jobs[jid] = {"job_id": jid, "tool": tool, "host": host, "status": "running", "started": _now_local(),
+                      "started_mono": time.monotonic()}
+        th = threading.Thread(target=_job_run, args=(jid, fn, host, args), daemon=True, name=f"job-{jid}")
+        th.start()
+        return {"host": host, **_job_public(_jobs[jid]), "message": "Job iniciado. Use get_job com este job_id."}
+
+
+@mcp.tool
+def get_job(job_id: str, wait_seconds: int = 0):
+    """Estado de um job (running, done ou error) e, quando done, o resultado completo no formato da chamada direta.
+    wait_seconds (0 a 30) espera até esse tempo pelo término, para não precisar repetir a chamada."""
+    if not re.fullmatch(r"[0-9a-f]{12}", job_id or ""):
+        raise ValueError("job_id inválido")
+    deadline = time.monotonic() + max(0, min(int(wait_seconds), JOB_MAX_WAIT_S))
+    while True:
+        with _jobs_lock:
+            j = _jobs.get(job_id)
+            if j is None:
+                return {"error": "Job não encontrado (expirou, nunca existiu ou o MCP foi reiniciado)", "host": ""}
+            if j["status"] != "running" or time.monotonic() >= deadline:
+                return {"host": j["host"], **_job_public(j)}
+        time.sleep(0.5)
+
+
+@mcp.tool
+def list_jobs():
+    """Lista os jobs conhecidos (id, tool, host, estado, início, fim e duração), sem os resultados."""
+    with _jobs_lock:
+        _job_prune(time.monotonic())
+        items = sorted((_job_public(j, with_result=False) for j in _jobs.values()), key=lambda x: x["started"], reverse=True)
+    return {"count": len(items), "running": sum(1 for x in items if x["status"] == "running"), "jobs": items}
 
 
 # ---------- painel de saúde rápido ----------
