@@ -189,7 +189,7 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 ### Serviços, roles e software
 | Tool | O que faz |
 |---|---|
-| `get_services` | Lista com filtros (nome/wildcard, estado, tipo de início) |
+| `get_services` | Lista com filtros (nome/wildcard, estado, tipo de início), com conta, PID, caminho e código de saída. **`detail=true`** (use com filtro; até 50 serviços) acrescenta descrição, início atrasado, memória do processo, código de saída específico, **dependências e dependentes** e as **ações de recuperação** configuradas (`Recovery`: período de reset e ações Restart/Reboot/RunCommand com atraso, lidas do registro, independem do idioma) |
 | `get_stopped_auto_services` | Serviços automáticos parados, **só fatos** por serviço: estado, código de saída (e o específico), conta, início atrasado (`Delayed`), início por gatilho (`Trigger`) e se nunca iniciou desde o boot (código 1077, que não é falha). Sinais: `failedExitCode` (diferente de 0 e de 1077) e `transitionalState` (diferente de `Stopped`). **Não** classifica como esperado ou suspeito: o estado esperado de cada serviço é interpretação do RAG |
 | `get_service_failures` | Falhas do Service Control Manager (eventos 70xx) |
 | `get_server_roles` | **Roles instaladas em hierarquia** (role → role services), features e estado dos serviços das roles principais (AD DS, DNS, DHCP, IIS, Hyper-V, Cluster, DFS, RDS, WSUS, AD CS…) |
