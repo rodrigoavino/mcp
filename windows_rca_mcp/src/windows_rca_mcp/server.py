@@ -1835,16 +1835,27 @@ def get_disk_usage_tree(
     threads: int = 8,
     scan_timeout_s: int = 300,
     old_days: int = 365,
+    measure: str = "logical",
+    dedupe_hardlinks: bool = False,
 ):
     """Análise de espaço estilo TreeSize, em uma única passada rápida (API nativa FindFirstFileEx + paralelismo).
-    Retorna: árvore de pastas até 'depth' níveis (maiores filhos, % do total), maiores arquivos, uso por extensão,
-    volume de dados sem modificação há 'old_days' dias e contagem de acessos negados. Tamanhos são lógicos.
-    Se estourar scan_timeout_s devolve resultado parcial (partial=true). Exige Add-Type (C#) liberado no servidor."""
+    Retorna: árvore de pastas até 'depth' níveis (maiores filhos, % do total, contagem de arquivos e pastas, item
+    'others' agrupando os menores), maiores arquivos, uso por extensão, volume de dados sem modificação há 'old_days'
+    dias, contagem de acessos negados e o tempo do scan. Cada item traz DOIS tamanhos: size_gb (LÓGICO, como o Explorer)
+    e disk_gb (EM DISCO: arredondado ao cluster do volume; compactados/esparsos pelo tamanho alocado; arquivos só-nuvem
+    como OneDrive = 0, e 'cloud_only' informa quantos são). 'measure' escolhe qual deles ordena e calcula os
+    percentuais: 'logical' (padrão) ou 'disk'. dedupe_hardlinks=true conta cada arquivo com vários links físicos
+    (ex.: WinSxS) UMA vez só, na primeira ocorrência encontrada ('hardlinks' informa quantos foram pulados); é mais
+    lento, pois abre cada arquivo. Se estourar scan_timeout_s devolve resultado parcial (partial=true).
+    Exige Add-Type (C#) liberado no servidor."""
     p = _path(path)
+    if measure not in ("logical", "disk"):
+        raise ValueError("measure deve ser logical ou disk")
     depth = max(1, min(int(depth), 6))
     args = (f"'{p}', {depth}, {max(3, min(int(top_children), 30))}, {max(5, min(int(top_files), 100))}, "
             f"{max(1, int(min_file_size_mb)) * 1048576}, {max(1, min(int(threads), 16))}, "
-            f"{max(30, min(int(scan_timeout_s), 1500))}, {max(1, int(old_days))}")
+            f"{max(30, min(int(scan_timeout_s), 1500))}, {max(1, int(old_days))}, "
+            f"{'$true' if measure == 'disk' else '$false'}, {'$true' if dedupe_hardlinks else '$false'}")
     src = (Path(__file__).parent / "diskscan.cs").read_text(encoding="utf-8")
     script = f"$src = @'\n{src}\n'@\nAdd-Type -TypeDefinition $src\n[DiskScan]::Run({args})\n"
     res = _ps_long(host, script, timeout=max(30, min(int(scan_timeout_s), 1500)) + 60)

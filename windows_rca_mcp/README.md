@@ -220,7 +220,7 @@ Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`
 | Tool | O que faz |
 |---|---|
 | `get_disks` | Volumes: tamanho, livre, % livre |
-| `get_disk_usage_tree` | Árvore no estilo TreeSize (rápida, nativa, paralela): maiores pastas e arquivos, uso por extensão, dados antigos |
+| `get_disk_usage_tree` | Árvore no estilo TreeSize (rápida, nativa, paralela): maiores pastas e arquivos, uso por extensão, dados antigos, contagem de arquivos e pastas por nível e item `others` agrupando os menores. **Dois tamanhos por item:** `size_gb` (lógico, como o Explorer) e `disk_gb` (**em disco**: arredondado ao cluster; compactados e esparsos pelo tamanho alocado; arquivos só-nuvem, como OneDrive, valem 0, com `cloud_only` informando quantos). `measure=disk` ordena e calcula os percentuais pelo tamanho em disco. `dedupe_hardlinks=true` conta cada arquivo com vários links físicos **uma vez só** (primeira ocorrência encontrada; `hardlinks` informa quantos foram pulados), o que desinfla `C:\Windows` (o WinSxS tem milhares de hard links), mas é mais lento. Arquivos minúsculos que o NTFS guarda dentro da MFT aparecem com um cluster |
 | `get_largest_folders` / `get_largest_files` | Alternativas em PowerShell puro (mais lentas) |
 | `get_common_space_offenders` | Temp, cache do WU, logs do CBS/IIS, dumps, WER, lixeira, pagefile, VSS |
 | `get_disk_allocation_analysis` | Discos offline, RAW, espaço não alocado, partições sem letra, volumes subutilizados |
