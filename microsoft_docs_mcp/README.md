@@ -107,8 +107,22 @@ Pergunta → classificação em domínios → busca (25 por consulta) → filtro
 
 - A consulta enviada à busca é **recusada** se tiver IP, e-mail, nome de host/domínio ou caminho UNC. Conferência de afirmações e leitura por `query` são locais.
 - O texto das páginas é **dado não confiável** (pode conter instruções para o modelo): vem marcado como citação.
-- Sem credenciais, sem `.env`, sem WinRM: é o único componente com acesso à internet.
+- Sem credenciais, sem WinRM: é o único componente com acesso à internet. O `.env` é **opcional** e só ajusta cache, modo offline e modo HTTP (veja Configuração).
 - Modo HTTP exige `MCP_AUTH_TOKEN` (>= 32 caracteres); sem token só em loopback com `MCP_ALLOW_INSECURE_LOOPBACK=true`.
+
+## Configuração (`.env`, opcional)
+
+Copie `.env.example` para `.env` (está no `.gitignore`). O arquivo é lido da **pasta de trabalho** do MCP (o registro usa `uv --directory <pasta>`) ou do caminho em `MS_DOCS_ENV_FILE` (variável de **sistema**); variável já definida no ambiente do sistema vence a do arquivo. Depois de alterar, reinicie o Claude Code.
+
+| Variável | Padrão | Descrição |
+|---|---|---|
+| `MS_DOCS_OFFLINE` | `false` | `true` nunca sai para a internet: sem cache, devolve `needs_network` |
+| `MS_DOCS_CACHE_DIR` | `%LOCALAPPDATA%\microsoft-docs-mcp` | Pasta do cache em disco |
+| `MS_DOCS_PAGE_TTL_DAYS` / `MS_DOCS_SEARCH_TTL_DAYS` | `7` / `1` | Validade do cache de páginas e de buscas, em dias |
+| `MCP_TRANSPORT` | `stdio` | `stdio` (Claude Code/Desktop) · `http` (deploy remoto) |
+| `MCP_HOST` / `MCP_PORT` | `127.0.0.1` / `8001` | Endereço no modo `http` |
+| `MCP_AUTH_TOKEN` | (vazio) | **Obrigatório no modo `http`**: token Bearer com 32 ou mais caracteres |
+| `MCP_ALLOW_INSECURE_LOOPBACK` | `false` | `true` permite `http` sem token, **somente em loopback** (testes) |
 
 ## Instalação e integração
 
