@@ -74,6 +74,7 @@ uv run python teste.py get_health_summary host=fastmcp.familia.local  # uma tool
 
 ## Ambiente de laboratório
 - Alvo de teste: `fastmcp.familia.local` (o próprio servidor, Windows Server 2025, VM KVM). Domínio `familia.local`, DC `dc-w25-03` (10.11.0.3).
+- `WINRM_ALLOWED_HOSTS=*` aceita qualquer nome, mas o coletor só conecta em endereço INTERNO: `_check_internal` (em `_session` e `check_winrm`) e `_preflight_host_ok` recusam host que resolve para endereço público (`WINRM_ALLOW_PUBLIC=true` libera). Nome que não resolve passa (o DNS é reportado pela sonda).
 - Primeiro passo de toda tool com `host`: sonda de pré-voo do WinRM (`preflight.py`, middleware por dentro do envelope): DNS, TCP, TLS e `/wsman` sem credenciais, com cache curto; falha responde na hora com `diagnosis` (camada, etapas, porta alternativa). Só sonda host da allowlist. `check_winrm` valida também a autenticação. `preflight.py` é o ÚNICO arquivo que importa `socket`/`http` (regra de não ter internet: só hosts da allowlist).
 - WinRM: listener HTTPS 5986 com certificado autoassinado (`WINRM_VALIDATE_CERT=ignore` só no lab), NTLM, conta administrador local. A credencial fica só no `.env`.
 - Registrado no Claude Code como `windows-ops` (escopo usuário):

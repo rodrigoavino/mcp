@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import http.client
+import ipaddress
 import json
 import os
 import socket
@@ -48,6 +49,56 @@ def settings() -> dict:
             "enabled": os.getenv("MCP_PREFLIGHT", "on").lower() != "off",
             "timeout": num("MCP_PREFLIGHT_TIMEOUT", 5, 1, 30), "ttl_ok": num("MCP_PREFLIGHT_TTL_OK", 60, 0, 600),
             "ttl_fail": num("MCP_PREFLIGHT_TTL_FAIL", 10, 0, 120)}
+
+
+# ---------- somente endereços internos ----------
+# Com WINRM_ALLOWED_HOSTS=* qualquer nome é aceito, mas o coletor NÃO conecta em endereço público (regra de não ter chamada
+# externa). "Interno" = tudo que não é endereço global: privado (RFC 1918, fc00::/7), loopback, link-local, CGNAT e reservados.
+# WINRM_ALLOW_PUBLIC=true libera (decisão consciente). Se o nome não resolver, a checagem deixa passar: a falha de DNS é
+# reportada pela própria sonda/conexão.
+_ADDR_CACHE: dict = {}
+_ADDR_LOCK = threading.Lock()
+_ADDR_TTL = 60.0
+
+
+def allow_public() -> bool:
+    return os.getenv("WINRM_ALLOW_PUBLIC", "false").lower() == "true"
+
+
+def public_addresses(host: str, resolver=socket.getaddrinfo) -> list:
+    """Endereços GLOBAIS (públicos) para os quais o nome resolve; vazio se todos são internos ou se o nome não resolve."""
+    if allow_public():
+        return []
+    try:                                                   # IP literal: não precisa de DNS
+        ip = ipaddress.ip_address(host)
+        return [str(ip)] if ip.is_global else []
+    except ValueError:
+        pass
+    key = host.lower()
+    now = time.monotonic()
+    with _ADDR_LOCK:
+        hit = _ADDR_CACHE.get(key)
+        if hit and hit[0] > now:
+            return list(hit[1])
+    try:
+        addrs = sorted({i[4][0] for i in resolver(host, None, type=socket.SOCK_STREAM)})
+    except Exception:
+        return []
+    pub = []
+    for a in addrs:
+        try:
+            if ipaddress.ip_address(a.split("%")[0]).is_global:
+                pub.append(a)
+        except ValueError:
+            continue
+    with _ADDR_LOCK:
+        _ADDR_CACHE[key] = (now + _ADDR_TTL, list(pub))
+    return pub
+
+
+def clear_address_cache() -> None:
+    with _ADDR_LOCK:
+        _ADDR_CACHE.clear()
 
 
 # ---------- classificação de erros ----------
