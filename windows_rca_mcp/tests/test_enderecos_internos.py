@@ -1,4 +1,4 @@
-"""Com WINRM_ALLOWED_HOSTS=*, o coletor aceita qualquer nome, mas só conecta em endereço interno (nunca público)."""
+"""Trava OPCIONAL (WINRM_INTERNAL_ONLY=true): o coletor só conecta em endereço interno. Desligada por padrão: nada é bloqueado."""
 import socket
 
 import pytest
@@ -15,7 +15,7 @@ def resolve_para(*enderecos):
 
 @pytest.fixture(autouse=True)
 def limpo(monkeypatch):
-    monkeypatch.delenv("WINRM_ALLOW_PUBLIC", raising=False)
+    monkeypatch.setenv("WINRM_INTERNAL_ONLY", "true")       # os testes abaixo exercitam a trava LIGADA
     P.clear_address_cache()
     yield
     P.clear_address_cache()
@@ -58,9 +58,14 @@ class TestEnderecosPublicos:
         P.public_addresses("A.exemplo", resolver=r)
         assert chamadas == ["a.exemplo"]
 
-    def test_liberacao_consciente_por_ambiente(self, monkeypatch):
-        monkeypatch.setenv("WINRM_ALLOW_PUBLIC", "true")
+    @pytest.mark.parametrize("valor", [None, "false", "FALSE", "0", ""])
+    def test_desligada_por_padrao_nao_bloqueia_nada(self, monkeypatch, valor):
+        if valor is None:
+            monkeypatch.delenv("WINRM_INTERNAL_ONLY", raising=False)
+        else:
+            monkeypatch.setenv("WINRM_INTERNAL_ONLY", valor)
         assert P.public_addresses("8.8.8.8") == []
+        assert P.public_addresses("www.exemplo.com", resolver=resolve_para("93.184.216.34")) == []
 
 
 class TestNoServidor:
@@ -95,6 +100,11 @@ class TestNoServidor:
             S._session("www.exemplo.com")
         assert S._preflight_host_ok("www.exemplo.com") is False
 
-    def test_liberado_por_ambiente(self, monkeypatch):
-        monkeypatch.setenv("WINRM_ALLOW_PUBLIC", "true")
+    def test_desligada_por_padrao_o_servidor_conecta_por_nome_ou_ip(self, monkeypatch):
+        monkeypatch.delenv("WINRM_INTERNAL_ONLY", raising=False)
         assert S._session("8.8.8.8") is not None
+        assert S._preflight_host_ok("8.8.8.8") is True
+        S.check_winrm  # a tool existe; sem a trava ela não recusa por endereço
+        monkeypatch.setattr(S, "probe_winrm", lambda host: {"host": host, "port": 5986, "ok": False, "category": "rede_timeout",
+                                                             "layer": "rede", "message": "m", "steps": [], "auth_schemes": [], "alt_port": None})
+        assert S.check_winrm("1.1.1.1")["ok"] is False

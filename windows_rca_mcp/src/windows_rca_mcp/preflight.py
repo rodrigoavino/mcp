@@ -51,23 +51,23 @@ def settings() -> dict:
             "ttl_fail": num("MCP_PREFLIGHT_TTL_FAIL", 10, 0, 120)}
 
 
-# ---------- somente endereços internos ----------
-# Com WINRM_ALLOWED_HOSTS=* qualquer nome é aceito, mas o coletor NÃO conecta em endereço público (regra de não ter chamada
-# externa). "Interno" = tudo que não é endereço global: privado (RFC 1918, fc00::/7), loopback, link-local, CGNAT e reservados.
-# WINRM_ALLOW_PUBLIC=true libera (decisão consciente). Se o nome não resolver, a checagem deixa passar: a falha de DNS é
-# reportada pela própria sonda/conexão.
+# ---------- somente endereços internos (OPCIONAL, desligado por padrão) ----------
+# Por padrão o coletor NÃO bloqueia nada: conecta por nome ou IP em qualquer servidor que autentique. Quem quiser pode ligar
+# WINRM_INTERNAL_ONLY=true: aí host que resolve para endereço público (ou IP literal público) é recusado. "Interno" = tudo que
+# não é endereço global: privado (RFC 1918, fc00::/7), loopback, link-local, CGNAT e reservados. Se o nome não resolver, a
+# checagem deixa passar: a falha de DNS é reportada pela própria sonda/conexão.
 _ADDR_CACHE: dict = {}
 _ADDR_LOCK = threading.Lock()
 _ADDR_TTL = 60.0
 
 
-def allow_public() -> bool:
-    return os.getenv("WINRM_ALLOW_PUBLIC", "false").lower() == "true"
+def internal_only() -> bool:
+    return os.getenv("WINRM_INTERNAL_ONLY", "false").lower() == "true"
 
 
 def public_addresses(host: str, resolver=socket.getaddrinfo) -> list:
     """Endereços GLOBAIS (públicos) para os quais o nome resolve; vazio se todos são internos ou se o nome não resolve."""
-    if allow_public():
+    if not internal_only():
         return []
     try:                                                   # IP literal: não precisa de DNS
         ip = ipaddress.ip_address(host)

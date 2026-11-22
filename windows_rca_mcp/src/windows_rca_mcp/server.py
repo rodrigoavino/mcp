@@ -70,11 +70,11 @@ def _preflight_host_ok(host: str) -> bool:
 
 
 def _check_internal(host: str) -> None:
-    """Recusa host que resolve para endereço PÚBLICO (o coletor só conecta em endereços internos; WINRM_ALLOW_PUBLIC=true libera)."""
+    """Só com WINRM_INTERNAL_ONLY=true (opcional, desligado por padrão): recusa host que resolve para endereço PÚBLICO."""
     pub = public_addresses(host)
     if pub:
         raise ValueError(f"Host '{host}' resolve para endereço público ({', '.join(pub[:3])}): o coletor só conecta em "
-                         "endereços internos. WINRM_ALLOW_PUBLIC=true libera, conscientemente.")
+                         "endereços internos (WINRM_INTERNAL_ONLY=true). Remova essa variável do .env para liberar.")
 
 # Funções PowerShell injetadas em todo script.
 # Msg: normaliza espaços e trunca a mensagem do evento com segurança (eventos podem vir sem Message).
