@@ -72,6 +72,9 @@ Copie `.env.example` para `.env` e preencha (o `.env` está no `.gitignore`):
 | `MCP_ALLOW_INSECURE_LOOPBACK` | `false` | `true` permite `http` sem token, **somente em loopback** (testes) |
 | `MCP_AUDIT` | `on` | `off` desliga o log de auditoria |
 | `MCP_AUDIT_LOG` | `<projeto>/logs/audit.jsonl` | Arquivo do log de auditoria (rotação 5 MB x 5) |
+| `MCP_PREFLIGHT` | `on` | `off` desliga a validação automática do WinRM antes de cada tool |
+| `MCP_PREFLIGHT_TIMEOUT` | `5` | Segundos por tentativa de conexão na sonda (1 a 30) |
+| `MCP_PREFLIGHT_TTL_OK` / `MCP_PREFLIGHT_TTL_FAIL` | `60` / `10` | Segundos em que o resultado da sonda fica em cache (sucesso / falha) |
 
 O `.env` é lido do **diretório de trabalho** do processo (por isso o Claude usa `uv --directory <pasta do projeto>`) ou do caminho em `WINRM_ENV_FILE`.
 
@@ -118,9 +121,29 @@ Depois é só pedir em linguagem natural, por exemplo: *"faça um health check d
 4. Registre no cliente, enviando o token:
    `claude mcp add --transport http windows-ops https://<host>/mcp --header "Authorization: Bearer <token>"`.
 
-## Catálogo de tools (77)
+## Catálogo de tools (78)
 
 Todas recebem `host` (nome ou FQDN do servidor alvo).
+
+### Validação da conexão WinRM (primeiro passo)
+
+Antes de **toda** tool que recebe `host`, o MCP faz uma sonda leve e **sem credenciais**: DNS, TCP na porta do WinRM (5986 por padrão), TLS e a resposta do `/wsman` (um listener WinRM responde 401 e informa os esquemas de autenticação). Se algo falhar, a tool **não executa** e a resposta vem na hora com `success: false`, o servidor, a **camada** do problema e o `diagnosis` (categoria, etapas com tempo, porta alternativa e o que verificar), em vez de esperar o prazo de 35 s. Pior caso da sonda: 2 tentativas de 5 s mais 2 s na porta alternativa.
+
+| Categoria | Camada | Quando |
+|---|---|---|
+| `dns` | dns | o nome não resolve no DNS do host que roda o MCP |
+| `rede_timeout` / `conexao_recusada` / `rede_inacessivel` | rede | a porta não responde, é recusada ou não há rota; a sonda informa se a porta alternativa (5985 ou 5986) abre |
+| `tls_certificado` / `tls` | tls | certificado não aceito ou falha no handshake |
+| `servico_winrm` | serviço | a porta abre, mas não responde como WinRM |
+| `autenticacao` | autenticação | credenciais rejeitadas (só aparece em `check_winrm` com `test_auth` ou numa chamada real) |
+| `dominio` | domínio | Kerberos/KDC/SPN/relação de confiança |
+| `prazo_comando` / `leitura_timeout` / `conexao_perdida` | prazo/rede | a conexão funcionou, mas o comando passou do prazo ou a conexão caiu |
+
+O cache evita repetir a sonda a cada chamada (60 s se OK, 10 s se falhou). A sonda **só abre conexão para hosts da `WINRM_ALLOWED_HOSTS`**. As tools com `host` que falham depois da sonda (autenticação, domínio, prazo) também trazem `diagnosis`. As instruções do MCP mandam avisar o usuário imediatamente e não encadear outras tools no servidor com problema.
+
+| Tool | O que faz |
+|---|---|
+| `check_winrm` | Validação explícita: DNS, TCP, TLS, `/wsman` e, com `test_auth=true` (padrão), um comando mínimo com a conta da coleta, confirmando a autenticação. Devolve `ok`, `category`, `layer`, `message`, `steps`, `auth_schemes`, `alt_port` e, havendo problema, `warning` e `next_checks`. Entra no `run_on_hosts` para validar vários servidores de uma vez |
 
 ### Padrão de resposta (envelope)
 Toda tool responde no mesmo formato mínimo, e o conteúdo vai **só** em `data`:
@@ -312,7 +335,7 @@ O inventário `hosts.json` (veja `hosts.example.json`; fica fora do git; `WINRM_
 | Tool | O que faz |
 |---|---|
 | `list_hosts` | Servidores do inventário: nome, tags, descrição e se passam na lista de hosts permitidos; `tag` filtra |
-| `run_on_hosts` | Roda uma tool de leitura (`get_uptime`, `get_system_overview`, `get_time_config`, `get_last_patches`, `get_patch_status`, `get_stopped_auto_services`, `get_volumes`, `get_disks`, `get_services`, `get_listening_ports`, `get_events`, `get_health_summary`, `get_performance_snapshot`, `get_local_admins`, `get_local_users`, `get_security_posture`, `get_applied_gpos`, `get_license_status`, `get_platform_info`, `get_network_config`, `get_expiring_certificates`, `list_event_logs`, `get_security_context`, `test_connectivity`, `get_top_processes`, `get_workload_evidence`, `get_scheduled_tasks`) em `hosts` e/ou `tag`. Até 50 hosts e 10 em paralelo; `timeout_s` de 30 a 900 (quem não responde volta como `timeout`); resultado por host acima de `max_chars_per_host` é resumido. **Não inclui** tools que leem conteúdo (`read_file`, `get_registry`, `search_log`...) nem as longas (use `start_job` host a host) |
+| `run_on_hosts` | Roda uma tool de leitura (`get_uptime`, `get_system_overview`, `get_time_config`, `get_last_patches`, `get_patch_status`, `get_stopped_auto_services`, `get_volumes`, `get_disks`, `get_services`, `get_listening_ports`, `get_events`, `get_health_summary`, `get_performance_snapshot`, `get_local_admins`, `get_local_users`, `get_security_posture`, `get_applied_gpos`, `get_license_status`, `get_platform_info`, `get_network_config`, `get_expiring_certificates`, `list_event_logs`, `get_security_context`, `test_connectivity`, `get_top_processes`, `get_workload_evidence`, `get_scheduled_tasks`, `check_winrm`) em `hosts` e/ou `tag`. Até 50 hosts e 10 em paralelo; `timeout_s` de 30 a 900 (quem não responde volta como `timeout`); resultado por host acima de `max_chars_per_host` é resumido. **Não inclui** tools que leem conteúdo (`read_file`, `get_registry`, `search_log`...) nem as longas (use `start_job` host a host) |
 
 ### Coleta × interpretação
 Este MCP **só coleta**: fatos observáveis, normalização, sinais objetivos e comparação com baseline do projeto. Boas práticas, recomendação, severidade e fontes documentais ficam no **`microsoft-docs-mcp`** (`C:\mcp\microsoft_docs_mcp`), outro servidor MCP e o único com acesso à internet. O Claude chama o coletor, depois o RAG, e junta fato e evidência citando a fonte. Veja a tabela do que cada um pode afirmar no README do `microsoft-docs-mcp`.

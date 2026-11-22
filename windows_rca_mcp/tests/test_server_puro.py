@@ -208,11 +208,16 @@ class TestRegrasDoProjeto:
     def test_coletor_nao_chama_a_internet(self):
         """Regra: o coletor não tem nenhuma chamada externa (só WinRM)."""
         proibidos = {"requests", "httpx", "urllib", "urllib3", "aiohttp", "http", "socket"}
+        # Exceção ÚNICA e restrita: preflight.py usa socket/http.client só para sondar o WinRM dos hosts da allowlist
+        # (a sonda só roda se host_ok, que exige WINRM_ALLOWED_HOSTS; ver test_preflight). As bibliotecas de cliente HTTP
+        # continuam proibidas em todos os arquivos, inclusive nele.
+        sondas = {"socket", "http"}
         for arq in SRC.glob("*.py"):
+            vetados = proibidos - (sondas if arq.name == "preflight.py" else set())
             for n in ast.walk(ast.parse(arq.read_text(encoding="utf-8"))):
                 mods = [a.name.split(".")[0] for a in n.names] if isinstance(n, ast.Import) else \
                        [n.module.split(".")[0]] if isinstance(n, ast.ImportFrom) and n.module else []
-                assert not (set(mods) & proibidos), f"{arq.name} importa {set(mods) & proibidos}"
+                assert not (set(mods) & vetados), f"{arq.name} importa {set(mods) & vetados}"
 
     def test_sem_severidade_no_codigo(self):
         """Regra: nada de OK/Atenção/Crítico como estado, nem ação recomendada ou dica."""
@@ -228,9 +233,9 @@ class TestRegrasDoProjeto:
             async with Client(S.mcp) as c:
                 return {t.name for t in await c.list_tools()}
         n = asyncio.run(nomes())
-        assert len(n) == 77
+        assert len(n) == 78
         for esperado in ("get_license_status", "get_workload_evidence", "get_platform_info", "get_storage_overview",
-                         "get_stopped_auto_services", "get_local_groups", "get_installed_software", "get_registry", "get_environment_variables", "get_permissions", "get_dns_cache", "resolve_dns_name", "get_local_users", "list_log_files", "get_log_tail", "search_log", "get_security_context", "list_directory", "find_files", "file_info", "read_file", "compare_files", "find_duplicate_files", "list_event_logs", "get_dotnet_config", "start_job", "get_job", "list_jobs", "list_hosts", "run_on_hosts"):
+                         "get_stopped_auto_services", "get_local_groups", "get_installed_software", "get_registry", "get_environment_variables", "get_permissions", "get_dns_cache", "resolve_dns_name", "get_local_users", "list_log_files", "get_log_tail", "search_log", "get_security_context", "list_directory", "find_files", "file_info", "read_file", "compare_files", "find_duplicate_files", "list_event_logs", "get_dotnet_config", "start_job", "get_job", "list_jobs", "list_hosts", "run_on_hosts", "check_winrm"):
             assert esperado in n
 
     def test_resposta_do_wmi_para_json_e_ida_e_volta(self):

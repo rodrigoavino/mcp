@@ -27,7 +27,7 @@ from fastmcp.tools.base import ToolResult
 from mcp.types import TextContent
 
 _NAME_KEYS = ("computerName", "Host", "host", "Computer", "computer")
-_ERROR_ONLY = {"error", "host", "hint", "Error"}
+_ERROR_ONLY = {"error", "host", "hint", "Error", "diagnosis"}
 
 
 # Fuso padrão das respostas (decidido pelo usuário): GMT-3, fixo (sem horário de verão). Mude com MCP_TZ_OFFSET_HOURS.
@@ -86,7 +86,10 @@ def build_envelope(host: str | None, raw, now: str | None = None) -> dict:
                 break
     # falha: o dicionário só tem a mensagem de erro (e contexto mínimo)
     if isinstance(raw, dict) and ("error" in raw or "Error" in raw) and set(raw) <= _ERROR_ONLY:
-        return {"computerName": name, "timestamp": ts, "success": False, "error": raw.get("error") or raw.get("Error")}
+        fail = {"computerName": name, "timestamp": ts, "success": False, "error": raw.get("error") or raw.get("Error")}
+        if isinstance(raw.get("diagnosis"), dict):        # falha de conexão: camada, etapas e o que verificar
+            fail["diagnosis"] = raw["diagnosis"]
+        return fail
     env: dict = {"computerName": name, "timestamp": ts, "success": True}
     data = raw
     if isinstance(raw, dict):

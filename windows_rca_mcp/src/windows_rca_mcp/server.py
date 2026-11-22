@@ -32,6 +32,7 @@ from fastmcp import FastMCP
 from .audit import AuditMiddleware, build_record, default_log
 from .envelope import EnvelopeMiddleware, build_envelope
 from .envelope import now_local as _now_local
+from .preflight import PreflightMiddleware, classify_error, probe_winrm
 
 # O .env é procurado a partir do DIRETÓRIO DE TRABALHO (usecwd=True), e não da pasta do pacote, para funcionar
 # também quando instalado via wheel em site-packages.
@@ -45,10 +46,13 @@ INSTRUCTIONS = """windows-ops: COLETA somente leitura de servidores Windows. Pad
 4. Este MCP afirma só FATOS e sinais objetivos (existe, online, acima de X, diverge da baseline, falhou, corrompido). Nunca melhor prática, recomendação, "inadequado", "deve ser alterado" ou classificação de serviço: isso é do microsoft-docs, e só para pergunta de recomendação, suporte, compatibilidade ou boa prática. Inventário, configuração, serviços, usuários, grupos, discos, eventos, SIDs, RIDs e status nunca disparam consulta externa.
 5. Nunca presuma a função do servidor (ex.: SQL Server) sem evidência (get_workload_evidence); sem evidência vale só o SO e a versão.
 6. Data de instalação de software é fato LOCAL: registro, instalação por usuário, eventos MsiInstaller, Package Management, sistema de arquivos, com a confiança informada. Nunca internet.
-7. Nada inventado: o que não foi coletado não é afirmado."""
+7. Nada inventado: o que não foi coletado não é afirmado.
+8. PRIMEIRO PASSO em cada servidor: a conexão WinRM (HTTPS 5986) é validada automaticamente antes de toda tool com 'host'. Se houver problema (DNS, rede/firewall/porta, certificado/TLS, autenticação, domínio/Kerberos, serviço WinRM, prazo), a resposta traz success=false com 'diagnosis' (categoria, camada, etapas, porta alternativa e o que verificar): AVISE o usuário IMEDIATAMENTE, diga o servidor, a camada e o que foi testado, e NÃO encadeie outras tools nesse servidor. Use check_winrm para validar a conexão (e a autenticação) de forma explícita, inclusive em vários servidores com run_on_hosts."""
 mcp = FastMCP("windows-server-ops", instructions=INSTRUCTIONS)
 mcp.add_middleware(AuditMiddleware())   # por fora do envelope: registra tool, host, resultado e duração (sem o conteúdo)
 mcp.add_middleware(EnvelopeMiddleware())
+# Por dentro do envelope: sonda o WinRM antes de cada tool com 'host' e, se falhar, responde na hora com o diagnóstico.
+mcp.add_middleware(PreflightMiddleware(host_ok=lambda h: _preflight_host_ok(h)))
 
 ALLOWED = [h.strip().lower() for h in os.getenv("WINRM_ALLOWED_HOSTS", "").split(",") if h.strip()]
 HOST_RE = re.compile(r"^[A-Za-z0-9._-]{1,253}$")
@@ -58,6 +62,11 @@ NAME_RE = re.compile(r"^[A-Za-z0-9 ._/-]{1,100}$")
 def _host_allowed(host: str) -> bool:
     h = host.lower()
     return any(p == "*" or fnmatch.fnmatchcase(h, p) for p in ALLOWED)
+
+
+def _preflight_host_ok(host: str) -> bool:
+    """A sonda de pré-voo só abre conexão para host válido E na allowlist (nunca para um host de fora dela)."""
+    return bool(ALLOWED) and bool(HOST_RE.match(host)) and _host_allowed(host)
 
 # Funções PowerShell injetadas em todo script.
 # Msg: normaliza espaços e trunca a mensagem do evento com segurança (eventos podem vir sem Message).
@@ -212,7 +221,8 @@ def _fmt_date(ms: int) -> str:
 
 
 def _conn_error(host: str, e: Exception) -> dict:
-    return {"error": f"{type(e).__name__}: {str(e)[:1000]}", "host": host}
+    msg = f"{type(e).__name__}: {str(e)[:1000]}"
+    return {"error": msg, "host": host, "diagnosis": classify_error(msg)}
 
 
 CLIXML_ERR_RE = re.compile(r'<S S="Error">(.*?)</S>', re.S)
@@ -4279,6 +4289,7 @@ FANOUT_TOOLS = (
     "get_performance_snapshot", "get_local_admins", "get_local_users", "get_security_posture", "get_applied_gpos",
     "get_license_status", "get_platform_info", "get_network_config", "get_expiring_certificates", "list_event_logs",
     "get_security_context", "test_connectivity", "get_top_processes", "get_workload_evidence", "get_scheduled_tasks",
+    "check_winrm",
 )
 FANOUT_MAX_HOSTS = 50
 FANOUT_MAX_PARALLEL = 10
@@ -4419,6 +4430,50 @@ def run_on_hosts(tool: str, hosts: list[str] | None = None, tag: str | None = No
         rows.append(r)
     return {"tool": tool, "requested": len(names), "succeeded": sum(1 for r in rows if r["ok"]), "failed": sum(1 for r in rows if not r["ok"]),
             "elapsed_s": round(time.monotonic() - t0, 1), "results": rows}
+
+
+# ---------- validação da conexão WinRM (primeiro passo) ----------
+@mcp.tool
+def check_winrm(host: str, test_auth: bool = True):
+    """Valida a conexão WinRM do servidor (HTTPS 5986 por padrão), PRIMEIRO PASSO de qualquer coleta, e aponta a camada do
+    problema: dns, rede (timeout/recusada/sem rota), tls/certificado, autenticação, domínio/Kerberos, serviço WinRM ou prazo.
+    Etapas: DNS, TCP na porta (se falhar, informa se a porta alternativa 5985/5986 abre), TLS e resposta do /wsman sem
+    credenciais e, com test_auth=true, um comando mínimo com a conta da coleta (confirma a autenticação). Em 'data': ok,
+    category, layer, message, steps (tempo de cada etapa), auth_schemes, alt_port, computer e, havendo problema,
+    'warning' e 'next_checks'. Só leitura. Toda tool com 'host' já roda a parte leve desta sonda antes da coleta."""
+    if not HOST_RE.match(host):
+        raise ValueError("Hostname inválido")
+    if not ALLOWED:
+        raise ValueError("WINRM_ALLOWED_HOSTS não configurada: defina os servidores permitidos no .env.")
+    if not _host_allowed(host):
+        raise ValueError(f"Host '{host}' fora da allowlist WINRM_ALLOWED_HOSTS")
+    p = probe_winrm(host)
+    data = {k: p[k] for k in ("host", "port", "ok", "category", "layer", "message", "steps", "auth_schemes", "alt_port")}
+    if p["ok"] and test_auth:
+        t0 = time.monotonic()
+        r = _ps(host, "[pscustomobject]@{ Computer=$env:COMPUTERNAME } | ConvertTo-Json -Compress", timeout=30)
+        ms = int((time.monotonic() - t0) * 1000)
+        if isinstance(r, dict) and "error" in r:
+            d = r.get("diagnosis") or classify_error(str(r["error"]))
+            data.update(ok=False, category=d["category"], layer=d["layer"],
+                        message=f"A porta abriu e o WinRM respondeu, mas o comando de teste falhou: {d['summary']}",
+                        next_checks=d["next_checks"])
+            data["steps"].append({"step": "autenticacao_comando", "ok": False, "ms": ms, "detail": str(r["error"])[:300]})
+        else:
+            data["computer"] = r.get("Computer") if isinstance(r, dict) else None
+            data["steps"].append({"step": "autenticacao_comando", "ok": True, "ms": ms,
+                                  "detail": f"comando executado em {data['computer'] or host}"})
+            data["message"] = f"WinRM e autenticação OK em {host}:{p['port']}."
+    elif not p["ok"]:
+        data["next_checks"] = diagnosis_next_checks(p)
+    if not data["ok"]:
+        data["warning"] = f"ATENÇÃO: problema de conexão com {host} ({data['layer']}): {data['message']}"
+    return data
+
+
+def diagnosis_next_checks(p: dict) -> list:
+    from .preflight import diagnosis_from_probe
+    return diagnosis_from_probe(p)["next_checks"]
 
 
 # ---------- painel de saúde rápido ----------
