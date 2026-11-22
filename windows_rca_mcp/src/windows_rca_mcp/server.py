@@ -1913,8 +1913,9 @@ $dirs = [ordered]@{
  'SCCM cache'="$sr\ccmcache"
 }
 $items = foreach($k in $dirs.Keys){ [pscustomobject]@{Item=$k; Path=$dirs[$k]; SizeGB=(SZ $dirs[$k])} }
+# Get-Item/Test-Path NÃO enxergam pagefile.sys/hiberfil.sys/swapfile.sys: a listagem da pasta com -Force enxerga.
 $files = foreach($f in "$sr\MEMORY.DMP","$sd\pagefile.sys","$sd\hiberfil.sys","$sd\swapfile.sys"){
-  $i = Get-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
+  $i = Get-ChildItem -LiteralPath (Split-Path $f -Parent) -Force -File -ErrorAction SilentlyContinue | ? { $_.Name -ieq (Split-Path $f -Leaf) } | select -First 1
   if($i){ [pscustomobject]@{File=$f; SizeGB=[math]::Round($i.Length/1GB,2); LastWrite=$i.LastWriteTime} } }
 $vss = try { Get-CimInstance Win32_ShadowStorage | select @{n='Volume';e={$_.Volume.DeviceID}},
   @{n='UsedGB';e={[math]::Round($_.UsedSpace/1GB,2)}},@{n='AllocatedGB';e={[math]::Round($_.AllocatedSpace/1GB,2)}},
@@ -3621,7 +3622,10 @@ def file_info(host: str, path: str, hash: bool = False):
     res = _ps(host, r"""
 $p = '__P__'; $hash = __H__
 try { $it = Get-Item -LiteralPath $p -Force -ErrorAction Stop } catch {
-  [pscustomobject]@{ Exists=$false; Error=$_.Exception.Message } | ConvertTo-Json -Compress; return }
+  $err = $_.Exception.Message
+  # pagefile.sys, hiberfil.sys e swapfile.sys: o Get-Item não os enxerga, a listagem da pasta com -Force enxerga
+  $it = Get-ChildItem -LiteralPath (Split-Path $p -Parent) -Force -ErrorAction SilentlyContinue | ? { $_.Name -ieq (Split-Path $p -Leaf) } | select -First 1
+  if (-not $it) { [pscustomobject]@{ Exists=$false; Error=$err } | ConvertTo-Json -Compress; return } }
 $owner = try { (Get-Acl -LiteralPath $p -ErrorAction Stop).Owner } catch { $null }
 $vi = $null
 if (-not $it.PSIsContainer -and $it.VersionInfo -and ($it.VersionInfo.FileVersion -or $it.VersionInfo.ProductName)) {
