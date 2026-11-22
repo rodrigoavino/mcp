@@ -3071,7 +3071,7 @@ def _dns_cache_shape(res, name_filter, top):
     res["Entries"] = ents
     res["Filter"] = name_filter
     res["Top"] = top
-    res["Truncated"] = (res.get("Matched") or 0) > len(ents)
+    res["Truncated"] = (res.get("MatchedUnique", res.get("Matched")) or 0) > len(ents)
     return res
 
 
@@ -3079,7 +3079,8 @@ def _dns_cache_shape(res, name_filter, top):
 def get_dns_cache(host: str, name_filter: str | None = None, top: int = 100):
     """Cache do cliente DNS do servidor (somente leitura): nome, tipo, status, seção, TTL restante e dado de cada
     entrada. 'name_filter' aceita curinga (ex.: '*.familia.local'). Máximo 500 entradas (padrão 100); 'Total' informa
-    quantas existem e 'Matched' quantas casam com o filtro. Entradas de status 9003 são respostas negativas em cache. Só fatos."""
+    quantas existem, 'Matched' quantas casam com o filtro e 'MatchedUnique' quantas sobram sem repetição (registros idênticos,
+    por exemplo um por interface, viram uma linha com 'Copies' e o maior TTL). Entradas de status 9003 são respostas negativas em cache. Só fatos."""
     if name_filter is not None and not DNS_FILTER_RE.match(name_filter):
         raise ValueError("name_filter inválido (letras, números, '.', '-', '_' e '*')")
     n = max(1, min(int(top), DNS_CACHE_MAX))
@@ -3087,10 +3088,12 @@ def get_dns_cache(host: str, name_filter: str | None = None, top: int = 100):
 $f = '__F__'
 $all = @(Get-DnsClientCache -ErrorAction SilentlyContinue)
 $m = @($all | ? { -not $f -or $_.Entry -like $f -or $_.Name -like $f })
-$sel = @($m | sort Entry | select -First __N__ |
-  % { [pscustomobject]@{ Entry=$_.Entry; Name=$_.Name; Type=[int]$_.Type; Status=[int]$_.Status; Section=[int]$_.Section
-        TTL=[int]$_.TimeToLive; Data=$_.Data } })
-[pscustomobject]@{ Total=$all.Count; Matched=$m.Count; Entries=$sel } | ConvertTo-Json -Depth 4 -Compress
+$grp = @($m | Group-Object { "$($_.Entry)|$($_.Type)|$($_.Status)|$($_.Section)|$($_.Data)" })
+$sel = @($grp | % { $g = $_.Group; $x = $g[0]
+    [pscustomobject]@{ Entry=$x.Entry; Name=$x.Name; Type=[int]$x.Type; Status=[int]$x.Status; Section=[int]$x.Section
+      TTL=[int](($g | Measure-Object TimeToLive -Maximum).Maximum); Data=$x.Data; Copies=$g.Count } } |
+  sort Entry, Type, Data | select -First __N__)
+[pscustomobject]@{ Total=$all.Count; Matched=$m.Count; MatchedUnique=$grp.Count; Entries=$sel } | ConvertTo-Json -Depth 4 -Compress
 """.replace("__F__", name_filter or "").replace("__N__", str(n)))
     return _dns_cache_shape(res, name_filter, n)
 
@@ -3473,6 +3476,20 @@ def _fs_mask_and_check(texts):
 
 
 PS_FS_GUARD = r"""
+# Codificação automática: com BOM o Get-Content já detecta; sem BOM, UTF-8 válido (lê até 64 KB) é lido como UTF-8, senão
+# vale o padrão do Windows (ANSI). Evita acentos quebrados ('domÃ­nio') em arquivos UTF-8 sem BOM.
+function AutoEnc([string]$p) {
+  try {
+    $fs = [IO.File]::Open($p, 'Open', 'Read', 'ReadWrite')
+    try { $buf = New-Object byte[] 65536; $n = $fs.Read($buf, 0, 65536) } finally { $fs.Dispose() }
+    if ($n -ge 2 -and (($buf[0] -eq 255 -and $buf[1] -eq 254) -or ($buf[0] -eq 254 -and $buf[1] -eq 255))) { return $null }
+    if ($n -ge 3 -and $buf[0] -eq 239 -and $buf[1] -eq 187 -and $buf[2] -eq 191) { return $null }
+    $len = if ($n -eq 65536) { $n - 3 } else { $n }
+    $u = New-Object System.Text.UTF8Encoding($false, $true); [void]$u.GetString($buf, 0, $len); return 'utf8'
+  } catch { return $null } }
+function Get-EncArg([string]$p, [string]$explicit) {
+  if ($explicit) { return @{ Encoding = $explicit } }
+  $e = AutoEnc $p; if ($e) { return @{ Encoding = $e } } else { return @{} } }
 function Guard([string]$p) {
   try { $it = Get-Item -LiteralPath $p -Force -ErrorAction Stop } catch { return $_.Exception.Message }
   if ($it.PSIsContainer) { return 'O caminho é uma pasta, não um arquivo' }
@@ -3631,13 +3648,13 @@ if ($hash -and -not $it.PSIsContainer) {
 def read_file(host: str, path: str, start_line: int = 1, end_line: int = 200, tail: bool = False, encoding: str | None = None):
     r"""Lê um arquivo de TEXTO (somente leitura), no formato C:\caminho. Por intervalo (start_line a end_line, até 500
     linhas por chamada) ou, com tail=true, as últimas end_line linhas (máx. 500). encoding opcional: utf8, unicode,
-    ascii, default, oem, utf32, bigendianunicode (padrão: detecta pelo BOM). Linhas cortadas em 500 caracteres e valores
+    ascii, default, oem, utf32, bigendianunicode (padrão: detecta pelo BOM e, sem BOM, UTF-8 válido). Linhas cortadas em 500 caracteres e valores
     de senha/token/chave mascarados. Recusa: áreas e arquivos sensíveis, binários, links/junções e arquivos com chave
     privada. Para logs de serviços use também get_log_tail/search_log."""
     p = _fs_file(path)
     if encoding is not None and encoding.lower() not in FS_ENCODINGS:
         raise ValueError("encoding inválido. Válidos: " + ", ".join(FS_ENCODINGS))
-    enc = f" -Encoding {encoding.lower()}" if encoding else ""
+    enc = " @ea"
     if tail:
         count = max(1, min(int(end_line), FS_MAX_LINES))
         read = f"@(Get-Content -LiteralPath $p -Tail {count}{enc} -ErrorAction Stop | % {{ [string]$_ }})"
@@ -3655,21 +3672,25 @@ $p = '__P__'
 $r = Guard $p
 if ($r) { [pscustomobject]@{ Refused=$r } | ConvertTo-Json -Compress; return }
 $it = Get-Item -LiteralPath $p -Force
+$ea = Get-EncArg $p '__EA__'
 $lines = __READ__
 [pscustomobject]@{ Path=$p; SizeBytes=$it.Length; LastWriteTime=$it.LastWriteTime; Mode='__MODE__'; StartLine=__FIRST__; LineCount=$lines.Count
   Lines=@($lines | % { if ($_.Length -gt __C__) { $_.Substring(0, __C__) + '…' } else { $_ } }) } | ConvertTo-Json -Depth 3 -Compress
-""".replace("__READ__", read).replace("__MODE__", "tail" if tail else "range").replace("__FIRST__", str(first) if first else "$null")
+""".replace("__READ__", read).replace("__EA__", (encoding or "").lower()).replace("__MODE__", "tail" if tail else "range").replace("__FIRST__", str(first) if first else "$null")
        .replace("__C__", str(FS_LINE_CHARS)).replace("__P__", p))
     return _fs_result(res, host)
 
 
 @mcp.tool
-def compare_files(host: str, path_a: str, path_b: str, max_diffs: int = 100):
+def compare_files(host: str, path_a: str, path_b: str, max_diffs: int = 100, encoding: str | None = None):
     r"""Compara dois arquivos de TEXTO do mesmo servidor, linha a linha (somente leitura): 'Identical', quantas linhas
     cada um tem, 'DiffCount' e as diferenças (Side OnlyInA ou OnlyInB, número da linha e texto, até 200). Cada arquivo:
     até 2 MB e 5.000 linhas. Mesmas proteções de read_file (áreas e arquivos sensíveis, binários, links, chave privada;
-    segredos mascarados). Útil para comparar o mesmo arquivo de configuração entre duas pastas ou versões."""
+    segredos mascarados). Codificação: BOM, senão UTF-8 válido, senão ANSI; 'encoding' (mesmos valores de read_file) força
+    a mesma para os dois. Útil para comparar o mesmo arquivo de configuração entre duas pastas ou versões."""
     a, b = _fs_file(path_a), _fs_file(path_b)
+    if encoding is not None and encoding.lower() not in FS_ENCODINGS:
+        raise ValueError("encoding inválido. Válidos: " + ", ".join(FS_ENCODINGS))
     n = max(1, min(int(max_diffs), FS_COMPARE_MAX_DIFFS))
     res = _ps(host, PS_FS_GUARD + r"""
 $pa = '__A__'; $pb = '__B__'
@@ -3679,7 +3700,8 @@ foreach ($p in $pa, $pb) {
   $it = Get-Item -LiteralPath $p -Force
   if ($it.Length -gt __MB__) { [pscustomobject]@{ Refused="$p : arquivo maior que 2 MB" } | ConvertTo-Json -Compress; return } }
 function Load($p) {
-  $l = @(Get-Content -LiteralPath $p -TotalCount (__ML__ + 1) -ErrorAction Stop | % { [string]$_ })
+  $ea = Get-EncArg $p '__EA__'
+  $l = @(Get-Content -LiteralPath $p -TotalCount (__ML__ + 1) @ea -ErrorAction Stop | % { [string]$_ })
   if ($l.Count -gt __ML__) { return $null }
   $o = New-Object System.Collections.ArrayList; $i = 0
   foreach ($t in $l) { $i++; [void]$o.Add([pscustomobject]@{ N=$i; Text=$t }) }
@@ -3691,7 +3713,7 @@ $d = @(Compare-Object $A $B -Property Text -PassThru -SyncWindow 50 | sort @{e={
   Diffs=@($d | select -First __N__ | % { [pscustomobject]@{ Side=$(if ($_.SideIndicator -eq '<=') { 'OnlyInA' } else { 'OnlyInB' }); Line=$_.N
     Text=$(if ($_.Text.Length -gt __C__) { $_.Text.Substring(0, __C__) + '…' } else { $_.Text }) } }) } | ConvertTo-Json -Depth 4 -Compress
 """.replace("__MB__", str(FS_COMPARE_MAX_BYTES)).replace("__ML__", str(FS_COMPARE_MAX_LINES)).replace("__N__", str(n))
-       .replace("__C__", str(FS_LINE_CHARS)).replace("__A__", a).replace("__B__", b), timeout=180)
+       .replace("__C__", str(FS_LINE_CHARS)).replace("__EA__", (encoding or "").lower()).replace("__A__", a).replace("__B__", b), timeout=180)
     res = _fs_result(res, host)
     if isinstance(res, dict) and "Diffs" in res:
         res["Truncated"] = (res.get("DiffCount") or 0) > len(res["Diffs"])
@@ -3922,6 +3944,8 @@ $all = @(Get-WinEvent -ListLog $f -ErrorAction SilentlyContinue | ? { (-not $onl
 
 CFG_MAX_BYTES = 2 * 1024 * 1024
 CFG_MAX_NODES = 1000
+CFG_DEFAULT_NODES = 150
+CFG_MAX_DEPTH = 20
 CFG_MAX_VALUE = 300
 CFG_SECTION_RE = re.compile(r"^[A-Za-z0-9._:-]{1,60}$")
 CFG_EXTS = (".config", ".xml")
@@ -3977,21 +4001,36 @@ def _config_summary(nodes: list) -> dict:
     return {"AppSettings": app, "ConnectionStrings": conns}
 
 
+def _config_hint(res: dict, section) -> str | None:
+    """Orientação objetiva quando a resposta foi cortada ou a seção pedida não existe (sem opinar sobre o conteúdo)."""
+    if res.get("Truncated"):
+        return "Resposta cortada em max_nodes: use 'section' mais específica, 'max_depth' ou aumente max_nodes (máximo 1000)."
+    if res.get("DepthLimited"):
+        return "Há nós abaixo de max_depth que não foram incluídos."
+    if section and (res.get("NodeCount") or 0) <= 1:
+        return f"Nenhum nó casou com a seção '{section}' (só a raiz foi devolvida)."
+    return None
+
+
 @mcp.tool
-def get_dotnet_config(host: str, path: str, section: str | None = None):
+def get_dotnet_config(host: str, path: str, section: str | None = None, max_nodes: int = CFG_DEFAULT_NODES, max_depth: int | None = None):
     r"""Lê um arquivo de configuração XML (.config ou .xml: web.config, app.config, machine.config, applicationHost.config)
-    e devolve a ESTRUTURA como nós (caminho, atributos e texto), até 1.000 nós, mais atalhos 'AppSettings' e
+    e devolve a ESTRUTURA como nós (caminho, atributos e texto; nós sem atributos e sem texto são omitidos), até 'max_nodes'
+    nós (padrão 150, máximo 1.000; 'Truncated' avisa e 'Hint' sugere como reduzir), mais atalhos 'AppSettings' e
     'ConnectionStrings' (nome, provedor, servidor, banco, segurança integrada, e a connection string COM A SENHA
-    MASCARADA). 'section' (ex.: 'appSettings', 'system.webServer') limita aos nós daquela seção. Somente leitura, com
+    MASCARADA). 'section' (ex.: 'appSettings', 'system.webServer') limita aos nós daquela seção e 'max_depth' (0-20) limita
+    a profundidade (a raiz é 0). Arquivos grandes, como o web.config do .NET, pedem section ou max_depth. Somente leitura, com
     as mesmas proteções de read_file (áreas e arquivos sensíveis, binários, links), XML sem DTD (sem XXE), arquivo de
     até 2 MB e segredos mascarados (atributos 'password', chaves como 'DbPassword', 'Pwd=' em connection strings)."""
     p = _fs_file(path)
+    nmax = max(1, min(int(max_nodes), CFG_MAX_NODES))
+    dmax = CFG_MAX_DEPTH if max_depth is None else max(0, min(int(max_depth), CFG_MAX_DEPTH))
     if not p.lower().endswith(CFG_EXTS):
         raise ValueError("Só arquivos .config e .xml são lidos por esta tool")
     if section is not None and not CFG_SECTION_RE.match(section):
         raise ValueError("section inválida (letras, números, '.', '-', '_' e ':')")
     res = _ps(host, PS_FS_GUARD + r"""
-$p = '__P__'; $sect = '__S__'; $maxNodes = __MN__; $maxVal = __MV__
+$p = '__P__'; $sect = '__S__'; $maxNodes = __MN__; $maxVal = __MV__; $maxDepth = __MD__
 $r = Guard $p
 if ($r) { [pscustomobject]@{ Refused=$r } | ConvertTo-Json -Compress; return }
 $it = Get-Item -LiteralPath $p -Force
@@ -4000,9 +4039,10 @@ try {
   $st = New-Object System.Xml.XmlReaderSettings; $st.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit; $st.XmlResolver = $null
   $rd = [System.Xml.XmlReader]::Create($p, $st); $doc = New-Object System.Xml.XmlDocument; $doc.XmlResolver = $null; $doc.Load($rd); $rd.Close()
 } catch { [pscustomobject]@{ Refused=('XML inválido ou com DTD (não permitido): ' + $_.Exception.Message) } | ConvertTo-Json -Compress; return }
-$script:nodes = New-Object System.Collections.ArrayList; $script:trunc = $false
+$script:nodes = New-Object System.Collections.ArrayList; $script:trunc = $false; $script:deeper = $false
 function Cut([string]$s) { if ($s -and $s.Length -gt $maxVal) { $s.Substring(0, $maxVal) + '…' } else { $s } }
-function Walk($e, [string]$path) {
+function Walk($e, [string]$path, [int]$lvl) {
+  if ($lvl -gt $maxDepth) { $script:deeper = $true; return }
   if ($script:nodes.Count -ge $maxNodes) { $script:trunc = $true; return }
   $emit = (-not $sect) -or ($path -notlike '*/*') -or ($path -match ('/' + [regex]::Escape($sect) + '(\[\d+\])?(/|$)'))
   if ($emit) {
@@ -4013,18 +4053,21 @@ function Walk($e, [string]$path) {
   $seen = @{}
   foreach ($c in $e.ChildNodes) { if ($c.NodeType -eq 'Element') {
     $n = $c.LocalName; $seen[$n] = 1 + [int]$seen[$n]
-    Walk $c ($path + '/' + $n + $(if ($cnt[$n] -gt 1) { '[' + $seen[$n] + ']' } else { '' })) } } }
-Walk $doc.DocumentElement $doc.DocumentElement.LocalName
+    Walk $c ($path + '/' + $n + $(if ($cnt[$n] -gt 1) { '[' + $seen[$n] + ']' } else { '' })) ($lvl + 1) } } }
+Walk $doc.DocumentElement $doc.DocumentElement.LocalName 0
 [pscustomobject]@{ Path=$p; SizeBytes=$it.Length; LastWriteTime=$it.LastWriteTime; Root=$doc.DocumentElement.LocalName
-  NodeCount=$script:nodes.Count; Truncated=$script:trunc; Nodes=@($script:nodes) } | ConvertTo-Json -Depth 5 -Compress
-""".replace("__MN__", str(CFG_MAX_NODES)).replace("__MV__", str(CFG_MAX_VALUE)).replace("__MB__", str(CFG_MAX_BYTES))
+  NodeCount=$script:nodes.Count; Truncated=$script:trunc; DepthLimited=$script:deeper; Nodes=@($script:nodes) } | ConvertTo-Json -Depth 5 -Compress
+""".replace("__MN__", str(nmax)).replace("__MD__", str(dmax)).replace("__MV__", str(CFG_MAX_VALUE)).replace("__MB__", str(CFG_MAX_BYTES))
        .replace("__S__", section or "").replace("__P__", p), timeout=120)
     if isinstance(res, dict) and res.get("Refused"):
         return {"host": host, "error": res["Refused"]}
     if isinstance(res, dict) and "Nodes" in res:
         nodes = [_mask_config_node(n) for n in _lst(res.get("Nodes")) if isinstance(n, dict)]
-        res["Nodes"] = nodes
         res.update(_config_summary(nodes))
+        res["Nodes"] = [{k: v for k, v in n.items() if k == "Path" or v} for n in nodes]   # sem nós/atributos vazios: respostas menores
+        res["Hint"] = _config_hint(res, section)
+        if res["Hint"] is None:
+            del res["Hint"]
     return res
 
 
