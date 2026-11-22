@@ -72,6 +72,7 @@ Copie `.env.example` para `.env` e preencha (o `.env` está no `.gitignore`):
 | `MCP_ALLOW_INSECURE_LOOPBACK` | `false` | `true` permite `http` sem token, **somente em loopback** (testes) |
 | `MCP_AUDIT` | `on` | `off` desliga o log de auditoria |
 | `MCP_AUDIT_LOG` | `<projeto>/logs/audit.jsonl` | Arquivo do log de auditoria (rotação 5 MB x 5) |
+| `WINRM_INTERNAL_ONLY` | `false` | **Opcional.** Por padrão nada é bloqueado: o coletor conecta por nome ou IP em qualquer servidor que autentique. `true` recusa host que resolve para endereço **público** (aceita privado, loopback, link-local, CGNAT) |
 | `MCP_PREFLIGHT` | `on` | `off` desliga a validação automática do WinRM antes de cada tool |
 | `MCP_PREFLIGHT_TIMEOUT` | `5` | Segundos por tentativa de conexão na sonda (1 a 30) |
 | `MCP_PREFLIGHT_TTL_OK` / `MCP_PREFLIGHT_TTL_FAIL` | `60` / `10` | Segundos em que o resultado da sonda fica em cache (sucesso / falha) |

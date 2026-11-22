@@ -32,7 +32,7 @@ from fastmcp import FastMCP
 from .audit import AuditMiddleware, build_record, default_log
 from .envelope import EnvelopeMiddleware, build_envelope
 from .envelope import now_local as _now_local
-from .preflight import PreflightMiddleware, classify_error, probe_winrm
+from .preflight import PreflightMiddleware, classify_error, probe_winrm, public_addresses
 
 # O .env é procurado a partir do DIRETÓRIO DE TRABALHO (usecwd=True), e não da pasta do pacote, para funcionar
 # também quando instalado via wheel em site-packages.
@@ -65,8 +65,16 @@ def _host_allowed(host: str) -> bool:
 
 
 def _preflight_host_ok(host: str) -> bool:
-    """A sonda de pré-voo só abre conexão para host válido E na allowlist (nunca para um host de fora dela)."""
-    return bool(ALLOWED) and bool(HOST_RE.match(host)) and _host_allowed(host)
+    """A sonda de pré-voo só abre conexão para host válido, na allowlist e com endereço interno (nunca público)."""
+    return bool(ALLOWED) and bool(HOST_RE.match(host)) and _host_allowed(host) and not public_addresses(host)
+
+
+def _check_internal(host: str) -> None:
+    """Só com WINRM_INTERNAL_ONLY=true (opcional, desligado por padrão): recusa host que resolve para endereço PÚBLICO."""
+    pub = public_addresses(host)
+    if pub:
+        raise ValueError(f"Host '{host}' resolve para endereço público ({', '.join(pub[:3])}): o coletor só conecta em "
+                         "endereços internos (WINRM_INTERNAL_ONLY=true). Remova essa variável do .env para liberar.")
 
 # Funções PowerShell injetadas em todo script.
 # Msg: normaliza espaços e trunca a mensagem do evento com segurança (eventos podem vir sem Message).
@@ -137,6 +145,7 @@ def _session(host: str, timeout: int = 60) -> winrm.Session:
                          "(ex.: *.dominio.local,srv01) no .env. Use '*' apenas conscientemente.")
     if not _host_allowed(host):
         raise ValueError(f"Host '{host}' fora da allowlist WINRM_ALLOWED_HOSTS")
+    _check_internal(host)
     user, pwd = os.getenv("WINRM_USER"), os.getenv("WINRM_PASSWORD")
     if not user or not pwd:
         raise ValueError("WINRM_USER/WINRM_PASSWORD não configurados (defina no .env ou no ambiente)")
@@ -4447,6 +4456,7 @@ def check_winrm(host: str, test_auth: bool = True):
         raise ValueError("WINRM_ALLOWED_HOSTS não configurada: defina os servidores permitidos no .env.")
     if not _host_allowed(host):
         raise ValueError(f"Host '{host}' fora da allowlist WINRM_ALLOWED_HOSTS")
+    _check_internal(host)
     p = probe_winrm(host)
     data = {k: p[k] for k in ("host", "port", "ok", "category", "layer", "message", "steps", "auth_schemes", "alt_port")}
     if p["ok"] and test_auth:
