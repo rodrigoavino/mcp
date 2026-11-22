@@ -1829,6 +1829,61 @@ Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-WindowsUpdateClient/O
 
 
 # ---------- disco: espaço, ofensores e alocação sem uso ----------
+RECON_MIN_TOL_BYTES = 256 * 1048576
+RECON_TOL_PCT = 0.02
+
+
+def _volume_reconciliation(res: dict, path: str, vol: dict) -> dict:
+    """Compara a soma 'em disco' da varredura com o espaço realmente usado do volume (tamanho - livre) e informa a
+    diferença como FATO, sem explicá-la. Só concilia quando a raiz varrida é a do volume; em subpasta devolve apenas a
+    participação da varredura no uso do volume. 'notes' lista só limitações objetivas desta varredura (dedupe desligado,
+    resultado parcial, acessos negados, links ignorados)."""
+    if not isinstance(vol, dict) or "error" in vol or not vol.get("Size"):
+        return {"available": False, "reason": (vol or {}).get("error", "volume não informado") if isinstance(vol, dict) else "volume não informado"}
+    size, free = int(vol["Size"]), int(vol.get("Free") or 0)
+    used = max(0, size - free)
+    scanned = int(res.get("total_disk_bytes") or 0)
+    root = str(vol.get("Root") or "")
+    is_root = bool(root) and path.rstrip(chr(92)).lower() == root.rstrip(chr(92)).lower()
+    out = {"available": True, "volume": root, "volume_size_bytes": size, "volume_free_bytes": free, "volume_used_bytes": used,
+           "volume_used_gb": round(used / 1073741824, 2), "scanned_disk_bytes": scanned,
+           "scanned_disk_gb": round(scanned / 1073741824, 2), "is_volume_root": is_root}
+    notes = []
+    if res.get("partial"):
+        notes.append("Varredura parcial (timeout): a soma está incompleta.")
+    if (res.get("access_denied") or 0) > 0:
+        notes.append(f"{res.get('access_denied')} itens sem permissão de leitura não entram na soma.")
+    if (res.get("links_skipped") or 0) > 0:
+        notes.append(f"{res.get('links_skipped')} links/junções não foram seguidos.")
+    hl = res.get("hardlinks") or {}
+    if not hl.get("deduplicated"):
+        notes.append("dedupe_hardlinks=false: arquivos com vários links físicos foram contados em cada link; "
+                     "use dedupe_hardlinks=true para contar o dado uma vez.")
+    if not is_root:
+        out["comparison"] = "not_applicable"
+        out["share_of_volume_used_pct"] = round(scanned * 100 / used, 1) if used else None
+        notes.append("A raiz varrida não é a do volume: sem conciliação, só a participação da pasta no uso do volume.")
+        out["notes"] = notes
+        return out
+    diff = used - scanned
+    tol = max(RECON_MIN_TOL_BYTES, int(used * RECON_TOL_PCT))
+    out["difference_bytes"] = diff
+    out["difference_gb"] = round(diff / 1073741824, 2)
+    out["tolerance_gb"] = round(tol / 1073741824, 2)
+    if abs(diff) <= tol:
+        out["comparison"] = "reconciled"
+    elif diff > 0:
+        out["comparison"] = "volume_uses_more_than_scan"
+        notes.append("Parte do uso do volume não é visível a esta varredura (metadados do NTFS e System Volume Information não "
+                     "são enumerados).")
+    else:
+        out["comparison"] = "scan_exceeds_volume_used"
+        notes.append("A soma dos tamanhos dos arquivos passa do espaço realmente usado no volume: os valores por pasta estão "
+                     "superestimados. Confirme com fontes que medem o espaço real (ex.: get_component_store_analysis para o WinSxS).")
+    out["notes"] = notes
+    return out
+
+
 @mcp.tool
 def get_disk_usage_tree(
     host: str,
@@ -1852,6 +1907,9 @@ def get_disk_usage_tree(
     percentuais: 'logical' (padrão) ou 'disk'. dedupe_hardlinks=true conta cada arquivo com vários links físicos
     (ex.: WinSxS) UMA vez só, na primeira ocorrência encontrada ('hardlinks' informa quantos foram pulados); é mais
     lento, pois abre cada arquivo. Se estourar scan_timeout_s devolve resultado parcial (partial=true).
+    'volume_reconciliation' compara a soma em disco da varredura com o espaço realmente usado do volume (tamanho - livre):
+    em raiz de volume informa a diferença (comparison: reconciled, volume_uses_more_than_scan ou scan_exceeds_volume_used,
+    tolerância max(256 MB, 2%)); em subpasta informa só a participação no uso do volume. Só fatos, sem explicar a causa.
     Exige Add-Type (C#) liberado no servidor."""
     p = _path(path)
     if measure not in ("logical", "disk"):
@@ -1867,6 +1925,12 @@ def get_disk_usage_tree(
     if isinstance(res, dict) and "error" in res:
         res["hint"] = ("Falha ao compilar/executar o scanner (Add-Type bloqueado por AppLocker/WDAC/Constrained "
                        "Language?). Use get_largest_folders/get_largest_files como alternativa mais lenta.")
+    elif isinstance(res, dict) and "total_disk_bytes" in res:
+        vol = _ps(host, r"""
+$r = [IO.Path]::GetPathRoot('__P__'); $d = New-Object IO.DriveInfo $r
+[pscustomobject]@{ Root=$r; Size=$d.TotalSize; Free=$d.TotalFreeSpace; Format=$d.DriveFormat } | ConvertTo-Json -Compress
+""".replace("__P__", p), timeout=60)
+        res["volume_reconciliation"] = _volume_reconciliation(res, p, vol)
     return res
 
 
